@@ -27,6 +27,29 @@ function getImpureTimestamp(): string {
   return "0";
 }
 
+function getRecordSignalForLead(signals: any, leadName: string): number[] | null {
+  if (!signals || !leadName) return null;
+  if (Array.isArray(signals[leadName])) return signals[leadName];
+  
+  const lowerName = leadName.toLowerCase();
+  for (const key of Object.keys(signals)) {
+    if (key.toLowerCase() === lowerName) {
+      if (Array.isArray(signals[key])) return signals[key];
+    }
+  }
+  
+  const mappings: Record<string, string> = {
+    avr: "AVR", avl: "AVL", avf: "AVF",
+    "aVR": "AVR", "aVL": "AVL", "aVF": "AVF",
+    "AVR": "aVR", "AVL": "aVL", "AVF": "aVF"
+  };
+  const targetKey = mappings[leadName] || mappings[lowerName];
+  if (targetKey && Array.isArray(signals[targetKey])) {
+    return signals[targetKey];
+  }
+  return null;
+}
+
 const SCP_DESCRIPTIONS: Record<string, string> = {
   NORM: "Normal ECG",
   AMI: "Anterior Myocardial Infarction",
@@ -221,7 +244,8 @@ export default function ECGSimulatorPage() {
     // Database mode values
     mode: "database",
     signals: null as any | null,
-    frequency: 100
+    frequency: 100,
+    timeElapsed: 0.0
   });
 
   // ── Synchronize React state variations to the drawing variables thread ──
@@ -728,6 +752,9 @@ export default function ECGSimulatorPage() {
       }
 
       const state = stateRef.current;
+      if (!state.paused) {
+        state.timeElapsed = (state.timeElapsed || 0) + dt;
+      }
       const dark = document.documentElement.getAttribute("data-theme") !== "light";
       const colors = getThemeColors(dark, state.stripMode, state.colorScheme);
       const displayDuration = 10 / state.zoom;
@@ -738,8 +765,9 @@ export default function ECGSimulatorPage() {
 
       // ── Single Trace Sweep Plotting ──
       if (state.viewMode === "single") {
-        if (state.mode === "database" && state.signals && state.signals[state.currentLead]) {
-          const signalArray = state.signals[state.currentLead];
+        const dbSignalArray = state.mode === "database" ? getRecordSignalForLead(state.signals, state.currentLead) : null;
+        if (state.mode === "database" && state.signals && dbSignalArray) {
+          const signalArray = dbSignalArray;
           if (!state.paused) {
             const pixelsThisFrame = pixelsPerSec * dt;
             const oldScanX = state.scanX;
@@ -1049,14 +1077,16 @@ export default function ECGSimulatorPage() {
               ctx.stroke();
               ctx.setLineDash([]);
 
-              const leadSignal = state.signals[lead];
+              const leadSignal = getRecordSignalForLead(state.signals, lead);
               if (leadSignal) {
                 ctx.beginPath();
                 let first = true;
                 const steps = Math.ceil(cellW);
                 for (let px = 0; px <= steps; px += 1) {
                   const cellFrac = px / cellW;
-                  const absFrac = (col + cellFrac) / numCols;
+                  // Scroll the 10-second segment smoothly over time
+                  const elapsedOffset = (state.timeElapsed || 0) * 0.10;
+                  const absFrac = ((col + cellFrac) / numCols + elapsedOffset) % 1.0;
                   let sampleIdx = Math.floor(absFrac * leadSignal.length);
                   sampleIdx = Math.min(leadSignal.length - 1, Math.max(0, sampleIdx));
 
@@ -1128,12 +1158,12 @@ export default function ECGSimulatorPage() {
           ctx.rect(0, gridHeight + 1, W, rhythmHeight - 1);
           ctx.clip();
 
-          const iiSignal = state.signals["II"];
+          const iiSignal = getRecordSignalForLead(state.signals, "II");
           if (iiSignal) {
             ctx.beginPath();
             let firstR = true;
             for (let px = 0; px <= W; px += 1) {
-              const absFrac = px / W;
+              const absFrac = (px / W + (state.timeElapsed || 0) * 0.10) % 1.0;
               let sampleIdx = Math.floor(absFrac * iiSignal.length);
               sampleIdx = Math.min(iiSignal.length - 1, Math.max(0, sampleIdx));
 
