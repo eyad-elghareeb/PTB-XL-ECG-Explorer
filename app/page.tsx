@@ -1192,7 +1192,6 @@ export default function ECGSimulatorPage() {
 
           ctx.lineJoin = "round";
           ctx.lineCap = "round";
-        }
 
         const bps = state.heartRate > 0 ? state.heartRate / 60 : 1;
         let renderPhase = state.phase;
@@ -1453,6 +1452,7 @@ export default function ECGSimulatorPage() {
         }
         ctx.globalAlpha = 1.0;
         ctx.restore();
+        }
       }
 
       animationFrameId = requestAnimationFrame(render);
@@ -1595,11 +1595,13 @@ export default function ECGSimulatorPage() {
 
   const adjustZoom = (dir: number) => {
     const step = 0.2;
-    const newVal = Math.max(0.2, Math.min(5.0, zoom + dir * step));
-    const rounded = Math.round(newVal * 10) / 10;
-    setZoom(rounded);
-    gridCacheValid.current = false;
-    showToastMsg("Grid Zoom: " + rounded.toFixed(2) + "x");
+    setZoom((prevZoom) => {
+      const newVal = Math.max(0.2, Math.min(5.0, prevZoom + dir * step));
+      const rounded = Math.round(newVal * 10) / 10;
+      gridCacheValid.current = false;
+      showToastMsg("Grid Zoom: " + rounded.toFixed(2) + "x");
+      return rounded;
+    });
   };
 
   const handleIntensityChange = (valStr: string) => {
@@ -2307,6 +2309,24 @@ export default function ECGSimulatorPage() {
       showToastMsg("Export failed. Please check browser permissions.");
     }
   };
+
+  // ── Mouse wheel scroll zoom listener ──
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const handleWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const dir = e.deltaY < 0 ? 1 : -1;
+      adjustZoom(dir);
+    };
+
+    container.addEventListener("wheel", handleWheel, { passive: false });
+    return () => {
+      container.removeEventListener("wheel", handleWheel);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // ── Keyboard keys bindings matches standard monitor consoles ──
   useEffect(() => {
