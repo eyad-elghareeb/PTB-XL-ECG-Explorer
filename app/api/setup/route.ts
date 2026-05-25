@@ -28,8 +28,18 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
+  let pullConfig = { mode: "partial", count: 36 };
+  try {
+    const body = await req.json();
+    if (body.pullConfig) {
+      pullConfig = body.pullConfig;
+    }
+  } catch(e) {
+    // default to partial
+  }
+
   const seeded = isDatabaseSeeded();
-  if (seeded) {
+  if (seeded && pullConfig.mode !== "full_force") {
     return NextResponse.json({
       seeded: true,
       status: "complete",
@@ -45,15 +55,15 @@ export async function POST(req: NextRequest) {
     });
   }
 
-  // Trigger seeding asynchronously (so response is sent quickly to the client and we can poll progress)
+    // Trigger seeding asynchronously (so response is sent quickly to the client and we can poll progress)
   globalProgress = {
     status: "downloading_scp",
-    message: "Triggering PTB-XL database seeding pipeline..."
+    message: "Triggering PTB-XL+ database seeding pipeline..."
   };
 
   activePromise = (async () => {
     try {
-      await seedDatabase((p) => {
+      await seedDatabase(pullConfig, (p) => {
         globalProgress = p;
       });
     } catch (err: any) {

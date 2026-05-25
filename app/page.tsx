@@ -27,27 +27,51 @@ function getImpureTimestamp(): string {
   return "0";
 }
 
-function getRecordSignalForLead(signals: any, leadName: string): number[] | null {
+function getRecordSignalForLead(signals: any, leadName: string, applyFilter: boolean = false): number[] | null {
   if (!signals || !leadName) return null;
-  if (Array.isArray(signals[leadName])) return signals[leadName];
   
-  const lowerName = leadName.toLowerCase();
-  for (const key of Object.keys(signals)) {
-    if (key.toLowerCase() === lowerName) {
-      if (Array.isArray(signals[key])) return signals[key];
+  let targetArr: number[] | null = null;
+  if (Array.isArray(signals[leadName])) {
+    targetArr = signals[leadName];
+  } else {
+    const lowerName = leadName.toLowerCase();
+    for (const key of Object.keys(signals)) {
+      if (key.toLowerCase() === lowerName) {
+        if (Array.isArray(signals[key])) {
+          targetArr = signals[key];
+          break;
+        }
+      }
+    }
+    if (!targetArr) {
+      const mappings: Record<string, string> = {
+        avr: "AVR", avl: "AVL", avf: "AVF",
+        "aVR": "AVR", "aVL": "AVL", "aVF": "AVF",
+        "AVR": "aVR", "AVL": "aVL", "AVF": "aVF"
+      };
+      const targetKey = mappings[leadName] || mappings[lowerName];
+      if (targetKey && Array.isArray(signals[targetKey])) {
+        targetArr = signals[targetKey];
+      }
     }
   }
   
-  const mappings: Record<string, string> = {
-    avr: "AVR", avl: "AVL", avf: "AVF",
-    "aVR": "AVR", "aVL": "AVL", "aVF": "AVF",
-    "AVR": "aVR", "AVL": "aVL", "AVF": "aVF"
-  };
-  const targetKey = mappings[leadName] || mappings[lowerName];
-  if (targetKey && Array.isArray(signals[targetKey])) {
-    return signals[targetKey];
+  if (!targetArr) return null;
+  
+  if (applyFilter) {
+    const out = new Array(targetArr.length);
+    for (let i = 0; i < targetArr.length; i++) {
+      let sum = 0;
+      let count = 0;
+      for (let j = Math.max(0, i - 2); j <= Math.min(targetArr.length - 1, i + 2); j++) {
+        sum += targetArr[j];
+        count++;
+      }
+      out[i] = sum / count;
+    }
+    return out;
   }
-  return null;
+  return targetArr;
 }
 
 const SCP_DESCRIPTIONS: Record<string, string> = {
@@ -121,6 +145,11 @@ function estimateHeartRate(signalArray: number[], freq: number = 100): number {
 export default function ECGSimulatorPage() {
   // ── Mode selection (clinical db vs mathematical simulator) ──
   const [mode, setMode] = useState<string>("database"); // "database" or "simulation"
+
+  // ── Database pulling config ──
+  const [pullMode, setPullMode] = useState<string>("partial");
+  const [pullCount, setPullCount] = useState<number>(36);
+  const [filterSignal, setFilterSignal] = useState<boolean>(false);
 
   // ── Tab state ──
   const [activeTab, setActiveTab] = useState<string>("db-explorer");
@@ -245,6 +274,7 @@ export default function ECGSimulatorPage() {
     mode: "database",
     signals: null as any | null,
     frequency: 100,
+    filterSignal: false,
     timeElapsed: 0.0
   });
 
@@ -273,6 +303,7 @@ export default function ECGSimulatorPage() {
     stateRef.current.mode = mode;
     stateRef.current.signals = recordSignals;
     stateRef.current.frequency = selectedFreq;
+    stateRef.current.filterSignal = filterSignal;
   }, [
     paused,
     viewMode,
@@ -294,7 +325,8 @@ export default function ECGSimulatorPage() {
     waveParams,
     mode,
     recordSignals,
-    selectedFreq
+    selectedFreq,
+    filterSignal
   ]);
 
   // ── Database Setup and Records Integration Hooks ──
@@ -396,13 +428,17 @@ export default function ECGSimulatorPage() {
       setSeedingActive(true);
       setDbStatus("running");
       setDbProgress("Starting PhysioNet clinical signal collection...");
-      const res = await fetch("/api/setup", { method: "POST" });
+      const res = await fetch("/api/setup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pullConfig: { mode: pullMode, count: pullCount } })
+      });
       const data = await res.json();
       if (data.seeded) {
         setDbSeeded(true);
         setSeedingActive(false);
         fetchRecords();
-        showToastMsg("Clinical database successfully seeded!");
+        showToastMsg("Clinical database successfully seeded/updated!");
       }
     } catch (err) {
       setDbStatus("failed");
@@ -765,7 +801,7 @@ export default function ECGSimulatorPage() {
 
       // ── Single Trace Sweep Plotting ──
       if (state.viewMode === "single") {
-        const dbSignalArray = state.mode === "database" ? getRecordSignalForLead(state.signals, state.currentLead) : null;
+        const dbSignalArray = state.mode === "database" ? getRecordSignalForLead(state.signals, state.currentLead, state.filterSignal) : null;
         if (state.mode === "database" && state.signals && dbSignalArray) {
           const signalArray = dbSignalArray;
           if (!state.paused) {
@@ -1077,25 +1113,28 @@ export default function ECGSimulatorPage() {
               ctx.stroke();
               ctx.setLineDash([]);
 
-              const leadSignal = getRecordSignalForLead(state.signals, lead);
+              const leadSignal = getRecordSignalForLead(state.signals, lead, state.filterSignal);
               if (leadSignal) {
                 ctx.beginPath();
                 let first = true;
-                const steps = Math.ceil(cellW);
-                for (let px = 0; px <= steps; px += 1) {
-                  const cellFrac = px / cellW;
-                  // Scroll the 10-second segment smoothly over time
-                  const elapsedOffset = (state.timeElapsed || 0) * 0.10;
-                  const absFrac = ((col + cellFrac) / numCols + elapsedOffset) % 1.0;
-                  let sampleIdx = Math.floor(absFrac * leadSignal.length);
-                  sampleIdx = Math.min(leadSignal.length - 1, Math.max(0, sampleIdx));
-
-                  let val = leadSignal[sampleIdx] * state.amplitude;
+                
+                const tStart = col * cellDuration;
+                const tEnd = (col + 1) * cellDuration;
+                
+                const startSample = Math.floor((tStart / 10.0) * (leadSignal.length - 1));
+                const endSample = Math.ceil((tEnd / 10.0) * (leadSignal.length - 1));
+                const safeEnd = Math.min(leadSignal.length - 1, endSample);
+                
+                for (let i = startSample; i <= safeEnd; i++) {
+                  const t = (i / (leadSignal.length - 1)) * 10.0;
+                  const cellFrac = (t - tStart) / cellDuration;
+                  
+                  let val = leadSignal[i] * state.amplitude;
                   if (state.noise > 0) {
-                    val = addTraceNoise(val, sampleIdx * 0.05, 0, state.noise, state.realistic, state.heartRate);
+                    val = addTraceNoise(val, i * 0.05, 0, state.noise, state.realistic, state.heartRate);
                   }
 
-                  const xCoord = cx + px;
+                  const xCoord = cx + (cellFrac * cellW);
                   const yCoord = centerYLocal - val * pixelsPerMv;
                   if (first) {
                     ctx.moveTo(xCoord, yCoord);
@@ -1158,18 +1197,18 @@ export default function ECGSimulatorPage() {
           ctx.rect(0, gridHeight + 1, W, rhythmHeight - 1);
           ctx.clip();
 
-          const iiSignal = getRecordSignalForLead(state.signals, "II");
+          const iiSignal = getRecordSignalForLead(state.signals, "II", state.filterSignal);
           if (iiSignal) {
             ctx.beginPath();
             let firstR = true;
-            for (let px = 0; px <= W; px += 1) {
-              const absFrac = (px / W + (state.timeElapsed || 0) * 0.10) % 1.0;
-              let sampleIdx = Math.floor(absFrac * iiSignal.length);
-              sampleIdx = Math.min(iiSignal.length - 1, Math.max(0, sampleIdx));
+            const endSample = Math.min(iiSignal.length - 1, Math.ceil((totalDuration / 10.0) * (iiSignal.length - 1)));
+            for (let i = 0; i <= endSample; i++) {
+              const t = (i / (iiSignal.length - 1)) * 10.0;
+              const px = (t / totalDuration) * W;
 
-              let val = iiSignal[sampleIdx] * state.amplitude;
+              let val = iiSignal[i] * state.amplitude;
               if (state.noise > 0) {
-                val = addTraceNoise(val, sampleIdx * 0.05, 0, state.noise, state.realistic, state.heartRate);
+                val = addTraceNoise(val, i * 0.05, 0, state.noise, state.realistic, state.heartRate);
               }
 
               const yCoord = rhythmY - val * pixelsPerMv;
@@ -1979,17 +2018,23 @@ export default function ECGSimulatorPage() {
           pdfCtx.beginPath();
 
           let first = true;
-          if (mode === "database" && recordSignals && recordSignals[lead]) {
-            const signalArray = recordSignals[lead];
-            for (let px = 0; px <= drawW; px += 0.5) {
-              const cellFrac = px / drawW;
-              const absFrac = (col + cellFrac) / 4;
-              let sampleIdx = Math.floor(absFrac * signalArray.length);
-              sampleIdx = Math.min(signalArray.length - 1, Math.max(0, sampleIdx));
-
-              const val = signalArray[sampleIdx] * amplitude;
+          const leadSignalArray = mode === "database" ? getRecordSignalForLead(recordSignals, lead, filterSignal) : null;
+          if (mode === "database" && recordSignals && leadSignalArray) {
+            const signalArray = leadSignalArray;
+            const tStart = col * 2.5;
+            const tEnd = (col + 1) * 2.5;
+            const startSample = Math.floor((tStart / 10.0) * (signalArray.length - 1));
+            const endSample = Math.ceil((tEnd / 10.0) * (signalArray.length - 1));
+            const safeEnd = Math.min(signalArray.length - 1, endSample);
+            
+            for (let i = startSample; i <= safeEnd; i++) {
+              const t = (i / (signalArray.length - 1)) * 10.0;
+              const cellFrac = (t - tStart) / 2.5;
+              const px = cellFrac * colW;
+              const val = signalArray[i] * amplitude;
               const cx2 = xStart + px;
               const cy2 = cellCenterY - val * yScale;
+              
               if (first) {
                 pdfCtx.moveTo(cx2, cy2);
                 first = false;
@@ -2090,16 +2135,17 @@ export default function ECGSimulatorPage() {
       pdfCtx.lineWidth = Math.max(1.5, mm2px * 0.19);
       pdfCtx.beginPath();
       let firstR = true;
-      if (mode === "database" && recordSignals && recordSignals["II"]) {
-        const signalArray = recordSignals["II"];
-        for (let px = 0; px <= rsW; px += 0.5) {
-          const absFrac = px / rsW;
-          let sampleIdx = Math.floor(absFrac * signalArray.length);
-          sampleIdx = Math.min(signalArray.length - 1, Math.max(0, sampleIdx));
+      const iiSignalArray = mode === "database" ? getRecordSignalForLead(recordSignals, "II", filterSignal) : null;
+      if (mode === "database" && recordSignals && iiSignalArray) {
+        const signalArray = iiSignalArray;
+        for (let i = 0; i < signalArray.length; i++) {
+          const absFrac = i / (signalArray.length - 1);
+          let px = absFrac * rsW;
 
-          const val = signalArray[sampleIdx] * amplitude;
+          const val = signalArray[i] * amplitude;
           const cx2 = rsX + px;
           const cy2 = rCenterY - val * yScale;
+          
           if (firstR) {
             pdfCtx.moveTo(cx2, cy2);
             firstR = false;
@@ -2231,17 +2277,19 @@ export default function ECGSimulatorPage() {
         pdfCtx.beginPath();
 
         let first = true;
-        if (mode === "database" && recordSignals && recordSignals[currentLead]) {
-          const signalArray = recordSignals[currentLead];
-          for (let px = 0; px <= contentW; px += 0.5) {
-            const fractionInStrip = px / contentW;
-            const globalTimeFraction = (s + fractionInStrip) / 3;
-            let sampleIdx = Math.floor(globalTimeFraction * signalArray.length);
-            sampleIdx = Math.min(signalArray.length - 1, Math.max(0, sampleIdx));
-
-            const val = signalArray[sampleIdx] * amplitude;
+        const currentLeadSignalArray = mode === "database" ? getRecordSignalForLead(recordSignals, currentLead, filterSignal) : null;
+        if (mode === "database" && recordSignals && currentLeadSignalArray) {
+          const signalArray = currentLeadSignalArray;
+          const startSample = Math.floor((s / 3) * signalArray.length);
+          const endSample = Math.min(signalArray.length - 1, Math.ceil(((s + 1) / 3) * signalArray.length));
+          
+          for (let i = startSample; i <= endSample; i++) {
+            const fractionInStrip = (i - startSample) / (endSample - startSample);
+            const px = fractionInStrip * contentW;
+            const val = signalArray[i] * amplitude;
             const cx2 = marginL + px;
             const cy2 = cellCenterY - val * yScale;
+            
             if (first) {
               pdfCtx.moveTo(cx2, cy2);
               first = false;
@@ -2618,129 +2666,144 @@ export default function ECGSimulatorPage() {
               <>
                 {/* RECORDS EXPLORER TAB */}
                 <div className={`tab-content ${activeTab === "db-explorer" ? "active" : ""}`} id="tab-db-explorer">
-                  <div style={{ fontSize: "0.7rem", color: "var(--text-muted)", marginBottom: "0.5rem" }}>
-                    Browse PTB-XL records clinical dataset from SQLite database engine.
-                  </div>
+                  <div className="wave-customizer">
+                    <div className="manual-banner" style={{ display: "block" }}>
+                      <div className="manual-banner-text">Database Explorer</div>
+                      <div className="manual-banner-desc">Browse clinical PTB-XL+ records.</div>
+                    </div>
 
-                  {/* Search box controls */}
-                  <div className="flex gap-2 mb-3">
-                    <input
-                      type="text"
-                      className="flex-1 px-3 py-1.5 text-xs rounded border border-border bg-surface text-foreground placeholder-muted outline-none focus:border-accent"
-                      placeholder="Search ID, NORM, MI, CD..."
-                      value={searchQuery}
-                      onChange={(e) => setSearchQuery(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") {
+                    <div className="param-grid pb-3 mb-3" style={{ marginBottom: "1.0rem", paddingBottom: "1.0rem" }}>
+                      <div className="toggle-row">
+                        <div>
+                          <div className="tr-label">Sampling Frequency</div>
+                          <div className="tr-desc">Resolution of the trace</div>
+                        </div>
+                        <select
+                          className="bg-surface2 text-foreground border border-border rounded px-2 py-1 text-xs outline-none"
+                          value={selectedFreq}
+                          onChange={(e) => {
+                            const freqValue = parseInt(e.target.value, 10);
+                            setSelectedFreq(freqValue);
+                            showToastMsg(`Switched sampling resolution to ${freqValue}Hz`);
+                          }}
+                        >
+                          <option value={500}>500 Hz (Raw / Resampled)</option>
+                          <option value={100}>100 Hz (Downsampled)</option>
+                        </select>
+                      </div>
+
+                      <div className="toggle-row">
+                        <div>
+                          <div className="tr-label">Low-Pass Filter</div>
+                          <div className="tr-desc">Moving average to clean raw traces</div>
+                        </div>
+                        <label className="toggle-switch">
+                          <input
+                            type="checkbox"
+                            checked={filterSignal}
+                            onChange={(e) => setFilterSignal(e.target.checked)}
+                          />
+                          <span className="toggle-slider"></span>
+                        </label>
+                      </div>
+                    </div>
+
+                    {/* Search box controls */}
+                    <div className="flex gap-2 mb-3">
+                      <input
+                        type="text"
+                        className="flex-1 px-3 py-1.5 text-xs rounded border border-border bg-surface text-foreground placeholder-muted outline-none focus:border-accent"
+                        placeholder="Search ID, NORM, MI, CD..."
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            setDbOffset(0);
+                            fetchRecords(searchQuery, superclassFilter, 0);
+                          }
+                        }}
+                      />
+                      <button
+                        className="px-3 py-1.5 bg-accent text-accent-foreground text-xs font-semibold rounded hover:bg-opacity-90 transition-colors"
+                        onClick={() => {
                           setDbOffset(0);
                           fetchRecords(searchQuery, superclassFilter, 0);
-                        }
-                      }}
-                    />
-                    <button
-                      className="px-3 py-1.5 bg-accent text-accent-foreground text-xs font-semibold rounded hover:bg-opacity-90 transition-colors"
-                      onClick={() => {
-                        setDbOffset(0);
-                        fetchRecords(searchQuery, superclassFilter, 0);
-                      }}
-                    >
-                      <i className="fa-solid fa-magnifying-glass"></i>
-                    </button>
-                  </div>
-
-                  {/* Frequency controls */}
-                  <div className="mb-3 p-2 bg-surface2 rounded border border-border flex items-center justify-between">
-                    <span className="text-xs font-medium text-foreground">Sampling Freq:</span>
-                    <select
-                      className="text-xs px-2 py-1 rounded border border-border bg-surface text-foreground outline-none cursor-pointer"
-                      value={selectedFreq}
-                      onChange={(e) => {
-                        const freqValue = parseInt(e.target.value, 10);
-                        setSelectedFreq(freqValue);
-                        showToastMsg(`Switched sampling resolution to ${freqValue}Hz`);
-                      }}
-                    >
-                      <option value={500}>500 Hz (Raw / Resampled)</option>
-                      <option value={100}>100 Hz (Downsampled)</option>
-                    </select>
-                  </div>
-
-                  {/* Loading indicator */}
-                  {recordsLoading && (
-                    <div className="py-8 flex flex-col items-center justify-center gap-2">
-                      <div className="animate-spin text-accent text-lg"><i className="fa-solid fa-spinner"></i></div>
-                      <span className="text-xs text-muted">Retrieving matching records...</span>
+                        }}
+                      >
+                        <i className="fa-solid fa-magnifying-glass"></i>
+                      </button>
                     </div>
-                  )}
 
-                  {/* Records List */}
-                  {!recordsLoading && (
-                    <div className="flex flex-col gap-2 max-h-[360px] overflow-y-auto pr-1">
-                      {dbRecords.length === 0 ? (
-                        <div className="py-8 text-center text-xs text-muted">
-                          No matching records found. Try &quot;NORM&quot; or &quot;MI&quot;.
-                        </div>
-                      ) : (
-                        dbRecords.map((record) => {
-                          const isSelected = selectedRecord?.ecg_id === record.ecg_id;
-                          return (
-                            <div
-                              key={record.ecg_id}
-                              className={`p-3 rounded border transition-all cursor-pointer flex flex-col gap-1.5 ${
-                                isSelected
-                                  ? "bg-accent bg-opacity-10 border-accent"
-                                  : "bg-surface hover:border-gray-500 border-border"
-                              }`}
-                              onClick={() => selectRecordItem(record)}
-                            >
-                              <div className="flex items-center justify-between">
-                                <span className="text-xs font-bold text-foreground">ECG Record #{record.ecg_id}</span>
-                                <span
-                                  className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
-                                    record.superclass === "NORM"
-                                      ? "bg-emerald-500 bg-opacity-20 text-emerald-400"
-                                      : "bg-rose-500 bg-opacity-20 text-rose-400"
-                                  }`}
-                                >
-                                  {record.superclass}
-                                </span>
+                    {/* Loading indicator */}
+                    {recordsLoading && (
+                      <div className="py-8 flex flex-col items-center justify-center gap-2">
+                        <div className="animate-spin text-accent text-lg"><i className="fa-solid fa-spinner"></i></div>
+                        <span className="text-xs text-muted">Retrieving matching records...</span>
+                      </div>
+                    )}
+
+                    {/* Records List */}
+                    {!recordsLoading && (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-[360px] overflow-y-auto pr-1">
+                        {dbRecords.length === 0 ? (
+                          <div className="py-8 text-center text-xs text-muted col-span-2">
+                            No matching records found. Try &quot;NORM&quot; or &quot;MI&quot;.
+                          </div>
+                        ) : (
+                          dbRecords.map((record) => {
+                            const isSelected = selectedRecord?.ecg_id === record.ecg_id;
+                            const isNorm = record.superclass === "NORM";
+                            return (
+                              <div
+                                key={record.ecg_id}
+                                className={`rhythm-card ${isSelected ? "selected" : ""}`}
+                                onClick={() => selectRecordItem(record)}
+                              >
+                                <div className="flex items-start justify-between w-full">
+                                  <div className="rc-icon">
+                                    <i className={`fa-solid ${isNorm ? "fa-heart-circle-check" : "fa-heart-circle-exclamation"}`}></i>
+                                  </div>
+                                  <span className={`rc-tag ${!isNorm ? "abnormal" : ""}`}>
+                                    {record.superclass}
+                                  </span>
+                                </div>
+                                <div className="rc-name mt-1">Record #{record.ecg_id}</div>
+                                <div className="text-[10px] text-muted-foreground mt-0.5">
+                                  Pt: {record.patient_id} | {record.age || "N/A"}/{record.sex === 0 ? "M" : "F"}
+                                </div>
                               </div>
-                              <div className="grid grid-cols-2 gap-1 text-[11px] text-muted-foreground">
-                                <div>Patient ID: <span className="text-foreground">#{record.patient_id}</span></div>
-                                <div>Age/Sex: <span className="text-foreground">{record.age || "N/A"}/{record.sex === 0 ? "M" : "F"}</span></div>
-                              </div>
-                            </div>
-                          );
-                        })
-                      )}
+                            );
+                          })
+                        )}
+                      </div>
+                    )}
+
+                    {/* Pagination control */}
+                    <div className="action-row mt-3 pt-2">
+                      <button
+                        className="btn-action" style={{ background: "transparent", color: "var(--text)" }}
+                        disabled={dbOffset === 0}
+                        onClick={() => {
+                          const nextOffset = Math.max(0, dbOffset - dbLimit);
+                          setDbOffset(nextOffset);
+                          fetchRecords(searchQuery, superclassFilter, nextOffset);
+                        }}
+                      >
+                        <i className="fa-solid fa-chevron-left mr-1"></i> Prev
+                      </button>
+                      <div className="block flex items-center text-xs text-muted">Page {Math.floor(dbOffset / dbLimit) + 1}</div>
+                      <button
+                        className="btn-action" style={{ background: "transparent", color: "var(--text)" }}
+                        disabled={dbRecords.length < dbLimit}
+                        onClick={() => {
+                          const nextOffset = dbOffset + dbLimit;
+                          setDbOffset(nextOffset);
+                          fetchRecords(searchQuery, superclassFilter, nextOffset);
+                        }}
+                      >
+                        Next <i className="fa-solid fa-chevron-right ml-1"></i>
+                      </button>
                     </div>
-                  )}
-
-                  {/* Pagination control */}
-                  <div className="flex items-center justify-between mt-3 pt-2 border-t border-border">
-                    <button
-                      className="px-2 py-1 text-xs rounded border border-border text-foreground hover:bg-surface disabled:opacity-40"
-                      disabled={dbOffset === 0}
-                      onClick={() => {
-                        const nextOffset = Math.max(0, dbOffset - dbLimit);
-                        setDbOffset(nextOffset);
-                        fetchRecords(searchQuery, superclassFilter, nextOffset);
-                      }}
-                    >
-                      <i className="fa-solid fa-chevron-left mr-1"></i> Prev
-                    </button>
-                    <span className="text-xs text-muted">Page {Math.floor(dbOffset / dbLimit) + 1}</span>
-                    <button
-                      className="px-2 py-1 text-xs rounded border border-border text-foreground hover:bg-surface disabled:opacity-40"
-                      disabled={dbRecords.length < dbLimit}
-                      onClick={() => {
-                        const nextOffset = dbOffset + dbLimit;
-                        setDbOffset(nextOffset);
-                        fetchRecords(searchQuery, superclassFilter, nextOffset);
-                      }}
-                    >
-                      Next <i className="fa-solid fa-chevron-right ml-1"></i>
-                    </button>
                   </div>
                 </div>
 
@@ -2751,55 +2814,57 @@ export default function ECGSimulatorPage() {
                       Select an ECG clinical record from the database to view diagnostics.
                     </div>
                   ) : (
-                    <div className="flex flex-col gap-3">
-                      <div className="p-3 bg-surface2 rounded border border-border font-sans">
-                        <div className="text-xs font-bold text-accent mb-1 uppercase tracking-wider">CLINICAL DIAGNOSIS SUPERCLASS</div>
-                        <div className="text-sm font-semibold text-foreground mb-1">
-                          {selectedRecord.superclass} &mdash; {SCP_DESCRIPTIONS[selectedRecord.superclass] || "Abnormality detected"}
-                        </div>
-                        <div className="text-xs text-muted-foreground leading-relaxed">
-                          {selectedRecord.class_explanation || "No explanation provided for this patient group."}
-                        </div>
+                    <div className="wave-customizer">
+                      <div className="manual-banner" style={{ display: "block", marginBottom: "1rem" }}>
+                        <div className="manual-banner-text">Superclass {selectedRecord.superclass}</div>
+                        <div className="manual-banner-desc">{SCP_DESCRIPTIONS[selectedRecord.superclass] || "Abnormality detected"}</div>
                       </div>
-
-                      <div className="p-3 bg-surface2 rounded border border-border font-sans">
-                        <div className="text-xs font-bold text-accent mb-1.5 uppercase tracking-wider">PATIENT PROFILE METADATA</div>
-                        <div className="flex flex-col gap-1 text-xs">
-                          <div className="flex justify-between py-1 border-b border-border border-opacity-50">
-                            <span className="text-muted">Patient ID</span>
-                            <span className="text-foreground font-semibold">#{selectedRecord.patient_id}</span>
-                          </div>
-                          <div className="flex justify-between py-1 border-b border-border border-opacity-50">
-                            <span className="text-muted">Age / Sex</span>
-                            <span className="text-foreground font-semibold">{selectedRecord.age || "Unknown"} years / {selectedRecord.sex === 0 ? "Male" : "Female"}</span>
-                          </div>
-                          <div className="flex justify-between py-1 border-b border-border border-opacity-50">
-                            <span className="text-muted">Chest Pain Type</span>
-                            <span className="text-foreground font-semibold">{selectedRecord.chest_pain_type === 0 ? "Asymptomatic" : selectedRecord.chest_pain_type === 1 ? "Atypical Angina" : "Non-Anginal"}</span>
-                          </div>
-                          <div className="flex justify-between py-1 border-b border-border border-opacity-50">
-                            <span className="text-muted">Recorded Medication</span>
-                            <span className="text-foreground font-semibold">{selectedRecord.medication_history ? selectedRecord.medication_history : "None on file"}</span>
-                          </div>
-                          <div className="flex justify-between py-1 border-b border-border border-opacity-50">
-                            <span className="text-muted">Recording Height/Weight</span>
-                            <span className="text-semibold text-foreground">{selectedRecord.height ? `${selectedRecord.height} cm` : "N/A"}/{selectedRecord.weight ? `${selectedRecord.weight} kg` : "N/A"}</span>
+                      
+                      <div className="param-grid" style={{ paddingBottom: "0", marginBottom: "0.5rem" }}>
+                        <div className="param-card">
+                          <div className="param-card-title">Patient Profile</div>
+                          <div className="flex flex-col gap-2">
+                            <div className="slider-label">
+                              <span className="text-muted text-xs">Patient ID</span>
+                              <span className="font-bold">#{selectedRecord.patient_id}</span>
+                            </div>
+                            <div className="slider-label">
+                              <span className="text-muted text-xs">Age / Sex</span>
+                              <span className="font-bold">{selectedRecord.age || "Unknown"} years / {selectedRecord.sex === 0 ? "Male" : "Female"}</span>
+                            </div>
+                            <div className="slider-label">
+                              <span className="text-muted text-xs">Chest Pain Type</span>
+                              <span className="font-bold">{selectedRecord.chest_pain_type === 0 ? "Asymptomatic" : selectedRecord.chest_pain_type === 1 ? "Atypical Angina" : "Non-Anginal"}</span>
+                            </div>
+                            <div className="slider-label">
+                              <span className="text-muted text-xs">Medication</span>
+                              <span className="font-bold">{selectedRecord.medication_history ? selectedRecord.medication_history : "None on file"}</span>
+                            </div>
+                            <div className="slider-label">
+                              <span className="text-muted text-xs">Height / Weight</span>
+                              <span className="font-bold">{selectedRecord.height ? `${selectedRecord.height} cm` : "N/A"} / {selectedRecord.weight ? `${selectedRecord.weight} kg` : "N/A"}</span>
+                            </div>
                           </div>
                         </div>
-                      </div>
 
-                      <div className="p-3 bg-surface2 rounded border border-border font-sans">
-                        <div className="text-xs font-bold text-accent mb-1 uppercase tracking-wider font-sans">SECONDARY STRATIFIED CODES</div>
-                        <div className="text-xs text-muted-foreground font-mono leading-relaxed bg-surface p-2 rounded max-h-[140px] overflow-y-auto">
-                          {selectedRecord.scp_codes ? (
-                            Object.entries(JSON.parse(selectedRecord.scp_codes)).map(([code, value]) => (
-                              <div key={code} className="flex justify-between pb-1 mb-1 border-b border-border border-opacity-30">
-                                <span className="text-semibold text-accent font-sans">{code}</span>
-                                <span className="text-foreground">{String(value)}</span>
+                        <div className="param-card flex flex-col">
+                          <div className="param-card-title">SCP Statements</div>
+                          <div className="text-[10px] text-muted-foreground leading-relaxed flex-1">
+                            {selectedRecord.class_explanation || "No explanation provided for this patient group."}
+                          </div>
+                          
+                          {selectedRecord.scp_codes && (
+                            <div className="mt-3 pt-3 border-t border-border">
+                              <div className="text-[10px] text-accent font-bold uppercase tracking-wider mb-2">Secondary Codes</div>
+                              <div className="bg-surface2 p-2 rounded text-[10px] font-mono break-words border border-border max-h-[80px] overflow-y-auto">
+                                {Object.entries(JSON.parse(selectedRecord.scp_codes)).map(([code, value]) => (
+                                  <div key={code} className="flex justify-between pb-1 mb-1 border-b border-border border-opacity-30">
+                                    <span className="font-semibold text-accent font-sans">{code}</span>
+                                    <span className="text-foreground">{String(value)}</span>
+                                  </div>
+                                ))}
                               </div>
-                            ))
-                          ) : (
-                            <span>No secondary SCP metadata</span>
+                            </div>
                           )}
                         </div>
                       </div>
@@ -2809,46 +2874,78 @@ export default function ECGSimulatorPage() {
 
                 {/* DATABASE ENGINE SEEDER SETUP TAB */}
                 <div className={`tab-content ${activeTab === "db-setup" ? "active" : ""}`} id="tab-db-setup">
-                  <div className="flex flex-col gap-3 font-sans">
-                    <div className="p-3 bg-surface2 rounded border border-border text-center font-sans">
-                      <div className="text-[10px] text-muted font-bold tracking-wider mb-1 uppercase">DATABASE STATUS</div>
-                      <div className={`text-base font-extrabold ${dbStatus === "seeded" ? "text-emerald-400" : "text-amber-400"}`}>
-                        {dbStatus === "seeded" ? "ACTIVE & SEEDED" : "NOT CONFIGURED"}
+                  <div className="wave-customizer">
+                    <div className="manual-banner" style={{ display: "block" }}>
+                      <div className="manual-banner-text">Database Setup</div>
+                      <div className="manual-banner-desc">Manage the local PTB-XL+ 1.0.1 SQLite engine.</div>
+                    </div>
+
+                    <div className="param-grid pb-3 mb-3" style={{ marginBottom: "1.5rem", paddingBottom: "1.0rem" }}>
+                      <div className="toggle-row">
+                        <div>
+                          <div className="tr-label">DATABASE STATUS</div>
+                          <div className="tr-desc">Engine contains {dbStatus === "seeded" ? "active" : "0"} records</div>
+                        </div>
+                        <div className={`text-xs font-bold ${dbStatus === "seeded" ? "text-emerald-400" : "text-amber-400"}`}>
+                          {dbStatus === "seeded" ? "ACTIVE & SEEDED" : "NOT CONFIGURED"}
+                        </div>
                       </div>
-                      <div className="text-[12px] text-foreground mt-1">
-                        SQLite Engine contains {dbStatus === "seeded" ? "36" : "0"} PTB-XL records trace datasets setup.
+
+                      <div className="toggle-row">
+                        <div>
+                          <div className="tr-label">Dataset Depth</div>
+                          <div className="tr-desc">Select how many records to fetch</div>
+                        </div>
+                        <select 
+                          className="bg-surface2 text-foreground border border-border rounded px-2 py-1 text-xs outline-none"
+                          value={pullMode}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setPullMode(val);
+                            if (val === "full_force") setPullCount(21837);
+                            else setPullCount(36);
+                          }}
+                          disabled={seedingActive}
+                        >
+                          <option value="partial">Partial Representative Preview</option>
+                          <option value="full_force">Full Database Download</option>
+                        </select>
+                      </div>
+
+                      <div className="toggle-row">
+                        <div>
+                          <div className="tr-label">Maximum Records</div>
+                          <div className="tr-desc">Approximate count to retrieve</div>
+                        </div>
+                        <input
+                          type="number"
+                          className="bg-surface2 text-foreground border border-border rounded px-2 py-1 text-xs outline-none w-24 text-right"
+                          value={pullCount}
+                          onChange={(e) => setPullCount(Number(e.target.value))}
+                          min={pullMode === "full_force" ? 100 : 36}
+                          step={pullMode === "full_force" ? 500 : 36}
+                          disabled={seedingActive}
+                        />
                       </div>
                     </div>
 
-                    <div className="p-3 bg-surface2 rounded border border-border font-sans">
-                      <div className="text-xs font-bold text-accent mb-2 uppercase tracking-wider">INITIALIZATION & SEEDING</div>
-                      <p className="text-xs text-muted-foreground leading-relaxed mb-3">
-                        The clinical SQLite engine reads records pre-extracted from the PTB-XL diagnostic database. Trigger initial seed if empty.
-                      </p>
-
-                      {dbProgress && (
-                        <div className="mb-3 p-2 bg-surface text-[10px] text-accent font-mono rounded border border-border break-words">
-                          <span className="text-[9px] text-muted block uppercase font-bold tracking-wider mb-0.5">Engine Status Output</span>
-                          {dbProgress}
-                        </div>
-                      )}
-
+                    <div className="action-row">
                       <button
-                        className="w-full py-2 bg-accent text-accent-foreground text-xs font-semibold rounded hover:bg-opacity-95 transition-all flex items-center justify-center gap-1.5 disabled:opacity-50"
+                        className="btn-action primary disabled:opacity-50 flex items-center justify-center gap-1.5"
                         onClick={triggerDbSeeding}
                         disabled={seedingActive}
                       >
-                        <i className={`fa-solid fa-database ${seedingActive ? "animate-bounce" : ""}`}></i> {seedingActive ? "Seeding Archive..." : "Re-trigger SQLite DB Seed"}
+                        <i className={`fa-solid fa-database ${seedingActive ? "animate-bounce" : ""}`}></i> 
+                        {seedingActive ? " Seeding Archive..." : " Re-trigger SQLite DB Seed"}
                       </button>
                     </div>
 
-                    <div className="p-3 bg-surface2 rounded border border-border font-sans">
-                      <div className="text-xs font-bold text-accent mb-1.5 uppercase tracking-wider font-sans">INTEGRATION COMPULSORIES</div>
-                      <ul className="text-[11px] text-muted-foreground list-disc pl-4 flex flex-col gap-1 leading-relaxed">
-                        <li><b>Data Scope:</b> Standard full 12-leads clinical database datasets.</li>
-                        <li><b>Wave Resolution:</b> original recordings preserved up to 500 samples/sec per lead trace.</li>
-                      </ul>
-                    </div>
+                    {dbProgress && (
+                      <div className="mt-3 p-2 bg-surface2 text-[10px] text-accent font-mono rounded border border-border break-words">
+                        <span className="text-[9px] text-muted block uppercase font-bold tracking-wider mb-0.5">Engine Status Output</span>
+                        {dbProgress}
+                      </div>
+                    )}
                   </div>
                 </div>
               </>

@@ -89,7 +89,12 @@ export function parseBinarySignals(buffer: Buffer, info: { numLeads: number; num
   return signals;
 }
 
-export async function seedDatabase(onProgress?: (progress: SeedProgress) => void) {
+export interface PullConfig {
+  mode: string;
+  count?: number;
+}
+
+export async function seedDatabase(pullConfig: PullConfig, onProgress?: (progress: SeedProgress) => void) {
   const db = getDB();
   const physioNetBase = "https://physionet.org/files/ptb-xl/1.0.1/";
 
@@ -249,21 +254,38 @@ export async function seedDatabase(onProgress?: (progress: SeedProgress) => void
       };
     }
 
-    // Pick 8 records for NORM, MI, CD and 6 records for HYP, STTC. Total: 36 records
-    const targetCounts: Record<string, number> = {
-      NORM: 8,
-      MI: 8,
-      CD: 8,
-      HYP: 6,
-      STTC: 6
-    };
-
     const selectedIds: number[] = [];
-    for (const [group, targetCount] of Object.entries(targetCounts)) {
-      const idsForGroup = categories[group] || [];
-      // Select files that lie within fold 10 or simply the first matching ones for simplicity and completeness
-      for (let i = 0; i < Math.min(targetCount, idsForGroup.length); i++) {
-        selectedIds.push(parseInt(idsForGroup[i]));
+    
+    if (pullConfig.mode === "full" || pullConfig.mode === "full_force") {
+      // For "full" database, take up to everything. 
+      // Note: fetching 21000 records sequentially will take hours and might hit memory/timeout limits on cloud run.
+      // But we will allow pulling up to pullConfig.count if provided, else maybe cap at 1000 for safety, or full.
+      const totalRequested = pullConfig.count || 21837; 
+      let count = 0;
+      for (const [group, idsForGroup] of Object.entries(categories)) {
+        for (let i = 0; i < idsForGroup.length; i++) {
+          if (count >= totalRequested) break;
+          selectedIds.push(parseInt(idsForGroup[i]));
+          count++;
+        }
+        if (count >= totalRequested) break;
+      }
+    } else {
+      // Partial / preview mode
+      const multiplier = (pullConfig.count && pullConfig.count > 36) ? Math.floor(pullConfig.count / 36) : 1;
+      const targetCounts: Record<string, number> = {
+        NORM: 8 * multiplier,
+        MI: 8 * multiplier,
+        CD: 8 * multiplier,
+        HYP: 6 * multiplier,
+        STTC: 6 * multiplier
+      };
+
+      for (const [group, targetCount] of Object.entries(targetCounts)) {
+        const idsForGroup = categories[group] || [];
+        for (let i = 0; i < Math.min(targetCount, idsForGroup.length); i++) {
+          selectedIds.push(parseInt(idsForGroup[i]));
+        }
       }
     }
 
