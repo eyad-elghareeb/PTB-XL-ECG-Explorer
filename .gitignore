@@ -5,3 +5,6 @@ coverage/
 *.log
 .env*
 !.env.example
+ptbxl.db
+ptbxl.db-shm
+ptbxl.db-wal
