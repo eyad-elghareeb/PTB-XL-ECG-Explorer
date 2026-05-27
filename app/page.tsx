@@ -27,6 +27,49 @@ function getImpureTimestamp(): string {
   return "0";
 }
 
+// ── Savitzky-Golay coefficient tables ──
+// Precomputed quadratic (order=2) smoothing coefficients for odd window sizes
+// Each entry: { halfWindow: number, norm: number, coeffs: number[] }
+const SG_TABLE: { half: number; norm: number; coeffs: number[] }[] = [
+  { half: 2, norm: 35,   coeffs: [-3, 12, 17, 12, -3] },                          // window=5
+  { half: 3, norm: 21,   coeffs: [-2, 3, 6, 7, 6, 3, -2] },                       // window=7
+  { half: 4, norm: 231,  coeffs: [-21, 14, 39, 54, 59, 54, 39, 14, -21] },        // window=9
+  { half: 5, norm: 429,  coeffs: [-36, 9, 44, 69, 84, 89, 84, 69, 44, 9, -36] },  // window=11
+];
+
+function savgolFilter(data: number[], windowPoints: 5 | 7 | 9 | 11 = 5): number[] {
+  const n = data.length;
+  if (n <= windowPoints) return data.slice();  // too short, return copy
+
+  const entry = SG_TABLE.find(e => e.half * 2 + 1 === windowPoints)!;
+  const { half, norm, coeffs } = entry;
+  const out = new Array(n);
+
+  // ── Reflect-pad the input at both boundaries ──
+  // Pre-allocate a padded array: [reflected left tail | data | reflected right tail]
+  const padLen = half;
+  const padded = new Array(n + 2 * padLen);
+  for (let i = 0; i < padLen; i++) {
+    padded[i] = data[padLen - 1 - i];                 // left reflection
+    padded[padLen + n + i] = data[n - 2 - i];          // right reflection
+  }
+  for (let i = 0; i < n; i++) {
+    padded[padLen + i] = data[i];
+  }
+
+  // ── Apply convolution ──
+  const offset = padLen; // index in `padded` corresponding to data[0]
+  for (let i = 0; i < n; i++) {
+    let sum = 0;
+    for (let k = -half; k <= half; k++) {
+      sum += coeffs[k + half] * padded[offset + i + k];
+    }
+    out[i] = sum / norm;
+  }
+
+  return out;
+}
+
 function getRecordSignalForLead(signals: any, leadName: string, applyFilter: boolean = false): number[] | null {
   if (!signals || !leadName) return null;
   
@@ -47,7 +90,7 @@ function getRecordSignalForLead(signals: any, leadName: string, applyFilter: boo
       const mappings: Record<string, string> = {
         avr: "AVR", avl: "AVL", avf: "AVF",
         "aVR": "AVR", "aVL": "AVL", "aVF": "AVF",
-        "AVR": "aVR", "AVL": "aVL", "AVF": "aVF"
+      "AVR": "aVR", "AVL": "aVL", "AVF": "aVF"
       };
       const targetKey = mappings[leadName] || mappings[lowerName];
       if (targetKey && Array.isArray(signals[targetKey])) {
@@ -59,16 +102,9 @@ function getRecordSignalForLead(signals: any, leadName: string, applyFilter: boo
   if (!targetArr) return null;
   
   if (applyFilter) {
-    const out = new Array(targetArr.length);
-    for (let i = 0; i < targetArr.length; i++) {
-      if (i < 2 || i > targetArr.length - 3) {
-        out[i] = targetArr[i]; // Preserve original boundary samples
-      } else {
-        // Savitzky-Golay 5-point quadratic smoothing
-        out[i] = (-3 * targetArr[i - 2] + 12 * targetArr[i - 1] + 17 * targetArr[i] + 12 * targetArr[i + 1] - 3 * targetArr[i + 2]) / 35;
-      }
-    }
-    return out;
+    // Use 9-point SG filter for clinical ECGs — spans ~18ms at 500Hz.
+    // Larger window provides visible smoothing while preserving diagnostic features.
+    return savgolFilter(targetArr, 9);
   }
   return targetArr;
 }
@@ -3016,10 +3052,10 @@ export default function ECGSimulatorPage() {
                     </div>
 
                     {/* Search box controls */}
-                    <div className="flex gap-2 mb-3">
+                    <div className="db-search-container">
                       <input
                         type="text"
-                        className="flex-1 px-3 py-1.5 text-xs rounded border border-border bg-surface text-foreground placeholder-muted outline-none focus:border-accent"
+                        className="db-search-input"
                         placeholder="Search ID, NORM, MI, CD..."
                         value={searchQuery}
                         onChange={(e) => {
@@ -3034,7 +3070,7 @@ export default function ECGSimulatorPage() {
                         }}
                       />
                       <button
-                        className="px-3 py-1.5 bg-accent text-accent-foreground text-xs font-semibold rounded hover:bg-opacity-90 transition-colors"
+                        className="db-search-btn"
                         onClick={() => {
                           setDbOffset(0);
                           fetchRecords(searchQuery, superclassFilter, 0);
@@ -3069,44 +3105,43 @@ export default function ECGSimulatorPage() {
                         </div>
                       )}
                       {!recordsLoading && dbRecords.length === 0 ? (
-                        <div className="py-8 text-center text-xs text-muted">
+                        <div className="db-empty-state">
                           No matching records found. Try "NORM" or "MI".
                         </div>
                       ) : (
                         dbRecords.map((record) => {
                           const isSelected = selectedRecord?.ecg_id === record.ecg_id;
                           const isNorm = record.superclass === "NORM";
+                          const sc = (record.superclass || "").toLowerCase();
+                          const scClass = isNorm ? "norm" : sc === "mi" ? "mi" : sc === "cd" ? "cd" : sc === "hyp" ? "hyp" : "sttc";
                           return (
                             <div
                               key={record.ecg_id}
-                              className={`rhythm-card ${isSelected ? "selected" : ""}`}
+                              className={`db-record-card ${scClass} ${isSelected ? "selected" : ""}`}
                               onClick={() => selectRecordItem(record)}
-                              style={{ padding: "10px 12px", minHeight: "82px", borderLeft: isSelected ? `3px solid ${isNorm ? "var(--correct)" : "var(--wrong)"}` : "3px solid transparent", transition: "all 0.15s ease", cursor: "pointer" }}
                             >
-                              <div className="flex items-start justify-between w-full" style={{ marginBottom: "6px" }}>
+                              <div className="flex items-start justify-between w-full mb-1">
                                 <div className="flex items-center gap-2">
-                                  <div className="rc-icon" style={{ width: "22px", textAlign: "center" }}>
-                                    <i className={`fa-solid ${isNorm ? "fa-heart-circle-check" : "fa-heart-circle-exclamation"}`} style={{ color: isNorm ? "var(--correct)" : "var(--wrong)", fontSize: "14px" }}></i>
+                                  <div style={{ width: "20px", textAlign: "center" }}>
+                                    <i className={`fa-solid ${isNorm ? "fa-heart-circle-check" : "fa-heart-circle-exclamation"}`} style={{ color: isNorm ? "var(--correct)" : "var(--wrong)", fontSize: "13px" }}></i>
                                   </div>
                                   <div>
-                                    <div className="rc-name" style={{ fontSize: "0.75rem", fontWeight: 700, lineHeight: 1.2 }}>Record #{record.ecg_id}</div>
-                                    <div className="text-[9px] text-muted" style={{ lineHeight: 1.2 }}>
-                                      Patient #{record.patient_id}
-                                    </div>
+                                    <div className="db-record-id">Record #{record.ecg_id}</div>
+                                    <div className="db-record-patient">Patient #{record.patient_id}</div>
                                   </div>
                                 </div>
-                                <span className={`rc-tag ${!isNorm ? "abnormal" : ""}`} style={{ fontSize: "9px", padding: "1px 6px" }}>
+                                <span className={`db-record-superclass ${scClass}`}>
                                   {record.superclass}
                                 </span>
                               </div>
-                              <div className="flex gap-3 text-[9px] text-muted-foreground" style={{ borderTop: "1px solid var(--border)", paddingTop: "5px" }}>
-                                <span><i className="fa-regular fa-calendar mr-1"></i>{record.age || "N/A"}y</span>
-                                <span><i className="fa-regular fa-user mr-1"></i>{record.sex === 0 ? "Male" : "Female"}</span>
-                                <span><i className="fa-solid fa-ruler mr-1"></i>{record.height ? `${record.height}cm` : "N/A"}</span>
-                                <span><i className="fa-solid fa-weight-scale mr-1"></i>{record.weight ? `${record.weight}kg` : "N/A"}</span>
+                              <div className="db-record-detail">
+                                <span><i className="fa-regular fa-calendar"></i>{record.age || "N/A"}y</span>
+                                <span><i className="fa-regular fa-user"></i>{record.sex === 0 ? "Male" : "Female"}</span>
+                                <span><i className="fa-solid fa-ruler"></i>{record.height ? `${record.height}cm` : "N/A"}</span>
+                                <span><i className="fa-solid fa-weight-scale"></i>{record.weight ? `${record.weight}kg` : "N/A"}</span>
                               </div>
                               {record.scp_codes && (
-                                <div className="text-[8px] text-muted mt-1 truncate" style={{ borderTop: "1px solid var(--border)", paddingTop: "3px" }}>
+                                <div className="db-record-scp">
                                   SCP: {Object.keys(JSON.parse(record.scp_codes)).slice(0, 3).join(", ")}{Object.keys(JSON.parse(record.scp_codes)).length > 3 ? "..." : ""}
                                 </div>
                               )}
@@ -3170,7 +3205,7 @@ export default function ECGSimulatorPage() {
                 </div>
 
                 {/* DIAGNOSTICS DETAILED SUMMARY TAB */}
-                <div className={`tab-content ${activeTab === "db-diagnostic" ? "active" : ""}`} id="tab-db-diagnostic">
+                <div className={`tab-content ${activeTab === "db-diagnostic" ? "active" : ""} animate-fade-in`} id="tab-db-diagnostic">
                   {!selectedRecord ? (
                     <div className="py-8 text-center text-xs text-muted">
                       Select an ECG clinical record from the database to view diagnostics.
@@ -3178,69 +3213,34 @@ export default function ECGSimulatorPage() {
                   ) : (
                     <div className="wave-customizer">
                       {/* Findings Banner */}
-                      <div 
-                        className="manual-banner" 
-                        style={{ 
-                          display: "block", 
-                          marginBottom: "0.8rem",
-                          borderLeft: `4px solid ${
-                            selectedRecord.superclass === "NORM"
-                              ? "var(--correct)"
-                              : selectedRecord.superclass === "MI"
-                              ? "var(--wrong)"
-                              : selectedRecord.superclass === "CD"
-                              ? "var(--rhythm-metabolic)"
-                              : selectedRecord.superclass === "HYP"
-                              ? "var(--rhythm-block)"
-                              : "var(--rhythm-ischemia)"
-                          }`
-                        }}
-                      >
-                        <div className="manual-banner-text flex justify-between items-center w-full">
-                          <span>Superclass: {selectedRecord.superclass}</span>
-                          <span 
-                            className={`rc-tag ${selectedRecord.superclass !== "NORM" ? "abnormal" : ""}`}
-                            style={{ fontSize: "9px", padding: "1px 6px" }}
-                          >
-                            {SCP_DESCRIPTIONS[selectedRecord.superclass] || "Abnormality"}
+                      <div className="diag-banner" style={{ borderLeft: `4px solid ${
+                        selectedRecord.superclass === "NORM" ? "var(--correct)"
+                        : selectedRecord.superclass === "MI" ? "var(--wrong)"
+                        : selectedRecord.superclass === "CD" ? "var(--rhythm-metabolic)"
+                        : selectedRecord.superclass === "HYP" ? "var(--rhythm-block)"
+                        : "var(--rhythm-ischemia)"
+                      }` }}>
+                        <div className="diag-banner-row">
+                          <div>
+                            <div className="diag-banner-title">Record #{selectedRecord.ecg_id}</div>
+                            <div className="diag-banner-sub">Patient #{selectedRecord.patient_id}</div>
+                          </div>
+                          <span className={`diag-banner-tag ${selectedRecord.superclass === "NORM" ? "norm" : selectedRecord.superclass === "MI" ? "mi" : selectedRecord.superclass === "CD" ? "cd" : selectedRecord.superclass === "HYP" ? "hyp" : "sttc"}`}>
+                            {selectedRecord.superclass}
                           </span>
-                        </div>
-                        <div className="manual-banner-desc mt-1 text-[10px] text-muted-foreground opacity-90 font-mono">
-                          Record #{selectedRecord.ecg_id} &middot; Patient #{selectedRecord.patient_id}
                         </div>
                       </div>
 
                       {/* Sub-tab Navigation Buttons */}
-                      <div className="flex bg-surface2 border border-border rounded-lg p-0.5 mb-3" style={{ background: "rgba(0,0,0,0.2)" }}>
-                        <button
-                          className={`flex-1 py-1.5 text-[10px] font-bold rounded-md transition-all ${
-                            diagSubTab === "overview"
-                              ? "bg-accent text-white shadow-sm"
-                              : "text-muted hover:text-foreground"
-                          }`}
-                          onClick={() => setDiagSubTab("overview")}
-                        >
-                          Overview
+                      <div className="diag-subnav">
+                        <button className={`diag-subnav-btn ${diagSubTab === "overview" ? "active" : ""}`} onClick={() => setDiagSubTab("overview")}>
+                          <i className="fa-solid fa-clipboard-list"></i> Overview
                         </button>
-                        <button
-                          className={`flex-1 py-1.5 text-[10px] font-bold rounded-md transition-all flex items-center justify-center gap-1 ${
-                            diagSubTab === "peaks"
-                              ? "bg-accent text-white shadow-sm"
-                              : "text-muted hover:text-foreground"
-                          }`}
-                          onClick={() => setDiagSubTab("peaks")}
-                        >
-                          <i className="fa-solid fa-heart-pulse text-[9px] animate-pulse"></i> Peaks
+                        <button className={`diag-subnav-btn ${diagSubTab === "peaks" ? "active" : ""}`} onClick={() => setDiagSubTab("peaks")}>
+                          <i className="fa-solid fa-heart-pulse"></i> Peaks
                         </button>
-                        <button
-                          className={`flex-1 py-1.5 text-[10px] font-bold rounded-md transition-all ${
-                            diagSubTab === "length"
-                              ? "bg-accent text-white shadow-sm"
-                              : "text-muted hover:text-foreground"
-                          }`}
-                          onClick={() => setDiagSubTab("length")}
-                        >
-                          Length & Info
+                        <button className={`diag-subnav-btn ${diagSubTab === "length" ? "active" : ""}`} onClick={() => setDiagSubTab("length")}>
+                          <i className="fa-solid fa-ruler"></i> Info
                         </button>
                       </div>
 
@@ -3248,33 +3248,33 @@ export default function ECGSimulatorPage() {
                       {diagSubTab === "overview" && (
                         <div className="flex flex-col gap-3 animate-fade-in">
                           {/* Clinical Report Card */}
-                          <div className="param-card">
-                            <div className="param-card-title flex items-center gap-1">
+                          <div className="diag-report-card">
+                            <div className="diag-report-card-header">
                               <i className="fa-solid fa-clipboard-question"></i> Clinical Report Summary
                             </div>
-                            <div className="text-[11px] text-foreground leading-relaxed bg-surface2 p-3 rounded-lg border border-border font-sans italic">
+                            <div className="diag-report-card-body">
                               "{selectedRecord.report || "No summary report text is cataloged in the database for this record."}"
                             </div>
                           </div>
 
                           {/* SCP Statement Table */}
                           {selectedRecord.scp_codes && (
-                            <div className="bg-surface2 p-3 rounded-lg border border-border">
-                              <div className="text-[10px] text-accent font-bold uppercase tracking-wider mb-2 flex items-center gap-1">
-                                <i className="fa-solid fa-book-medical"></i> Diagnostic SCP Codes Breakdown
+                            <div className="diag-scp-section">
+                              <div className="diag-scp-header">
+                                <i className="fa-solid fa-book-medical"></i> Diagnostic SCP Codes
                               </div>
-                              <div className="flex flex-col gap-2 max-h-[140px] overflow-y-auto pr-1">
+                              <div className="diag-scp-list">
                                 {Object.entries(JSON.parse(selectedRecord.scp_codes)).map(([code, value]) => {
                                   const desc = SCP_DESCRIPTIONS[code] || "Associated clinical condition";
                                   const prob = typeof value === "number" ? Math.round(value) : 100;
                                   return (
-                                    <div key={code} className="flex flex-col gap-1 pb-2 border-b border-border border-opacity-30 last:border-0 last:pb-0">
-                                      <div className="flex justify-between items-baseline text-[10px]">
-                                        <span className="font-bold text-accent">{code} <span className="font-normal text-muted-foreground">- {desc}</span></span>
-                                        <span className="font-mono text-foreground font-semibold">{prob}%</span>
+                                    <div key={code} className="diag-scp-item">
+                                      <div className="diag-scp-item-header">
+                                        <span><span className="diag-scp-code">{code}</span> <span className="diag-scp-desc">- {desc}</span></span>
+                                        <span className="diag-scp-prob">{prob}%</span>
                                       </div>
-                                      <div className="h-1 bg-surface rounded-full overflow-hidden">
-                                        <div className="h-full bg-accent" style={{ width: `${prob}%` }}></div>
+                                      <div className="diag-scp-bar">
+                                        <div className="diag-scp-bar-fill" style={{ width: `${prob}%` }}></div>
                                       </div>
                                     </div>
                                   );
@@ -3285,24 +3285,22 @@ export default function ECGSimulatorPage() {
 
                           {/* Infarction Stadium Details */}
                           {(selectedRecord.infarction_stadium1 || selectedRecord.infarction_stadium2) && (
-                            <div className="param-card">
-                              <div className="param-card-title flex items-center gap-1">
+                            <div className="diag-infarction-card">
+                              <div className="diag-infarction-header">
                                 <i className="fa-solid fa-layer-group"></i> Myocardial Infarction Stadium
                               </div>
-                              <div className="flex flex-col gap-2 p-2 bg-surface2 rounded-lg border border-border">
-                                {selectedRecord.infarction_stadium1 && (
-                                  <div className="flex justify-between items-center text-xs">
-                                    <span className="text-muted text-[10px]">Primary Infarct Stadium:</span>
-                                    <span className="font-semibold text-wrong bg-wrong bg-opacity-10 px-2 py-0.5 rounded text-[9px] uppercase font-mono border border-wrong border-opacity-20">{selectedRecord.infarction_stadium1}</span>
-                                  </div>
-                                )}
-                                {selectedRecord.infarction_stadium2 && (
-                                  <div className="flex justify-between items-center text-xs">
-                                    <span className="text-muted text-[10px]">Secondary Infarct Stadium:</span>
-                                    <span className="font-semibold text-accent bg-accent bg-opacity-10 px-2 py-0.5 rounded text-[9px] uppercase font-mono border border-accent border-opacity-20">{selectedRecord.infarction_stadium2}</span>
-                                  </div>
-                                )}
-                              </div>
+                              {selectedRecord.infarction_stadium1 && (
+                                <div className="diag-infarction-row">
+                                  <span className="diag-infarction-label">Primary:</span>
+                                  <span className="diag-infarction-value" style={{ color: "var(--wrong)", border: "1px solid rgba(218,54,51,0.3)", background: "rgba(218,54,51,0.12)" }}>{selectedRecord.infarction_stadium1}</span>
+                                </div>
+                              )}
+                              {selectedRecord.infarction_stadium2 && (
+                                <div className="diag-infarction-row">
+                                  <span className="diag-infarction-label">Secondary:</span>
+                                  <span className="diag-infarction-value" style={{ color: "var(--accent)", border: "1px solid rgba(240,165,0,0.3)", background: "var(--accent-glow)" }}>{selectedRecord.infarction_stadium2}</span>
+                                </div>
+                              )}
                             </div>
                           )}
                         </div>
@@ -3312,86 +3310,64 @@ export default function ECGSimulatorPage() {
                       {diagSubTab === "peaks" && (
                         <div className="flex flex-col gap-3 animate-fade-in">
                           {signalsLoading ? (
-                            <div className="py-8 flex flex-col items-center justify-center gap-2">
-                              <div className="animate-spin text-accent text-lg"><i className="fa-solid fa-spinner"></i></div>
-                              <span className="text-xs text-muted">Analyzing waveform peaks...</span>
+                            <div className="db-loading-spinner">
+                              <i className="fa-solid fa-spinner"></i>
+                              <span>Analyzing waveform peaks...</span>
                             </div>
                           ) : !peaksAnalysis ? (
-                            <div className="py-6 text-center text-xs text-muted">
-                              Could not load trace waveforms to perform peak detection. Verify signal cache.
+                            <div className="db-empty-state">
+                              Could not load trace waveforms to perform peak detection.
                             </div>
                           ) : (
                             <>
                               {/* R-Peak Stats Grid */}
-                              <div className="grid grid-cols-2 gap-2">
-                                <div className="bg-surface2 p-2 rounded-lg border border-border flex flex-col items-center justify-center text-center">
-                                  <div className="text-[9px] text-muted-foreground uppercase font-bold tracking-wider mb-0.5">Calculated Heart Rate</div>
-                                  <div className="text-lg font-extrabold text-accent flex items-baseline gap-1">
-                                    <i className="fa-solid fa-heart-pulse text-xs animate-bounce text-red-500"></i>
-                                    {peaksAnalysis.calculatedBPM}
-                                    <span className="text-[9px] font-normal text-muted-foreground font-sans">bpm</span>
-                                  </div>
+                              <div className="diag-peaks-grid">
+                                <div className="diag-peak-stat">
+                                  <div className="diag-peak-stat-label">Heart Rate</div>
+                                  <div className="diag-peak-stat-value hr">{peaksAnalysis.calculatedBPM}<span className="diag-peak-stat-unit">bpm</span></div>
                                 </div>
-                                <div className="bg-surface2 p-2 rounded-lg border border-border flex flex-col items-center justify-center text-center">
-                                  <div className="text-[9px] text-muted-foreground uppercase font-bold tracking-wider mb-0.5">Total R-Peaks</div>
-                                  <div className="text-lg font-extrabold text-accent">
-                                    {peaksAnalysis.peaksCount}
-                                    <span className="text-[9px] font-normal text-muted-foreground font-sans ml-1">beats</span>
-                                  </div>
+                                <div className="diag-peak-stat">
+                                  <div className="diag-peak-stat-label">R-Peaks</div>
+                                  <div className="diag-peak-stat-value">{peaksAnalysis.peaksCount}<span className="diag-peak-stat-unit">beats</span></div>
                                 </div>
-                                <div className="bg-surface2 p-2 rounded-lg border border-border flex flex-col items-center justify-center text-center">
-                                  <div className="text-[9px] text-muted-foreground uppercase font-bold tracking-wider mb-0.5" title="Standard Deviation of Normal-to-Normal Intervals">HRV Index (SDNN)</div>
-                                  <div className="text-lg font-extrabold text-correct">
-                                    {peaksAnalysis.sdnn}
-                                    <span className="text-[9px] font-normal text-muted-foreground font-sans ml-1">ms</span>
-                                  </div>
+                                <div className="diag-peak-stat">
+                                  <div className="diag-peak-stat-label" title="Standard Deviation of NN Intervals">SDNN</div>
+                                  <div className="diag-peak-stat-value hrv">{peaksAnalysis.sdnn}<span className="diag-peak-stat-unit">ms</span></div>
                                 </div>
-                                <div className="bg-surface2 p-2 rounded-lg border border-border flex flex-col items-center justify-center text-center">
-                                  <div className="text-[9px] text-muted-foreground uppercase font-bold tracking-wider mb-0.5" title="Root Mean Square of Successive Differences">Vagal Index (RMSSD)</div>
-                                  <div className="text-lg font-extrabold text-correct">
-                                    {peaksAnalysis.rmssd}
-                                    <span className="text-[9px] font-normal text-muted-foreground font-sans ml-1">ms</span>
-                                  </div>
+                                <div className="diag-peak-stat">
+                                  <div className="diag-peak-stat-label" title="Root Mean Square of Successive Differences">RMSSD</div>
+                                  <div className="diag-peak-stat-value hrv">{peaksAnalysis.rmssd}<span className="diag-peak-stat-unit">ms</span></div>
                                 </div>
                               </div>
 
                               {/* HRV Clinical Interpretation */}
-                              <div className="bg-surface2 p-2.5 rounded-lg border border-border text-[9px] leading-relaxed text-muted-foreground">
-                                <span className="font-bold text-foreground uppercase tracking-wider block mb-1">Clinical Interpretation Summary</span>
+                              <div className="diag-hrv-interp">
+                                <div className="diag-hrv-interp-title">Clinical Interpretation</div>
                                 {peaksAnalysis.sdnn < 30 ? (
-                                  <span><i className="fa-solid fa-circle-exclamation text-amber-500 mr-1"></i> HRV indices are depressed ({peaksAnalysis.sdnn}ms), which can indicate systemic autonomic distress or autonomic neuropathy under clinical settings.</span>
+                                  <span><i className="fa-solid fa-circle-exclamation" style={{color:"var(--rhythm-metabolic)"}}></i> HRV depressed ({peaksAnalysis.sdnn}ms), indicating possible autonomic distress.</span>
                                 ) : (
-                                  <span><i className="fa-solid fa-circle-check text-emerald-500 mr-1"></i> Autonomic cardiac modulation is healthy and normal ({peaksAnalysis.sdnn}ms SDNN, {peaksAnalysis.rmssd}ms RMSSD parasympathetic index).</span>
+                                  <span><i className="fa-solid fa-circle-check" style={{color:"var(--rhythm-normal)"}}></i> Normal autonomic modulation ({peaksAnalysis.sdnn}ms SDNN).</span>
                                 )}
                               </div>
 
                               {/* R-Peaks Timings List */}
-                              <div className="bg-surface2 p-3 rounded-lg border border-border">
-                                <div className="text-[10px] text-accent font-bold uppercase tracking-wider mb-2 flex justify-between items-center">
-                                  <span><i className="fa-solid fa-list-ol mr-1"></i> R-Peak Timeline (Lead {currentLead})</span>
-                                  <span className="text-[8px] text-muted font-normal lowercase">visual markers active on grid</span>
+                              <div className="diag-rpeak-table">
+                                <div className="diag-rpeak-table-header">
+                                  <span><i className="fa-solid fa-list-ol"></i> R-Peaks (Lead {currentLead})</span>
                                 </div>
-                                <div className="overflow-y-auto max-h-[140px] pr-1">
-                                  <table className="w-full text-[10px] font-mono">
+                                <div className="diag-rpeak-table-scroll">
+                                  <table>
                                     <thead>
-                                      <tr className="border-b border-border border-opacity-40 text-[9px] text-muted-foreground text-left">
-                                        <th className="pb-1.5 font-bold">Beat</th>
-                                        <th className="pb-1.5 font-bold">Timestamp</th>
-                                        <th className="pb-1.5 font-bold text-right">R-Amp (mV)</th>
-                                      </tr>
+                                      <tr><th>Beat</th><th>Time</th><th style={{textAlign:"right"}}>Amp (mV)</th></tr>
                                     </thead>
                                     <tbody>
-                                      {peaksAnalysis.peaksInfo.map((p: any, idx: number) => {
-                                        return (
-                                          <tr key={idx} className="border-b border-border border-opacity-20 last:border-0 hover:bg-surface py-1">
-                                            <td className="py-1">#{idx + 1}</td>
-                                            <td className="py-1">{p.time.toFixed(3)} s</td>
-                                            <td className={`py-1 text-right font-semibold ${p.value > 0.6 ? "text-emerald-400" : "text-foreground"}`}>
-                                              {p.value.toFixed(3)}
-                                            </td>
-                                          </tr>
-                                        );
-                                      })}
+                                      {peaksAnalysis.peaksInfo.map((p: any, idx: number) => (
+                                        <tr key={idx}>
+                                          <td>#{idx + 1}</td>
+                                          <td>{p.time.toFixed(3)}s</td>
+                                          <td className="text-right" style={p.value > 0.6 ? {color:"var(--rhythm-normal)",fontWeight:700} : {}}>{p.value.toFixed(3)}</td>
+                                        </tr>
+                                      ))}
                                     </tbody>
                                   </table>
                                 </div>
@@ -3405,123 +3381,67 @@ export default function ECGSimulatorPage() {
                       {diagSubTab === "length" && (
                         <div className="flex flex-col gap-3 animate-fade-in">
                           {/* Physical Demographics & BMI */}
-                          <div className="bg-surface2 p-3 rounded-lg border border-border">
-                            <div className="text-[10px] text-accent font-bold uppercase tracking-wider mb-2.5 flex items-center gap-1">
-                              <i className="fa-solid fa-user-doctor"></i> Physical Characteristics & BMI
+                          <div className="diag-meta-section">
+                            <div className="diag-meta-section-header">
+                              <i className="fa-solid fa-user-doctor"></i> Physical Demographics
                             </div>
-                            <div className="grid grid-cols-2 gap-3 text-xs mb-3">
-                              <div className="flex flex-col">
-                                <span className="text-[9px] text-muted-foreground uppercase font-bold tracking-wider mb-0.5">Age / Sex</span>
-                                <span className="font-semibold">{selectedRecord.age || "Unknown"} yr &middot; {selectedRecord.sex === 0 ? "Male" : "Female"}</span>
+                            <div className="diag-meta-grid">
+                              <div className="diag-meta-field">
+                                <span className="diag-meta-field-label">Age / Sex</span>
+                                <span className="diag-meta-field-value">{selectedRecord.age || "?"} yr · {selectedRecord.sex === 0 ? "Male" : "Female"}</span>
                               </div>
-                              <div className="flex flex-col">
-                                <span className="text-[9px] text-muted-foreground uppercase font-bold tracking-wider mb-0.5">Physical Frame</span>
-                                <span className="font-semibold">{selectedRecord.height ? `${selectedRecord.height} cm` : "N/A"} &middot; {selectedRecord.weight ? `${selectedRecord.weight} kg` : "N/A"}</span>
+                              <div className="diag-meta-field">
+                                <span className="diag-meta-field-label">Physical Frame</span>
+                                <span className="diag-meta-field-value">{selectedRecord.height ? `${selectedRecord.height}cm` : "N/A"} · {selectedRecord.weight ? `${selectedRecord.weight}kg` : "N/A"}</span>
                               </div>
                             </div>
                             
-                            {/* Dynamic BMI Gauge */}
+                            {/* BMI */}
                             {selectedRecord.height && selectedRecord.weight ? (() => {
-                              const heightM = selectedRecord.height / 100;
-                              const bmiVal = Number((selectedRecord.weight / (heightM * heightM)).toFixed(1));
-                              let cat = "Normal";
-                              let color = "var(--correct)";
+                              const bmiVal = Number((selectedRecord.weight / ((selectedRecord.height/100) ** 2)).toFixed(1));
+                              let cat = "Normal", color = "var(--correct)";
                               if (bmiVal < 18.5) { cat = "Underweight"; color = "var(--accent)"; }
                               else if (bmiVal >= 25 && bmiVal < 30) { cat = "Overweight"; color = "var(--accent)"; }
                               else if (bmiVal >= 30) { cat = "Obese"; color = "var(--wrong)"; }
-                              
                               return (
-                                <div className="border-t border-border border-opacity-40 pt-2.5 flex justify-between items-center">
-                                  <div className="flex flex-col">
-                                    <span className="text-[9px] text-muted-foreground uppercase font-bold tracking-wider mb-0.5">Body Mass Index (BMI)</span>
-                                    <span className="font-mono text-sm font-extrabold">{bmiVal} <span className="text-[9px] font-normal text-muted-foreground font-sans">kg/m²</span></span>
+                                <div className="diag-bmi-row">
+                                  <div className="diag-bmi-info">
+                                    <span className="diag-bmi-label">BMI</span>
+                                    <span className="diag-bmi-value">{bmiVal} <span>kg/m²</span></span>
                                   </div>
-                                  <span 
-                                    className="px-2 py-0.5 rounded text-[9px] font-bold uppercase border"
-                                    style={{ color, borderColor: `${color}40`, backgroundColor: `${color}10` }}
-                                  >
-                                    {cat}
-                                  </span>
+                                  <span className="diag-bmi-category" style={{color, border:`1px solid ${color}40`, background:`${color}15`}}>{cat}</span>
                                 </div>
                               );
                             })() : (
-                              <div className="border-t border-border border-opacity-40 pt-2 text-[10px] text-muted">
-                                Height or weight missing. Cannot calculate Body Mass Index.
-                              </div>
+                              <div style={{paddingTop:"0.4rem",borderTop:"1px solid var(--border)",fontSize:"0.6rem",color:"var(--text-muted)",marginTop:"0.4rem"}}>Height or weight missing.</div>
                             )}
                           </div>
 
                           {/* Technical Waveform Stats */}
-                          <div className="bg-surface2 p-3 rounded-lg border border-border">
-                            <div className="text-[10px] text-accent font-bold uppercase tracking-wider mb-2 flex items-center gap-1">
-                              <i className="fa-solid fa-wave-square"></i> Waveform & Signal Properties
+                          <div className="diag-meta-section">
+                            <div className="diag-meta-section-header">
+                              <i className="fa-solid fa-wave-square"></i> Signal Properties
                             </div>
-                            <div className="flex flex-col gap-1.5 text-[10px] font-mono">
-                              <div className="flex justify-between py-0.5 border-b border-border border-opacity-20">
-                                <span className="text-muted-foreground">ECG Duration</span>
-                                <span className="font-semibold text-foreground">10.0 seconds</span>
-                              </div>
-                              <div className="flex justify-between py-0.5 border-b border-border border-opacity-20">
-                                <span className="text-muted-foreground">Sampling Rate</span>
-                                <span className="font-semibold text-foreground">500 Hz</span>
-                              </div>
-                              <div className="flex justify-between py-0.5 border-b border-border border-opacity-20">
-                                <span className="text-muted-foreground">Raw Data Points</span>
-                                <span className="font-semibold text-foreground">5,000 samples / lead</span>
-                              </div>
-                              <div className="flex justify-between py-0.5">
-                                <span className="text-muted-foreground">Channel Setup</span>
-                                <span className="font-semibold text-foreground">12 Leads (Standard)</span>
-                              </div>
+                            <div className="diag-props-table">
+                              <div className="diag-prop-row"><span className="diag-prop-label">Duration</span><span className="diag-prop-value">10.0s</span></div>
+                              <div className="diag-prop-row"><span className="diag-prop-label">Sampling</span><span className="diag-prop-value">500 Hz</span></div>
+                              <div className="diag-prop-row"><span className="diag-prop-label">Samples</span><span className="diag-prop-value">5,000 / lead</span></div>
+                              <div className="diag-prop-row"><span className="diag-prop-label">Channels</span><span className="diag-prop-value">12 Leads</span></div>
                             </div>
                           </div>
 
-                          {/* Complete Administrative Database Fields */}
-                          <div className="bg-surface2 p-3 rounded-lg border border-border">
-                            <div className="text-[10px] text-accent font-bold uppercase tracking-wider mb-2 flex items-center gap-1">
-                              <i className="fa-solid fa-database"></i> Clinical Registry Database Metadata
+                          {/* Admin Metadata */}
+                          <div className="diag-meta-section">
+                            <div className="diag-meta-section-header">
+                              <i className="fa-solid fa-database"></i> Registry Metadata
                             </div>
-                            <div className="flex flex-col gap-1.5 text-[10px] font-mono">
-                              <div className="flex justify-between py-0.5 border-b border-border border-opacity-20">
-                                <span className="text-muted-foreground">Recording Date</span>
-                                <span className="font-semibold text-foreground">{selectedRecord.recording_date ? selectedRecord.recording_date.replace("T", " ") : "N/A"}</span>
-                              </div>
-                              <div className="flex justify-between py-0.5 border-b border-border border-opacity-20">
-                                <span className="text-muted-foreground">Device / Model</span>
-                                <span className="font-semibold text-foreground truncate max-w-[150px]">{selectedRecord.device || "Schiller System"}</span>
-                              </div>
-                              <div className="flex justify-between py-0.5 border-b border-border border-opacity-20">
-                                <span className="text-muted-foreground">Electrical Axis</span>
-                                <span className="font-semibold text-foreground flex items-center gap-1">
-                                  {selectedRecord.heart_axis || "NORMAL"}
-                                  <span className="text-[8px] text-muted-foreground font-normal font-sans">
-                                    ({selectedRecord.heart_axis === "LAD" ? "Left Dev" : selectedRecord.heart_axis === "RAD" ? "Right Dev" : "Normal"})
-                                  </span>
-                                </span>
-                              </div>
-                              <div className="flex justify-between py-0.5 border-b border-border border-opacity-20">
-                                <span className="text-muted-foreground">Pacemaker State</span>
-                                <span className={`font-bold px-1.5 py-0.2 rounded text-[8px] uppercase border ${
-                                  selectedRecord.pacemaker === 1 
-                                    ? "text-emerald-400 bg-emerald-500 bg-opacity-10 border-emerald-500 border-opacity-20" 
-                                    : "text-muted-foreground bg-surface border-border border-opacity-40"
-                                }`}>
-                                  {selectedRecord.pacemaker === 1 ? "Active" : "None"}
-                                </span>
-                              </div>
-                              <div className="flex justify-between py-0.5 border-b border-border border-opacity-20">
-                                <span className="text-muted-foreground">validated Cardiologist</span>
-                                <span className="font-semibold text-foreground">MD-Cardio #{selectedRecord.validated_by || "0"}</span>
-                              </div>
-                              <div className="flex justify-between py-0.5 border-b border-border border-opacity-20">
-                                <span className="text-muted-foreground">Nurse Technician</span>
-                                <span className="font-semibold text-foreground">Nurse #{selectedRecord.nurse || "0"}</span>
-                              </div>
-                              <div className="flex justify-between py-0.5">
-                                <span className="text-muted-foreground">Recording Site ID</span>
-                                <span className="font-semibold text-foreground">Site #{selectedRecord.site || "0"}</span>
-                              </div>
-                            </div>
+                            <div className="diag-registry-row"><span className="diag-registry-label">Date</span><span className="diag-registry-value">{selectedRecord.recording_date ? selectedRecord.recording_date.replace("T"," ") : "N/A"}</span></div>
+                            <div className="diag-registry-row"><span className="diag-registry-label">Device</span><span className="diag-registry-value">{selectedRecord.device || "Schiller"}</span></div>
+                            <div className="diag-registry-row"><span className="diag-registry-label">Axis</span><span className="diag-registry-value">{selectedRecord.heart_axis || "NORMAL"}</span></div>
+                            <div className="diag-registry-row"><span className="diag-registry-label">Pacemaker</span><span className="diag-registry-value" style={{color: selectedRecord.pacemaker === 1 ? "var(--rhythm-normal)" : "var(--text-muted)"}}>{selectedRecord.pacemaker === 1 ? "Active" : "None"}</span></div>
+                            <div className="diag-registry-row"><span className="diag-registry-label">Cardiologist</span><span className="diag-registry-value">#{selectedRecord.validated_by || "0"}</span></div>
+                            <div className="diag-registry-row"><span className="diag-registry-label">Nurse</span><span className="diag-registry-value">#{selectedRecord.nurse || "0"}</span></div>
+                            <div className="diag-registry-row"><span className="diag-registry-label">Site</span><span className="diag-registry-value">#{selectedRecord.site || "0"}</span></div>
                           </div>
                         </div>
                       )}
@@ -3529,144 +3449,99 @@ export default function ECGSimulatorPage() {
                   )}
                 </div>
 
-                    {/* DATABASE ENGINE SEEDER SETUP TAB */}
-                <div className={`tab-content ${activeTab === "db-setup" ? "active" : ""}`} id="tab-db-setup">
-                  <div className="wave-customizer">
-                    <div className="manual-banner" style={{ display: "block" }}>
-                      <div className="manual-banner-text">Database Setup</div>
-                      <div className="manual-banner-desc">Manage the local PTB-XL+ 1.0.1 SQLite engine.</div>
+                {/* DATABASE ENGINE SEEDER SETUP TAB */}
+                <div className={`tab-content ${activeTab === "db-setup" ? "active" : ""} animate-fade-in`} id="tab-db-setup">
+                  <div className="db-setup-section">
+                    {/* Status Card */}
+                    <div className="db-setup-card">
+                      <div className="db-setup-status-row">
+                        <div>
+                          <div className="db-setup-status-label">Database Status</div>
+                          <div className="db-setup-status-desc">{dbStatus === "seeded" ? "Engine ready with records" : "No records loaded"}</div>
+                        </div>
+                        <span className={`db-setup-status-badge ${dbStatus === "seeded" ? "seeded" : "unseeded"}`}>
+                          {dbStatus === "seeded" ? "SEEDED" : "EMPTY"}
+                        </span>
+                      </div>
                     </div>
 
-                    <div className="param-grid pb-3 mb-3" style={{ marginBottom: "1.5rem", paddingBottom: "1.0rem" }}>
+                    {/* Config Card */}
+                    <div className="db-setup-card">
+                      <div style={{fontSize:"0.7rem",fontWeight:700,marginBottom:"0.4rem",color:"var(--accent)"}}>Pull Configuration</div>
                       <div className="toggle-row">
                         <div>
-                          <div className="tr-label">DATABASE STATUS</div>
-                          <div className="tr-desc">Engine contains {dbStatus === "seeded" ? "active" : "0"} records</div>
+                          <div className="tr-label">Dataset Mode</div>
+                          <div className="tr-desc">Controls record count & signals</div>
                         </div>
-                        <div className={`text-xs font-bold ${dbStatus === "seeded" ? "text-emerald-400" : "text-amber-400"}`}>
-                          {dbStatus === "seeded" ? "ACTIVE & SEEDED" : "NOT CONFIGURED"}
-                        </div>
-                      </div>
-
-                      <div className="toggle-row">
-                        <div>
-                          <div className="tr-label">Dataset Depth</div>
-                          <div className="tr-desc">Select how many records to fetch</div>
-                        </div>
-                        <select 
-                          className="bg-surface2 text-foreground border border-border rounded px-2 py-1 text-xs outline-none"
-                          value={pullMode}
-                          onChange={(e) => {
-                            const val = e.target.value;
-                            setPullMode(val);
-                            if (val === "metadata_only") setPullCount(21837);
-                            else if (val === "full_force") setPullCount(21837);
-                            else setPullCount(36);
-                          }}
-                          disabled={seedingActive}
-                        >
-                          <option value="metadata_only">Online Mode (Metadata Only - Recommended)</option>
-                          <option value="partial">Local Mode (Partial + Signals cached)</option>
-                          <option value="full_force">Local Mode (Full + Signals cached)</option>
+                        <select className="db-setup-select" value={pullMode} onChange={(e) => {
+                          const val = e.target.value;
+                          setPullMode(val);
+                          if (val === "metadata_only" || val === "full_force") setPullCount(21837);
+                          else setPullCount(36);
+                        }} disabled={seedingActive}>
+                          <option value="metadata_only">Online (Metadata)</option>
+                          <option value="partial">Partial + Signals</option>
+                          <option value="full_force">Full + Signals</option>
                         </select>
                       </div>
-
                       <div className="toggle-row">
                         <div>
-                          <div className="tr-label">Maximum Records</div>
-                          <div className="tr-desc">Approximate count to retrieve</div>
+                          <div className="tr-label">Max Records</div>
+                          <div className="tr-desc">Upper count to retrieve</div>
                         </div>
-                        <input
-                          type="number"
-                          className="bg-surface2 text-foreground border border-border rounded px-2 py-1 text-xs outline-none w-24 text-right"
-                          value={pullCount}
-                          onChange={(e) => setPullCount(Number(e.target.value))}
-                          min={36}
-                          step={36}
-                          disabled={seedingActive}
-                        />
+                        <input className="db-setup-number" type="number" value={pullCount} onChange={(e) => setPullCount(Number(e.target.value))} min={36} step={36} disabled={seedingActive} />
                       </div>
-
-                      {/* Overwrite existing data toggle */}
-                      <div className="toggle-row" style={{ borderTop: "1px solid var(--border)", paddingTop: "0.75rem" }}>
+                      <div className="toggle-row" style={{borderTop:"1px solid var(--border)",marginTop:"0.3rem",paddingTop:"0.5rem"}}>
                         <div>
-                          <div className="tr-label">Overwrite Existing Data</div>
-                          <div className="tr-desc">Clear and re-import all records</div>
+                          <div className="tr-label">Overwrite</div>
+                          <div className="tr-desc">Clear before re-import</div>
                         </div>
                         <label className="toggle-switch">
-                          <input
-                            type="checkbox"
-                            checked={overwriteDb}
-                            onChange={(e) => setOverwriteDb(e.target.checked)}
-                          />
+                          <input type="checkbox" checked={overwriteDb} onChange={(e) => setOverwriteDb(e.target.checked)} />
                           <span className="toggle-slider"></span>
                         </label>
                       </div>
                     </div>
 
-                    {/* Download progress bar */}
+                    {/* Progress */}
                     {seedingActive && (
-                      <div className="mt-2 mb-3">
-                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: "10px", color: "var(--text-muted)", marginBottom: "4px" }}>
-                          <span><i className="fa-solid fa-download mr-1"></i> Downloading...</span>
-                          <span>{downloadProgress}/{downloadTotal}</span>
-                        </div>
-                        <div style={{ height: "6px", background: "var(--border)", borderRadius: "3px", overflow: "hidden" }}>
-                          <div style={{ height: "100%", width: `${downloadTotal > 0 ? (downloadProgress / downloadTotal) * 100 : 5}%`, background: "var(--accent)", borderRadius: "3px", transition: "width 0.3s ease" }}></div>
+                      <div className="db-setup-card">
+                        <div className="db-setup-progress">
+                          <div className="db-setup-progress-header">
+                            <span><i className="fa-solid fa-download"></i> Downloading...</span>
+                            <span>{downloadProgress}/{downloadTotal}</span>
+                          </div>
+                          <div className="db-setup-progress-bar">
+                            <div className="db-setup-progress-fill" style={{width:`${downloadTotal > 0 ? (downloadProgress/downloadTotal)*100 : 5}%`}}></div>
+                          </div>
                         </div>
                       </div>
                     )}
 
-                    <div className="action-row flex flex-col gap-2">
-                      <button
-                        className="btn-action primary disabled:opacity-50 flex items-center justify-center gap-1.5"
-                        onClick={triggerDbSeeding}
-                        disabled={seedingActive}
-                      >
-                        <i className={`fa-solid fa-database ${seedingActive ? "animate-bounce" : ""}`}></i> 
-                        {seedingActive ? " Seeding Archive..." : " Re-trigger SQLite DB Seed"}
+                    {/* Action Buttons */}
+                    <div className="db-setup-card">
+                      <button className="btn-action primary disabled:opacity-50" onClick={triggerDbSeeding} disabled={seedingActive}>
+                        <i className={`fa-solid fa-database ${seedingActive ? "animate-bounce" : ""}`}></i>
+                        {seedingActive ? " Seeding..." : " Seed / Update Database"}
                       </button>
-
                       {dbSeeded && !seedingActive && (
-                        <button
-                          className="btn-action danger disabled:opacity-50 flex items-center justify-center gap-1.5 mt-1"
-                          onClick={async () => {
-                            setOverwriteDb(true);
-                            setSeedingActive(true);
-                            setDbStatus("running");
-                            setDbProgress("Clearing existing database and re-importing...");
-                            setDownloadProgress(0);
-                            setDownloadTotal(pullCount);
-                            try {
-                              const res = await fetch("/api/setup", {
-                                method: "POST",
-                                headers: { "Content-Type": "application/json" },
-                                body: JSON.stringify({ pullConfig: { mode: pullMode, count: pullCount }, overwrite: true })
-                              });
-                              const data = await res.json();
-                              if (data.seeded) {
-                                setDbSeeded(true);
-                                setSeedingActive(false);
-                                setOverwriteDb(false);
-                                setDownloadProgress(pullCount);
-                                fetchRecords();
-                                showToastMsg("Database cleared and re-seeded successfully!");
-                              }
-                            } catch {
-                              setDbStatus("failed");
-                              setDbProgress("Failed to clear and re-import.");
-                              setSeedingActive(false);
-                            }
-                          }}
-                        >
-                          <i className="fa-solid fa-trash-can"></i> Clear & Re-Import All Records
+                        <button className="btn-action danger mt-2" onClick={async () => {
+                          setOverwriteDb(true); setSeedingActive(true); setDbStatus("running"); setDbProgress("Clearing & re-importing..."); setDownloadProgress(0); setDownloadTotal(pullCount);
+                          try {
+                            const res = await fetch("/api/setup", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({pullConfig:{mode:pullMode,count:pullCount}, overwrite:true}) });
+                            const data = await res.json();
+                            if (data.seeded) { setDbSeeded(true); setSeedingActive(false); setOverwriteDb(false); setDownloadProgress(pullCount); fetchRecords(); showToastMsg("Re-imported successfully!"); }
+                          } catch { setDbStatus("failed"); setDbProgress("Failed."); setSeedingActive(false); }
+                        }}>
+                          <i className="fa-solid fa-trash-can"></i> Clear & Re-Import
                         </button>
                       )}
                     </div>
 
+                    {/* Engine Status */}
                     {dbProgress && (
-                      <div className="mt-3 p-2 bg-surface2 text-[10px] text-accent font-mono rounded border border-border break-words">
-                        <span className="text-[9px] text-muted block uppercase font-bold tracking-wider mb-0.5">Engine Status Output</span>
+                      <div className="db-setup-engine-status">
+                        <span className="db-setup-engine-status-title">Engine Output</span>
                         {dbProgress}
                       </div>
                     )}
