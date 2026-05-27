@@ -11,6 +11,13 @@ let globalProgress: SeedProgress = {
 let activePromise: Promise<void> | null = null;
 
 export async function GET(req: NextRequest) {
+  if (activePromise) {
+    return NextResponse.json({
+      seeded: false,
+      progress: globalProgress
+    });
+  }
+
   const seeded = isDatabaseSeeded();
   
   if (seeded) {
@@ -28,18 +35,22 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
-  let pullConfig = { mode: "partial", count: 36 };
+  let pullConfig = { mode: "metadata_only", count: 21837 };
+  let overwrite = false;
   try {
     const body = await req.json();
     if (body.pullConfig) {
       pullConfig = body.pullConfig;
+    }
+    if (body.overwrite) {
+      overwrite = body.overwrite;
     }
   } catch(e) {
     // default to partial
   }
 
   const seeded = isDatabaseSeeded();
-  if (seeded && pullConfig.mode !== "full_force") {
+  if (seeded && !overwrite && pullConfig.mode !== "full_force") {
     return NextResponse.json({
       seeded: true,
       status: "complete",
@@ -63,7 +74,7 @@ export async function POST(req: NextRequest) {
 
   activePromise = (async () => {
     try {
-      await seedDatabase(pullConfig, (p) => {
+      await seedDatabase({ ...pullConfig, overwrite }, (p) => {
         globalProgress = p;
       });
     } catch (err: any) {

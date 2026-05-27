@@ -92,6 +92,7 @@ export function parseBinarySignals(buffer: Buffer, info: { numLeads: number; num
 export interface PullConfig {
   mode: string;
   count?: number;
+  overwrite?: boolean;
 }
 
 export async function seedDatabase(pullConfig: PullConfig, onProgress?: (progress: SeedProgress) => void) {
@@ -99,6 +100,20 @@ export async function seedDatabase(pullConfig: PullConfig, onProgress?: (progres
   const physioNetBase = "https://physionet.org/files/ptb-xl/1.0.1/";
 
   try {
+    // -------------------------------------------------------------
+    // Step 0: Clear DB if overwrite is true
+    // -------------------------------------------------------------
+    if (pullConfig.overwrite) {
+      if (onProgress) {
+        onProgress({ status: "processing_metadata", message: "Clearing existing records for fresh import..." });
+      }
+      db.exec(`
+        DELETE FROM records;
+        DELETE FROM signals;
+        DELETE FROM scp_statements;
+      `);
+    }
+
     // -------------------------------------------------------------
     // Step 1: Seed SCP Statements
     // -------------------------------------------------------------
@@ -164,6 +179,18 @@ export async function seedDatabase(pullConfig: PullConfig, onProgress?: (progres
     const filenameLrIdx = dbHeader.indexOf("filename_lr");
     const filenameHrIdx = dbHeader.indexOf("filename_hr");
     const scpCodesIdx = dbHeader.indexOf("scp_codes");
+    const heightIdx = dbHeader.indexOf("height");
+    const weightIdx = dbHeader.indexOf("weight");
+    const nurseIdx = dbHeader.indexOf("nurse");
+    const siteIdx = dbHeader.indexOf("site");
+    const deviceIdx = dbHeader.indexOf("device");
+    const recordingDateIdx = dbHeader.indexOf("recording_date");
+    const reportIdx = dbHeader.indexOf("report");
+    const heartAxisIdx = dbHeader.indexOf("heart_axis");
+    const infarctionStadium1Idx = dbHeader.indexOf("infarction_stadium1");
+    const infarctionStadium2Idx = dbHeader.indexOf("infarction_stadium2");
+    const validatedByIdx = dbHeader.indexOf("validated_by");
+    const pacemakerIdx = dbHeader.indexOf("pacemaker");
 
     // Group candidates by superclass from scp_codes dictionary
     const categories: Record<string, string[]> = {
@@ -188,6 +215,23 @@ export async function seedDatabase(pullConfig: PullConfig, onProgress?: (progres
       const filenameLr = cols[filenameLrIdx];
       const filenameHr = cols[filenameHrIdx];
       const scpCodesStr = cols[scpCodesIdx];
+
+      const heightVal = heightIdx !== -1 ? cols[heightIdx] : "";
+      const weightVal = weightIdx !== -1 ? cols[weightIdx] : "";
+      const pacemakerVal = pacemakerIdx !== -1 ? cols[pacemakerIdx] : "";
+
+      const height = heightVal && !isNaN(parseFloat(heightVal)) ? Math.round(parseFloat(heightVal)) : null;
+      const weight = weightVal && !isNaN(parseFloat(weightVal)) ? Math.round(parseFloat(weightVal)) : null;
+      const nurse = nurseIdx !== -1 ? cols[nurseIdx] || null : null;
+      const site = siteIdx !== -1 ? cols[siteIdx] || null : null;
+      const device = deviceIdx !== -1 ? cols[deviceIdx] || null : null;
+      const recordingDate = recordingDateIdx !== -1 ? cols[recordingDateIdx] || null : null;
+      const report = reportIdx !== -1 ? cols[reportIdx] || null : null;
+      const heartAxis = heartAxisIdx !== -1 ? cols[heartAxisIdx] || null : null;
+      const infarctionStadium1 = infarctionStadium1Idx !== -1 ? cols[infarctionStadium1Idx] || null : null;
+      const infarctionStadium2 = infarctionStadium2Idx !== -1 ? cols[infarctionStadium2Idx] || null : null;
+      const validatedBy = validatedByIdx !== -1 ? cols[validatedByIdx] || null : null;
+      const pacemaker = pacemakerVal === "true" || pacemakerVal === "1" ? 1 : 0;
 
       // Clean python dict braces to parse as JSON easily helper
       // Python: "{'NORM': 100.0, 'CLBBB': 50.0}"
@@ -250,17 +294,104 @@ export async function seedDatabase(pullConfig: PullConfig, onProgress?: (progres
         filenameLr,
         filenameHr,
         superclass: group,
-        scpCodes: JSON.stringify(scpDict)
+        scpCodes: JSON.stringify(scpDict),
+        height,
+        weight,
+        nurse,
+        site,
+        device,
+        recordingDate,
+        report,
+        heartAxis,
+        infarctionStadium1,
+        infarctionStadium2,
+        validatedBy,
+        pacemaker
       };
     }
 
+    // -------------------------------------------------------------
+    // Step 3: Insert all metadata for all 21,837 parsed records first
+    // -------------------------------------------------------------
+    if (onProgress) {
+      onProgress({ status: "processing_metadata", message: "Saving all 21,837 patient records to database metadata..." });
+    }
+
+    const allRecordIds = Object.keys(recordRows).map(id => parseInt(id)).sort((a, b) => a - b);
+    const insertRecord = db.prepare(`
+      INSERT OR REPLACE INTO records (
+        ecg_id, patient_id, age, sex, filename_lr, filename_hr, superclass, scp_codes, patient_metadata,
+        height, weight, report, recording_date, heart_axis, pacemaker, device, nurse, site, validated_by, infarction_stadium1, infarction_stadium2
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    db.transaction(() => {
+      for (const ecgId of allRecordIds) {
+        const meta = recordRows[ecgId];
+        if (!meta) continue;
+        insertRecord.run(
+          meta.ecgId,
+          meta.patientId,
+          meta.age,
+          meta.sex,
+          meta.filenameLr,
+          meta.filenameHr,
+          meta.superclass,
+          meta.scpCodes,
+          JSON.stringify({
+            scp_primary_group: meta.superclass,
+            rec_id_number: ecgId,
+            strat_fold: 10,
+            height: meta.height,
+            weight: meta.weight,
+            report: meta.report,
+            recording_date: meta.recordingDate,
+            heart_axis: meta.heartAxis,
+            pacemaker: meta.pacemaker,
+            device: meta.device,
+            nurse: meta.nurse,
+            site: meta.site,
+            validated_by: meta.validatedBy,
+            infarction_stadium1: meta.infarctionStadium1,
+            infarction_stadium2: meta.infarctionStadium2
+          }),
+          meta.height,
+          meta.weight,
+          meta.report,
+          meta.recordingDate,
+          meta.heartAxis,
+          meta.pacemaker,
+          meta.device,
+          meta.nurse,
+          meta.site,
+          meta.validatedBy,
+          meta.infarctionStadium1,
+          meta.infarctionStadium2
+        );
+      }
+    })();
+
+    // -------------------------------------------------------------
+    // Step 4: Handle Online Mode (Metadata Only) vs Offline Mode
+    // -------------------------------------------------------------
+    if (pullConfig.mode === "metadata_only" || pullConfig.mode === "online") {
+      if (onProgress) {
+        onProgress({
+          status: "complete",
+          message: "Online mode initialized successfully! All 21,837 metadata records seeded. Waveforms will fetch on-demand.",
+          count: allRecordIds.length,
+          total: allRecordIds.length
+        });
+      }
+      return;
+    }
+
+    // Offline mode: Determine subset of signals to download/cache
     const selectedIds: number[] = [];
     
     if (pullConfig.mode === "full" || pullConfig.mode === "full_force") {
-      // For "full" database, take up to everything. 
-      // Note: fetching 21000 records sequentially will take hours and might hit memory/timeout limits on cloud run.
-      // But we will allow pulling up to pullConfig.count if provided, else maybe cap at 1000 for safety, or full.
-      const totalRequested = pullConfig.count || 21837; 
+      const totalRequested = pullConfig.count || 1000; // default to a safe limit for full local download
       let count = 0;
       for (const [group, idsForGroup] of Object.entries(categories)) {
         for (let i = 0; i < idsForGroup.length; i++) {
@@ -292,21 +423,16 @@ export async function seedDatabase(pullConfig: PullConfig, onProgress?: (progres
     if (onProgress) {
       onProgress({
         status: "downloading_signals",
-        message: "Fetching digital signal binary waveforms (100Hz and 500Hz)...",
+        message: "Fetching digital signal binary waveforms (500Hz only)...",
         count: 0,
         total: selectedIds.length
       });
     }
 
     let completed = 0;
-    const insertRecord = db.prepare(`
-      INSERT OR REPLACE INTO records (ecg_id, patient_id, age, sex, filename_lr, filename_hr, superclass, scp_codes, patient_metadata)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
     const insertSignal = db.prepare(`
       INSERT OR REPLACE INTO signals (ecg_id, frequency, data)
-      VALUES (?, ?, ?)
+      VALUES (?, 500, ?)
     `);
 
     // Download and parse `.hea` and `.dat` files for each selected patient record
@@ -317,32 +443,14 @@ export async function seedDatabase(pullConfig: PullConfig, onProgress?: (progres
       if (onProgress) {
         onProgress({
           status: "downloading_signals",
-          message: `Ingesting clinical signals for patient ECG-ID ${ecgId}...`,
+          message: `Ingesting 500Hz signals for patient ECG-ID ${ecgId}...`,
           count: completed + 1,
           total: selectedIds.length
         });
       }
 
       try {
-        // A. Process 100Hz Signal
-        const lrHeaUrl = `${physioNetBase}${meta.filenameLr}.hea`;
-        const lrDatUrl = `${physioNetBase}${meta.filenameLr}.dat`;
-
-        const lrHeaRes = await fetch(lrHeaUrl);
-        const lrDatRes = await fetch(lrDatUrl);
-
-        if (lrHeaRes.ok && lrDatRes.ok) {
-          const heaText = await lrHeaRes.text();
-          const datBufArr = await lrDatRes.arrayBuffer();
-          const datBuf = Buffer.from(datBufArr);
-
-          const headerInfo = parseHeader(heaText);
-          const signals100 = parseBinarySignals(datBuf, headerInfo);
-
-          insertSignal.run(ecgId, 100, JSON.stringify(signals100));
-        }
-
-        // B. Process 500Hz Signal
+        // Process 500Hz Signal only (100Hz removed)
         const hrHeaUrl = `${physioNetBase}${meta.filenameHr}.hea`;
         const hrDatUrl = `${physioNetBase}${meta.filenameHr}.dat`;
 
@@ -357,25 +465,8 @@ export async function seedDatabase(pullConfig: PullConfig, onProgress?: (progres
           const headerInfo = parseHeader(heaText);
           const signals500 = parseBinarySignals(datBuf, headerInfo);
 
-          insertSignal.run(ecgId, 500, JSON.stringify(signals500));
+          insertSignal.run(ecgId, JSON.stringify(signals500));
         }
-
-        // C. Save patient record metadata
-        insertRecord.run(
-          meta.ecgId,
-          meta.patientId,
-          meta.age,
-          meta.sex,
-          meta.filenameLr,
-          meta.filenameHr,
-          meta.superclass,
-          meta.scpCodes,
-          JSON.stringify({
-            scp_primary_group: meta.superclass,
-            rec_id_number: ecgId,
-            strat_fold: 10
-          })
-        );
 
         completed++;
       } catch (err) {

@@ -61,13 +61,12 @@ function getRecordSignalForLead(signals: any, leadName: string, applyFilter: boo
   if (applyFilter) {
     const out = new Array(targetArr.length);
     for (let i = 0; i < targetArr.length; i++) {
-      let sum = 0;
-      let count = 0;
-      for (let j = Math.max(0, i - 2); j <= Math.min(targetArr.length - 1, i + 2); j++) {
-        sum += targetArr[j];
-        count++;
+      if (i < 2 || i > targetArr.length - 3) {
+        out[i] = targetArr[i]; // Preserve original boundary samples
+      } else {
+        // Savitzky-Golay 5-point quadratic smoothing
+        out[i] = (-3 * targetArr[i - 2] + 12 * targetArr[i - 1] + 17 * targetArr[i] + 12 * targetArr[i + 1] - 3 * targetArr[i + 2]) / 35;
       }
-      out[i] = sum / count;
     }
     return out;
   }
@@ -142,17 +141,159 @@ function estimateHeartRate(signalArray: number[], freq: number = 100): number {
   return Math.round(bpm);
 }
 
+function analyzeECGPeaks(signals: any, leadName: string, freq: number = 500) {
+  const signalArray = getRecordSignalForLead(signals, leadName, false);
+  if (!signalArray || signalArray.length === 0) {
+    return null;
+  }
+
+  // 1. Find the maximum absolute value in the signal to set a threshold
+  let maxAbs = 0;
+  for (let i = 0; i < signalArray.length; i++) {
+    const absVal = Math.abs(signalArray[i]);
+    if (absVal > maxAbs) maxAbs = absVal;
+  }
+
+  // 2. Simple Pan-Tompkins derivative & integration
+  const derivative = new Float32Array(signalArray.length);
+  for (let i = 2; i < signalArray.length - 2; i++) {
+    derivative[i] = (2 * signalArray[i+1] + signalArray[i] - signalArray[i-1] - 2 * signalArray[i-2]) / 8;
+  }
+
+  // Square and integrate derivative with a moving window
+  const windowSize = Math.round(0.08 * freq); // 80ms moving window
+  const integrated = new Float32Array(signalArray.length);
+  for (let i = 0; i < signalArray.length; i++) {
+    let sum = 0;
+    for (let j = Math.max(0, i - windowSize); j <= i; j++) {
+      sum += derivative[j] * derivative[j];
+    }
+    integrated[i] = sum;
+  }
+
+  // Find max in integrated signal
+  let maxInt = 0;
+  for (let i = 0; i < integrated.length; i++) {
+    if (integrated[i] > maxInt) maxInt = integrated[i];
+  }
+
+  // 3. Peak detection on integrated signal
+  const peakIndices: number[] = [];
+  const minSpacing = Math.round(0.35 * freq); // Refractory period of 350ms (max HR ~170 bpm)
+  const threshold = maxInt * 0.15; // Noise threshold
+
+  let lastPeakIndex = -minSpacing;
+  for (let i = 2; i < integrated.length - 2; i++) {
+    if (integrated[i] > threshold && 
+        integrated[i] > integrated[i-1] && 
+        integrated[i] > integrated[i-2] && 
+        integrated[i] > integrated[i+1] && 
+        integrated[i] > integrated[i+2]) {
+      
+      if (i - lastPeakIndex > minSpacing) {
+        // Search local neighborhood in original signal for exact R-peak (maximum value)
+        let exactPeakIdx = i;
+        let maxVal = -Infinity;
+        const searchHalfWindow = Math.round(0.05 * freq); // 50ms search window
+        const start = Math.max(0, i - searchHalfWindow);
+        const end = Math.min(signalArray.length - 1, i + searchHalfWindow);
+        
+        for (let k = start; k <= end; k++) {
+          if (signalArray[k] > maxVal) {
+            maxVal = signalArray[k];
+            exactPeakIdx = k;
+          }
+        }
+        
+        peakIndices.push(exactPeakIdx);
+        lastPeakIndex = i;
+      }
+    }
+  }
+
+  // If no peaks found, fall back to simple thresholding
+  if (peakIndices.length === 0) {
+    let inPeak = false;
+    let fallbackLastPeak = -minSpacing;
+    const thresh = maxAbs * 0.5;
+    for (let i = 0; i < signalArray.length; i++) {
+      if (signalArray[i] > thresh) {
+        if (!inPeak && (i - fallbackLastPeak) > minSpacing) {
+          peakIndices.push(i);
+          fallbackLastPeak = i;
+          inPeak = true;
+        }
+      } else if (signalArray[i] < thresh - 0.1) {
+        inPeak = false;
+      }
+    }
+  }
+
+  // Calculate metrics
+  const rrIntervalsMs: number[] = [];
+  for (let i = 1; i < peakIndices.length; i++) {
+    const diffSamples = peakIndices[i] - peakIndices[i-1];
+    const diffMs = (diffSamples / freq) * 1000;
+    rrIntervalsMs.push(Number(diffMs.toFixed(1)));
+  }
+
+  const numPeaks = peakIndices.length;
+  const durationSec = signalArray.length / freq;
+  const calculatedBPM = Math.round((numPeaks / durationSec) * 60);
+
+  // Heart Rate Variability (HRV) metrics
+  let meanRR = 0;
+  let sdnn = 0;
+  let rmssd = 0;
+
+  if (rrIntervalsMs.length > 0) {
+    const sumRR = rrIntervalsMs.reduce((a, b) => a + b, 0);
+    meanRR = sumRR / rrIntervalsMs.length;
+
+    const squaredDiffs = rrIntervalsMs.map(val => Math.pow(val - meanRR, 2));
+    const meanSquaredDiff = squaredDiffs.reduce((a, b) => a + b, 0) / squaredDiffs.length;
+    sdnn = Math.sqrt(meanSquaredDiff);
+
+    let sumSuccessiveSquaredDiffs = 0;
+    for (let i = 1; i < rrIntervalsMs.length; i++) {
+      sumSuccessiveSquaredDiffs += Math.pow(rrIntervalsMs[i] - rrIntervalsMs[i-1], 2);
+    }
+    rmssd = rrIntervalsMs.length > 1 
+      ? Math.sqrt(sumSuccessiveSquaredDiffs / (rrIntervalsMs.length - 1)) 
+      : 0;
+  }
+
+  const peaksInfo = peakIndices.map((idx) => {
+    return {
+      index: idx,
+      time: Number((idx / freq).toFixed(3)),
+      value: signalArray[idx]
+    };
+  });
+
+  return {
+    calculatedBPM,
+    peaksCount: numPeaks,
+    peaksInfo,
+    rrIntervalsMs,
+    meanRR: Math.round(meanRR),
+    sdnn: Number(sdnn.toFixed(1)),
+    rmssd: Number(rmssd.toFixed(1))
+  };
+}
+
 export default function ECGSimulatorPage() {
   // ── Mode selection (clinical db vs mathematical simulator) ──
   const [mode, setMode] = useState<string>("database"); // "database" or "simulation"
 
   // ── Database pulling config ──
-  const [pullMode, setPullMode] = useState<string>("partial");
-  const [pullCount, setPullCount] = useState<number>(36);
+  const [pullMode, setPullMode] = useState<string>("metadata_only");
+  const [pullCount, setPullCount] = useState<number>(21837);
   const [filterSignal, setFilterSignal] = useState<boolean>(false);
 
   // ── Tab state ──
   const [activeTab, setActiveTab] = useState<string>("db-explorer");
+  const [diagSubTab, setDiagSubTab] = useState<"overview" | "peaks" | "length">("overview");
 
   // ── Database records state ──
   const [dbSeeded, setDbSeeded] = useState<boolean>(false);
@@ -172,7 +313,7 @@ export default function ECGSimulatorPage() {
 
   const [recordsLoading, setRecordsLoading] = useState<boolean>(false);
   const [signalsLoading, setSignalsLoading] = useState<boolean>(false);
-  const [selectedFreq, setSelectedFreq] = useState<number>(100);
+  const [selectedFreq, setSelectedFreq] = useState<number>(500);
 
   // ── Rhythm and lead selections ──
   const [currentRhythm, setCurrentRhythm] = useState<string>("nsr");
@@ -273,9 +414,14 @@ export default function ECGSimulatorPage() {
     // Database mode values
     mode: "database",
     signals: null as any | null,
-    frequency: 100,
+    frequency: 500,
     filterSignal: false,
-    timeElapsed: 0.0
+    timeElapsed: 0.0,
+    // 12-lead scrolling offset for database mode
+    scrollOffset: 0.0,
+    activeTab: "db-explorer",
+    diagSubTab: "overview",
+    peaksAnalysis: null as any | null
   });
 
   // ── Synchronize React state variations to the drawing variables thread ──
@@ -304,6 +450,8 @@ export default function ECGSimulatorPage() {
     stateRef.current.signals = recordSignals;
     stateRef.current.frequency = selectedFreq;
     stateRef.current.filterSignal = filterSignal;
+    stateRef.current.activeTab = activeTab;
+    stateRef.current.diagSubTab = diagSubTab;
   }, [
     paused,
     viewMode,
@@ -326,7 +474,9 @@ export default function ECGSimulatorPage() {
     mode,
     recordSignals,
     selectedFreq,
-    filterSignal
+    filterSignal,
+    activeTab,
+    diagSubTab
   ]);
 
   // ── Database Setup and Records Integration Hooks ──
@@ -342,21 +492,36 @@ export default function ECGSimulatorPage() {
     }
   }
 
-  async function fetchRecords(searchStr = searchQuery, filterStr = superclassFilter, currentOffset = dbOffset) {
+  const [overwriteDb, setOverwriteDb] = useState<boolean>(false);
+  const [downloadProgress, setDownloadProgress] = useState<number>(0);
+  const [downloadTotal, setDownloadTotal] = useState<number>(0);
+  const fetchLock = useRef<boolean>(false);
+
+  async function fetchRecords(searchStr = searchQuery, filterStr = superclassFilter, currentOffset = dbOffset, append = false) {
     try {
       setRecordsLoading(true);
       const url = `/api/records?superclass=${filterStr}&limit=${dbLimit}&offset=${currentOffset}&search=${encodeURIComponent(searchStr)}`;
       const res = await fetch(url);
       const data = await res.json();
       if (data.records) {
-        setDbRecords(data.records);
+        if (append && currentOffset > 0) {
+          setDbRecords(prev => {
+            const existingIds = new Set(prev.map((r: any) => r.ecg_id));
+            const newRecords = data.records.filter((r: any) => !existingIds.has(r.ecg_id));
+            return [...prev, ...newRecords];
+          });
+        } else {
+          setDbRecords(data.records);
+        }
         setDbClassCounts(data.classCounts || {});
         
         // Auto-select first matching record if none selected or if selected is stale
-        if (data.records.length > 0) {
-          const alreadySelectedIdx = data.records.findIndex((r: any) => selectedRecord && r.ecg_id === selectedRecord.ecg_id);
-          if (alreadySelectedIdx < 0) {
-            selectRecordItem(data.records[0]);
+        if (!append || currentOffset === 0) {
+          if (data.records.length > 0) {
+            const alreadySelectedIdx = data.records.findIndex((r: any) => selectedRecord && r.ecg_id === selectedRecord.ecg_id);
+            if (alreadySelectedIdx < 0) {
+              selectRecordItem(data.records[0]);
+            }
           }
         }
       }
@@ -364,11 +529,20 @@ export default function ECGSimulatorPage() {
       console.error("Failed to fetch records:", err);
     } finally {
       setRecordsLoading(false);
+      fetchLock.current = false;
     }
   }
 
   async function selectRecordItem(record: any, freq = selectedFreq) {
     setSelectedRecord(record);
+    // Reset rendering state for new record
+    stateRef.current.scrollOffset = 0.0;
+    stateRef.current.scanX = 0.0;
+    stateRef.current.phase = 0.0;
+    stateRef.current.beatIndex = 0;
+    // Clear sweep buffers
+    if (stateRef.current.sweepBuf) stateRef.current.sweepBuf.fill(lastDimensions.current.H / 2);
+    if (stateRef.current.sweepWritten) stateRef.current.sweepWritten.fill(0);
     try {
       setSignalsLoading(true);
       const url = `/api/ecg/${record.ecg_id}?frequency=${freq}`;
@@ -389,6 +563,23 @@ export default function ECGSimulatorPage() {
     }
   }
 
+  // ── Compute Peak Analysis Dynamically ──
+  const [peaksAnalysis, setPeaksAnalysis] = useState<any | null>(null);
+
+  useEffect(() => {
+    if (mode === "database" && recordSignals) {
+      const analysis = analyzeECGPeaks(recordSignals, currentLead, selectedFreq);
+      setPeaksAnalysis(analysis);
+      stateRef.current.peaksAnalysis = analysis;
+      if (analysis) {
+        setHeartRate(analysis.calculatedBPM);
+      }
+    } else {
+      setPeaksAnalysis(null);
+      stateRef.current.peaksAnalysis = null;
+    }
+  }, [recordSignals, currentLead, selectedFreq, mode]);
+
   useEffect(() => {
     const timer = setTimeout(() => {
       checkDbStatus();
@@ -403,16 +594,32 @@ export default function ECGSimulatorPage() {
         try {
           const res = await fetch("/api/setup");
           const data = await res.json();
-          setDbStatus(data.status);
-          setDbProgress(data.message || "");
-          if (data.seeded) {
-            setDbSeeded(true);
-            setSeedingActive(false);
-            clearInterval(interval);
-            fetchRecords();
-          } else if (data.status === "failed") {
-            setSeedingActive(false);
-            clearInterval(interval);
+          if (data.progress) {
+            setDbStatus(data.progress.status);
+            setDbProgress(data.progress.message || "");
+            if (data.progress.count !== undefined) setDownloadProgress(data.progress.count);
+            if (data.progress.total !== undefined) setDownloadTotal(data.progress.total);
+            if (data.seeded) {
+              setDbSeeded(true);
+              setSeedingActive(false);
+              clearInterval(interval);
+              fetchRecords();
+            } else if (data.progress.status === "error" || data.progress.status === "failed") {
+              setSeedingActive(false);
+              clearInterval(interval);
+            }
+          } else {
+            setDbStatus(data.status);
+            setDbProgress(data.message || "");
+            if (data.seeded) {
+              setDbSeeded(true);
+              setSeedingActive(false);
+              clearInterval(interval);
+              fetchRecords();
+            } else if (data.status === "failed") {
+              setSeedingActive(false);
+              clearInterval(interval);
+            }
           }
         } catch {
           // Ignore failure during background sync
@@ -431,9 +638,15 @@ export default function ECGSimulatorPage() {
       const res = await fetch("/api/setup", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pullConfig: { mode: pullMode, count: pullCount } })
+        body: JSON.stringify({ pullConfig: { mode: pullMode, count: pullCount }, overwrite: overwriteDb })
       });
       const data = await res.json();
+      if (data.progress) {
+        setDbStatus(data.progress.status);
+        setDbProgress(data.progress.message || "");
+        if (data.progress.count !== undefined) setDownloadProgress(data.progress.count);
+        if (data.progress.total !== undefined) setDownloadTotal(data.progress.total);
+      }
       if (data.seeded) {
         setDbSeeded(true);
         setSeedingActive(false);
@@ -451,7 +664,7 @@ export default function ECGSimulatorPage() {
   useEffect(() => {
     if (dbSeeded) {
       const timer = setTimeout(() => {
-        fetchRecords(searchQuery, superclassFilter, dbOffset);
+        fetchRecords(searchQuery, superclassFilter, dbOffset, dbOffset > 0);
       }, 80);
       return () => clearTimeout(timer);
     }
@@ -801,55 +1014,10 @@ export default function ECGSimulatorPage() {
 
       // ── Single Trace Sweep Plotting ──
       if (state.viewMode === "single") {
-        const dbSignalArray = state.mode === "database" ? getRecordSignalForLead(state.signals, state.currentLead, state.filterSignal) : null;
-        if (state.mode === "database" && state.signals && dbSignalArray) {
-          const signalArray = dbSignalArray;
+        if (state.mode === "database") {
           if (!state.paused) {
-            const pixelsThisFrame = pixelsPerSec * dt;
-            const oldScanX = state.scanX;
-            state.scanX += pixelsThisFrame;
-            let wrapped = false;
-            if (state.scanX >= W) {
-              state.scanX -= W;
-              wrapped = true;
-            }
-
-            const totalAdvance = wrapped ? (W - oldScanX) + state.scanX : state.scanX - oldScanX;
-            const drawSteps = Math.max(1, Math.ceil(totalAdvance));
-            const maxX = state.sweepBuf ? state.sweepBuf.length : Math.ceil(W);
-
-            for (let i = 0; i <= drawSteps; i++) {
-              const frac = i / drawSteps;
-              let x = oldScanX + frac * totalAdvance;
-              if (x >= W) x -= W;
-              const xi = Math.floor(x);
-              if (xi >= 0 && xi < maxX) {
-                const percent_x = x / W;
-                let sampleIdx = Math.floor(percent_x * signalArray.length);
-                sampleIdx = Math.min(signalArray.length - 1, Math.max(0, sampleIdx));
-
-                let val = signalArray[sampleIdx] * state.amplitude;
-                if (state.noise > 0) {
-                  val = addTraceNoise(val, sampleIdx * 0.05, 0, state.noise, state.realistic, state.heartRate);
-                }
-
-                // ER R-peak sound beeping
-                const currentSampleVal = signalArray[sampleIdx];
-                const threshold = 0.55;
-                if (currentSampleVal > threshold && !state.rPeakDetected) {
-                  state.rPeakDetected = true;
-                  if (state.soundOn) playBeep();
-                } else if (currentSampleVal < 0.15) {
-                  state.rPeakDetected = false;
-                }
-
-                const yi = centerY - val * pixelsPerMv;
-                if (state.sweepBuf && state.sweepWritten) {
-                  state.sweepBuf[xi] = yi;
-                  state.sweepWritten[xi] = 1;
-                }
-              }
-            }
+            state.scrollOffset = (state.scrollOffset || 0) + dt;
+            if (state.scrollOffset >= 10.0) state.scrollOffset -= 10.0;
           }
         } else if (!state.paused) {
           const bpm = state.heartRate;
@@ -991,75 +1159,188 @@ export default function ECGSimulatorPage() {
 
         ctx.lineJoin = "round";
         ctx.lineCap = "round";
-        const traceLen = state.sweepBuf ? Math.min(Math.ceil(W), state.sweepBuf.length) : Math.ceil(W);
+        
+        if (state.mode === "database") {
+          const dbSignalArray = getRecordSignalForLead(state.signals, state.currentLead, state.filterSignal);
+          if (dbSignalArray) {
+            ctx.beginPath();
+            let first = true;
+            const signalLen = dbSignalArray.length;
+            const signalFreq = (signalLen - 1) / 10.0;
+            const drawSteps = Math.max(Math.ceil(W), Math.ceil(displayDuration * signalFreq));
+            
+            let prevIdx = -1;
+            for (let i = 0; i <= drawSteps; i++) {
+              const norm = i / drawSteps;
+              const px = norm * W;
+              const t = norm * displayDuration;
+              
+              let signalT = t + (state.scrollOffset || 0);
+              signalT = ((signalT % 10.0) + 10.0) % 10.0;
+              const floatIdx = (signalT / 10.0) * (signalLen - 1);
+              const idx0 = Math.floor(floatIdx);
+              const idx1 = Math.min(signalLen - 1, idx0 + 1);
+              const frac = floatIdx - idx0;
+              const val0 = dbSignalArray[idx0];
+              const val1 = dbSignalArray[idx1];
+              let val = (val0 * (1 - frac) + val1 * frac) * state.amplitude;
 
-        // Render NSR Trace
-        if (state.comparisonMode && state.sweepBufCompare) {
-          ctx.beginPath();
-          let prevX_c = -1;
-          for (let x = 0; x < traceLen; x++) {
-            if (!state.sweepWritten || !state.sweepWritten[x]) {
-              prevX_c = -1;
-              continue;
+              if (state.noise > 0) {
+                val = addTraceNoise(val, px * 0.05, 0, state.noise, state.realistic, state.heartRate);
+              }
+              
+              const yCoord = centerY - val * pixelsPerMv;
+              if (first) {
+                ctx.moveTo(px, yCoord);
+                first = false;
+              } else {
+                if (prevIdx !== -1 && Math.abs(idx0 - prevIdx) > signalLen / 2) {
+                  ctx.moveTo(px, yCoord);
+                } else {
+                  ctx.lineTo(px, yCoord);
+                }
+              }
+              prevIdx = idx0;
             }
-            const y = state.sweepBufCompare[x];
-            if (prevX_c < 0 || x - prevX_c > 2) ctx.moveTo(x, y);
-            else ctx.lineTo(x, y);
-            prevX_c = x;
-          }
-          ctx.strokeStyle = colors.trace;
-          ctx.lineWidth = colors.lineWidth;
-          ctx.stroke();
-        }
 
-        // Render Active/Bottom Trace
-        if (state.sweepBuf) {
-          ctx.beginPath();
-          let prevX = -1;
-          for (let x = 0; x < traceLen; x++) {
-            if (!state.sweepWritten || !state.sweepWritten[x]) {
-              prevX = -1;
-              continue;
+            if (colors.glow !== "transparent") {
+              ctx.strokeStyle = colors.glow;
+              ctx.lineWidth = colors.lineWidth * 2.5;
+              ctx.stroke();
             }
-            const y = state.sweepBuf[x];
-            if (prevX < 0 || x - prevX > 2) ctx.moveTo(x, y);
-            else ctx.lineTo(x, y);
-            prevX = x;
-          }
 
-          if (colors.glow !== "transparent") {
-            ctx.strokeStyle = colors.glow;
-            ctx.lineWidth = colors.lineWidth * 2.5;
+            ctx.strokeStyle = colors.trace;
+            ctx.lineWidth = colors.lineWidth;
+            ctx.stroke();
+
+            // R-Peaks Canvas Overlay in db-diagnostic tab, peaks sub-tab
+            if (state.activeTab === "db-diagnostic" && state.diagSubTab === "peaks" && state.peaksAnalysis) {
+              const analysis = state.peaksAnalysis;
+              const scroll = state.scrollOffset || 0;
+              const dur = displayDuration;
+              
+              ctx.save();
+              analysis.peaksInfo.forEach((peak: any) => {
+                let diffT = peak.time - scroll;
+                diffT = ((diffT % 10.0) + 10.0) % 10.0;
+                
+                if (diffT >= 0 && diffT < dur) {
+                  const px = (diffT / dur) * W;
+                  const val = peak.value * state.amplitude;
+                  const py = centerY - val * pixelsPerMv;
+                  
+                  // Draw R vertical dashed line
+                  ctx.strokeStyle = "rgba(46, 160, 67, 0.4)";
+                  ctx.lineWidth = 1.2;
+                  ctx.setLineDash([4, 4]);
+                  ctx.beginPath();
+                  ctx.moveTo(px, 0);
+                  ctx.lineTo(px, H);
+                  ctx.stroke();
+                  ctx.setLineDash([]);
+                  
+                  // Draw glowing green circle
+                  ctx.fillStyle = "#2ea043";
+                  ctx.beginPath();
+                  ctx.arc(px, py, 6, 0, Math.PI * 2);
+                  ctx.fill();
+                  ctx.strokeStyle = "#ffffff";
+                  ctx.lineWidth = 1.5;
+                  ctx.stroke();
+                  
+                  // Draw "R" label text
+                  ctx.fillStyle = "#2ea043";
+                  ctx.font = "bold 10px monospace";
+                  ctx.fillText("R", px - 3, py - 10);
+                }
+              });
+              ctx.restore();
+            }
+
+            if (!state.paused) {
+              const currentSampleIdx = Math.floor(((state.scrollOffset || 0) / 10.0) * (signalLen - 1));
+              const currentSampleVal = dbSignalArray[currentSampleIdx];
+              const threshold = 0.55;
+              if (currentSampleVal > threshold && !state.rPeakDetected) {
+                state.rPeakDetected = true;
+                if (state.soundOn) playBeep();
+              } else if (currentSampleVal < 0.15) {
+                state.rPeakDetected = false;
+              }
+            }
+          }
+        } else {
+          // Manual mode traces (Comparison & Active)
+          const traceLen = state.sweepBuf ? Math.min(Math.ceil(W), state.sweepBuf.length) : Math.ceil(W);
+
+          // Render NSR Trace
+          if (state.comparisonMode && state.sweepBufCompare) {
+            ctx.beginPath();
+            let prevX_c = -1;
+            for (let x = 0; x < traceLen; x++) {
+              if (!state.sweepWritten || !state.sweepWritten[x]) {
+                prevX_c = -1;
+                continue;
+              }
+              const y = state.sweepBufCompare[x];
+              if (prevX_c < 0 || x - prevX_c > 2) ctx.moveTo(x, y);
+              else ctx.lineTo(x, y);
+              prevX_c = x;
+            }
+            ctx.strokeStyle = colors.trace;
+            ctx.lineWidth = colors.lineWidth;
             ctx.stroke();
           }
 
-          let traceColor = colors.trace;
-          if (state.currentRhythm.startsWith("stemi_")) {
-            const config = INTENSITY_STAGES[state.currentRhythm];
-            if (config?.culpritLeads?.includes(state.currentLead)) traceColor = "#ff4444";
-            else if (config?.reciprocalLeads?.includes(state.currentLead)) traceColor = "#4499ff";
+          // Render Active/Bottom Trace
+          if (state.sweepBuf) {
+            ctx.beginPath();
+            let prevX = -1;
+            for (let x = 0; x < traceLen; x++) {
+              if (!state.sweepWritten || !state.sweepWritten[x]) {
+                prevX = -1;
+                continue;
+              }
+              const y = state.sweepBuf[x];
+              if (prevX < 0 || x - prevX > 2) ctx.moveTo(x, y);
+              else ctx.lineTo(x, y);
+              prevX = x;
+            }
+
+            if (colors.glow !== "transparent") {
+              ctx.strokeStyle = colors.glow;
+              ctx.lineWidth = colors.lineWidth * 2.5;
+              ctx.stroke();
+            }
+
+            let traceColor = colors.trace;
+            if (state.currentRhythm.startsWith("stemi_")) {
+              const config = INTENSITY_STAGES[state.currentRhythm];
+              if (config?.culpritLeads?.includes(state.currentLead)) traceColor = "#ff4444";
+              else if (config?.reciprocalLeads?.includes(state.currentLead)) traceColor = "#4499ff";
+            }
+
+            ctx.strokeStyle = traceColor;
+            ctx.lineWidth = colors.lineWidth;
+            ctx.stroke();
           }
 
-          ctx.strokeStyle = traceColor;
-          ctx.lineWidth = colors.lineWidth;
+          // Render vertical sweep scanning cursor
+          let cursorColor = colors.trace;
+          if (state.currentRhythm.startsWith("stemi_")) {
+            const config = INTENSITY_STAGES[state.currentRhythm];
+            if (config?.culpritLeads?.includes(state.currentLead)) cursorColor = "#ff4444";
+            else if (config?.reciprocalLeads?.includes(state.currentLead)) cursorColor = "#4499ff";
+          }
+          ctx.strokeStyle = cursorColor;
+          ctx.lineWidth = 1.25;
+          ctx.globalAlpha = 0.35;
+          ctx.beginPath();
+          ctx.moveTo(state.scanX, 0);
+          ctx.lineTo(state.scanX, H);
           ctx.stroke();
+          ctx.globalAlpha = 1.0;
         }
-
-        // Render vertical sweep scanning cursor
-        let cursorColor = colors.trace;
-        if (state.currentRhythm.startsWith("stemi_")) {
-          const config = INTENSITY_STAGES[state.currentRhythm];
-          if (config?.culpritLeads?.includes(state.currentLead)) cursorColor = "#ff4444";
-          else if (config?.reciprocalLeads?.includes(state.currentLead)) cursorColor = "#4499ff";
-        }
-        ctx.strokeStyle = cursorColor;
-        ctx.lineWidth = 1.25;
-        ctx.globalAlpha = 0.35;
-        ctx.beginPath();
-        ctx.moveTo(state.scanX, 0);
-        ctx.lineTo(state.scanX, H);
-        ctx.stroke();
-        ctx.globalAlpha = 1.0;
 
       } else {
         // ── Standard Diagnostic 12-Lead Rendering ──
@@ -1076,10 +1357,11 @@ export default function ECGSimulatorPage() {
 
         if (state.mode === "database" && state.signals) {
           if (!state.paused) {
-            state.phase += dt * 0.1;
-            if (state.phase >= 1) {
-              state.phase -= 1;
-              state.beatIndex++;
+            // Advance scroll offset for continuous 12-lead scrolling
+            // Real-world speed: scroll through the full 10s signal in 10 real seconds
+            state.scrollOffset += dt * 1.0 * state.zoom;
+            if (state.scrollOffset >= 10.0) {
+              state.scrollOffset -= 10.0;
             }
           }
 
@@ -1117,31 +1399,42 @@ export default function ECGSimulatorPage() {
               if (leadSignal) {
                 ctx.beginPath();
                 let first = true;
+                const signalLen = leadSignal.length;
+                const signalFreq = (signalLen - 1) / 10.0;
+                const drawSteps = Math.max(Math.ceil(cellW), Math.ceil(cellDuration * signalFreq));
                 
-                const tStart = col * cellDuration;
-                const tEnd = (col + 1) * cellDuration;
-                
-                const startSample = Math.floor((tStart / 10.0) * (leadSignal.length - 1));
-                const endSample = Math.ceil((tEnd / 10.0) * (leadSignal.length - 1));
-                const safeEnd = Math.min(leadSignal.length - 1, endSample);
-                
-                for (let i = startSample; i <= safeEnd; i++) {
-                  const t = (i / (leadSignal.length - 1)) * 10.0;
-                  const cellFrac = (t - tStart) / cellDuration;
-                  
-                  let val = leadSignal[i] * state.amplitude;
+                let prevIdx = -1;
+                for (let px = 0; px <= drawSteps; px++) {
+                  const frac = px / drawSteps;
+                  const t = (col + frac) * cellDuration;
+                  // Apply scrollOffset and wrap around 10s signal duration
+                  let signalT = t + state.scrollOffset;
+                  signalT = ((signalT % 10.0) + 10.0) % 10.0;
+                  const floatIdx = (signalT / 10.0) * (signalLen - 1);
+                  const idx0 = Math.floor(floatIdx);
+                  const idx1 = Math.min(signalLen - 1, idx0 + 1);
+                  const fracIdx = floatIdx - idx0;
+                  const val0 = leadSignal[idx0];
+                  const val1 = leadSignal[idx1];
+                  let val = (val0 * (1 - fracIdx) + val1 * fracIdx) * state.amplitude;
+
                   if (state.noise > 0) {
-                    val = addTraceNoise(val, i * 0.05, 0, state.noise, state.realistic, state.heartRate);
+                    val = addTraceNoise(val, idx0 * 0.05, 0, state.noise, state.realistic, state.heartRate);
                   }
 
-                  const xCoord = cx + (cellFrac * cellW);
+                  const xCoord = cx + (frac * cellW);
                   const yCoord = centerYLocal - val * pixelsPerMv;
                   if (first) {
                     ctx.moveTo(xCoord, yCoord);
                     first = false;
                   } else {
-                    ctx.lineTo(xCoord, yCoord);
+                    if (prevIdx !== -1 && Math.abs(idx0 - prevIdx) > signalLen / 2) {
+                      ctx.moveTo(xCoord, yCoord);
+                    } else {
+                      ctx.lineTo(xCoord, yCoord);
+                    }
                   }
+                  prevIdx = idx0;
                 }
 
                 if (colors.glow !== "transparent") {
@@ -1201,14 +1494,28 @@ export default function ECGSimulatorPage() {
           if (iiSignal) {
             ctx.beginPath();
             let firstR = true;
-            const endSample = Math.min(iiSignal.length - 1, Math.ceil((totalDuration / 10.0) * (iiSignal.length - 1)));
-            for (let i = 0; i <= endSample; i++) {
-              const t = (i / (iiSignal.length - 1)) * 10.0;
-              const px = (t / totalDuration) * W;
+            const iiLen = iiSignal.length;
+            const signalFreq = (iiLen - 1) / 10.0;
+            const drawSteps = Math.max(Math.ceil(W), Math.ceil(totalDuration * signalFreq));
+            let prevRIdx = -1;
+            for (let i = 0; i <= drawSteps; i++) {
+              const norm = i / drawSteps;
+              const px = norm * W;
+              // Time position along the visible strip
+              const t = norm * totalDuration;
+              // Apply scrollOffset to get position in the 10s signal
+              let signalT = t + state.scrollOffset;
+              signalT = ((signalT % 10.0) + 10.0) % 10.0;
+              const floatIdx = (signalT / 10.0) * (iiLen - 1);
+              const idx0 = Math.floor(floatIdx);
+              const idx1 = Math.min(iiLen - 1, idx0 + 1);
+              const fracR = floatIdx - idx0;
+              const val0 = iiSignal[idx0];
+              const val1 = iiSignal[idx1];
+              let val = (val0 * (1 - fracR) + val1 * fracR) * state.amplitude;
 
-              let val = iiSignal[i] * state.amplitude;
               if (state.noise > 0) {
-                val = addTraceNoise(val, i * 0.05, 0, state.noise, state.realistic, state.heartRate);
+                val = addTraceNoise(val, px * 0.05, 0, state.noise, state.realistic, state.heartRate);
               }
 
               const yCoord = rhythmY - val * pixelsPerMv;
@@ -1216,8 +1523,13 @@ export default function ECGSimulatorPage() {
                 ctx.moveTo(px, yCoord);
                 firstR = false;
               } else {
-                ctx.lineTo(px, yCoord);
+                if (prevRIdx !== -1 && Math.abs(idx0 - prevRIdx) > iiLen / 2) {
+                  ctx.moveTo(px, yCoord);
+                } else {
+                  ctx.lineTo(px, yCoord);
+                }
               }
+              prevRIdx = idx0;
             }
 
             if (colors.glow !== "transparent") {
@@ -2618,6 +2930,12 @@ export default function ECGSimulatorPage() {
                   Records DB
                 </button>
                 <button
+                  className={`tab-btn ${activeTab === "db-leads" ? "active" : ""}`}
+                  onClick={() => setActiveTab("db-leads")}
+                >
+                  Leads
+                </button>
+                <button
                   className={`tab-btn ${activeTab === "db-diagnostic" ? "active" : ""}`}
                   onClick={() => setActiveTab("db-diagnostic")}
                 >
@@ -2676,26 +2994,15 @@ export default function ECGSimulatorPage() {
                       <div className="toggle-row">
                         <div>
                           <div className="tr-label">Sampling Frequency</div>
-                          <div className="tr-desc">Resolution of the trace</div>
+                          <div className="tr-desc">High resolution raw signal</div>
                         </div>
-                        <select
-                          className="bg-surface2 text-foreground border border-border rounded px-2 py-1 text-xs outline-none"
-                          value={selectedFreq}
-                          onChange={(e) => {
-                            const freqValue = parseInt(e.target.value, 10);
-                            setSelectedFreq(freqValue);
-                            showToastMsg(`Switched sampling resolution to ${freqValue}Hz`);
-                          }}
-                        >
-                          <option value={500}>500 Hz (Raw / Resampled)</option>
-                          <option value={100}>100 Hz (Downsampled)</option>
-                        </select>
+                        <div className="text-xs font-bold text-accent">500 Hz</div>
                       </div>
 
                       <div className="toggle-row">
                         <div>
-                          <div className="tr-label">Low-Pass Filter</div>
-                          <div className="tr-desc">Moving average to clean raw traces</div>
+                          <div className="tr-label">Smooth Filter</div>
+                          <div className="tr-desc">Savitzky-Golay smoothing preserving peaks</div>
                         </div>
                         <label className="toggle-switch">
                           <input
@@ -2715,7 +3022,10 @@ export default function ECGSimulatorPage() {
                         className="flex-1 px-3 py-1.5 text-xs rounded border border-border bg-surface text-foreground placeholder-muted outline-none focus:border-accent"
                         placeholder="Search ID, NORM, MI, CD..."
                         value={searchQuery}
-                        onChange={(e) => setSearchQuery(e.target.value)}
+                        onChange={(e) => {
+                          setSearchQuery(e.target.value);
+                          setDbOffset(0);
+                        }}
                         onKeyDown={(e) => {
                           if (e.key === "Enter") {
                             setDbOffset(0);
@@ -2742,67 +3052,119 @@ export default function ECGSimulatorPage() {
                       </div>
                     )}
 
-                    {/* Records List */}
-                    {!recordsLoading && (
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-[360px] overflow-y-auto pr-1">
-                        {dbRecords.length === 0 ? (
-                          <div className="py-8 text-center text-xs text-muted col-span-2">
-                            No matching records found. Try &quot;NORM&quot; or &quot;MI&quot;.
-                          </div>
-                        ) : (
-                          dbRecords.map((record) => {
-                            const isSelected = selectedRecord?.ecg_id === record.ecg_id;
-                            const isNorm = record.superclass === "NORM";
-                            return (
-                              <div
-                                key={record.ecg_id}
-                                className={`rhythm-card ${isSelected ? "selected" : ""}`}
-                                onClick={() => selectRecordItem(record)}
-                              >
-                                <div className="flex items-start justify-between w-full">
-                                  <div className="rc-icon">
-                                    <i className={`fa-solid ${isNorm ? "fa-heart-circle-check" : "fa-heart-circle-exclamation"}`}></i>
+                    {/* Records List - continuous scroll */}
+                    <div className="flex flex-col gap-1.5 min-h-0 pr-1 overflow-y-auto flex-1" style={{ height: "100%", maxHeight: "calc(100vh - 350px)" }}
+                      onScroll={(e) => {
+                        const el = e.currentTarget;
+                        if (el.scrollHeight - el.scrollTop - el.clientHeight < 100 && !fetchLock.current && dbRecords.length >= dbLimit) {
+                          fetchLock.current = true;
+                          setDbOffset(prev => prev + dbLimit);
+                        }
+                      }}
+                    >
+                      {recordsLoading && dbRecords.length === 0 && (
+                        <div className="py-8 flex flex-col items-center justify-center gap-2">
+                          <div className="animate-spin text-accent text-lg"><i className="fa-solid fa-spinner"></i></div>
+                          <span className="text-xs text-muted">Retrieving matching records...</span>
+                        </div>
+                      )}
+                      {!recordsLoading && dbRecords.length === 0 ? (
+                        <div className="py-8 text-center text-xs text-muted">
+                          No matching records found. Try "NORM" or "MI".
+                        </div>
+                      ) : (
+                        dbRecords.map((record) => {
+                          const isSelected = selectedRecord?.ecg_id === record.ecg_id;
+                          const isNorm = record.superclass === "NORM";
+                          return (
+                            <div
+                              key={record.ecg_id}
+                              className={`rhythm-card ${isSelected ? "selected" : ""}`}
+                              onClick={() => selectRecordItem(record)}
+                              style={{ padding: "10px 12px", minHeight: "82px", borderLeft: isSelected ? `3px solid ${isNorm ? "var(--correct)" : "var(--wrong)"}` : "3px solid transparent", transition: "all 0.15s ease", cursor: "pointer" }}
+                            >
+                              <div className="flex items-start justify-between w-full" style={{ marginBottom: "6px" }}>
+                                <div className="flex items-center gap-2">
+                                  <div className="rc-icon" style={{ width: "22px", textAlign: "center" }}>
+                                    <i className={`fa-solid ${isNorm ? "fa-heart-circle-check" : "fa-heart-circle-exclamation"}`} style={{ color: isNorm ? "var(--correct)" : "var(--wrong)", fontSize: "14px" }}></i>
                                   </div>
-                                  <span className={`rc-tag ${!isNorm ? "abnormal" : ""}`}>
-                                    {record.superclass}
-                                  </span>
+                                  <div>
+                                    <div className="rc-name" style={{ fontSize: "0.75rem", fontWeight: 700, lineHeight: 1.2 }}>Record #{record.ecg_id}</div>
+                                    <div className="text-[9px] text-muted" style={{ lineHeight: 1.2 }}>
+                                      Patient #{record.patient_id}
+                                    </div>
+                                  </div>
                                 </div>
-                                <div className="rc-name mt-1">Record #{record.ecg_id}</div>
-                                <div className="text-[10px] text-muted-foreground mt-0.5">
-                                  Pt: {record.patient_id} | {record.age || "N/A"}/{record.sex === 0 ? "M" : "F"}
-                                </div>
+                                <span className={`rc-tag ${!isNorm ? "abnormal" : ""}`} style={{ fontSize: "9px", padding: "1px 6px" }}>
+                                  {record.superclass}
+                                </span>
                               </div>
-                            );
-                          })
-                        )}
-                      </div>
-                    )}
+                              <div className="flex gap-3 text-[9px] text-muted-foreground" style={{ borderTop: "1px solid var(--border)", paddingTop: "5px" }}>
+                                <span><i className="fa-regular fa-calendar mr-1"></i>{record.age || "N/A"}y</span>
+                                <span><i className="fa-regular fa-user mr-1"></i>{record.sex === 0 ? "Male" : "Female"}</span>
+                                <span><i className="fa-solid fa-ruler mr-1"></i>{record.height ? `${record.height}cm` : "N/A"}</span>
+                                <span><i className="fa-solid fa-weight-scale mr-1"></i>{record.weight ? `${record.weight}kg` : "N/A"}</span>
+                              </div>
+                              {record.scp_codes && (
+                                <div className="text-[8px] text-muted mt-1 truncate" style={{ borderTop: "1px solid var(--border)", paddingTop: "3px" }}>
+                                  SCP: {Object.keys(JSON.parse(record.scp_codes)).slice(0, 3).join(", ")}{Object.keys(JSON.parse(record.scp_codes)).length > 3 ? "..." : ""}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })
+                      )}
+                      {recordsLoading && dbRecords.length > 0 && (
+                        <div className="py-3 text-center text-xs text-muted">
+                          <i className="fa-solid fa-spinner animate-spin mr-1"></i> Loading more...
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
 
-                    {/* Pagination control */}
-                    <div className="action-row mt-3 pt-2">
-                      <button
-                        className="btn-action" style={{ background: "transparent", color: "var(--text)" }}
-                        disabled={dbOffset === 0}
-                        onClick={() => {
-                          const nextOffset = Math.max(0, dbOffset - dbLimit);
-                          setDbOffset(nextOffset);
-                          fetchRecords(searchQuery, superclassFilter, nextOffset);
-                        }}
-                      >
-                        <i className="fa-solid fa-chevron-left mr-1"></i> Prev
-                      </button>
-                      <div className="block flex items-center text-xs text-muted">Page {Math.floor(dbOffset / dbLimit) + 1}</div>
-                      <button
-                        className="btn-action" style={{ background: "transparent", color: "var(--text)" }}
-                        disabled={dbRecords.length < dbLimit}
-                        onClick={() => {
-                          const nextOffset = dbOffset + dbLimit;
-                          setDbOffset(nextOffset);
-                          fetchRecords(searchQuery, superclassFilter, nextOffset);
-                        }}
-                      >
-                        Next <i className="fa-solid fa-chevron-right ml-1"></i>
-                      </button>
+                {/* LEADS SELECTION TAB (same as simulator leads tab) */}
+                <div className={`tab-content ${activeTab === "db-leads" ? "active" : ""}`} id="tab-db-leads">
+                  <div style={{ fontSize: "0.72rem", color: "var(--text-muted)", marginBottom: "0.6rem" }}>
+                    Select the displayed single lead for the active trace. In 12-lead mode, all leads are shown simultaneously.
+                  </div>
+                  <div className="lead-tabs">
+                    {LEADS.map((l) => {
+                      let tabClass = "lead-tab";
+                      if (l === currentLead) tabClass += " active";
+                      return (
+                        <button
+                          key={l}
+                          className={tabClass}
+                          onClick={() => selectLead(l)}
+                          title={"Switch to lead " + l}
+                        >
+                          {l}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="mt-4 param-grid">
+                    <div className="toggle-row">
+                      <div>
+                        <div className="tr-label">Smooth Filter</div>
+                        <div className="tr-desc">Savitzky-Golay smoothing preserving peaks</div>
+                      </div>
+                      <label className="toggle-switch">
+                        <input
+                          type="checkbox"
+                          checked={filterSignal}
+                          onChange={(e) => setFilterSignal(e.target.checked)}
+                        />
+                        <span className="toggle-slider"></span>
+                      </label>
+                    </div>
+                    <div className="toggle-row">
+                      <div>
+                        <div className="tr-label">Sampling Frequency</div>
+                        <div className="tr-desc">High resolution trace data</div>
+                      </div>
+                      <div className="text-xs font-bold text-accent">500 Hz</div>
                     </div>
                   </div>
                 </div>
@@ -2815,64 +3177,359 @@ export default function ECGSimulatorPage() {
                     </div>
                   ) : (
                     <div className="wave-customizer">
-                      <div className="manual-banner" style={{ display: "block", marginBottom: "1rem" }}>
-                        <div className="manual-banner-text">Superclass {selectedRecord.superclass}</div>
-                        <div className="manual-banner-desc">{SCP_DESCRIPTIONS[selectedRecord.superclass] || "Abnormality detected"}</div>
-                      </div>
-                      
-                      <div className="param-grid" style={{ paddingBottom: "0", marginBottom: "0.5rem" }}>
-                        <div className="param-card">
-                          <div className="param-card-title">Patient Profile</div>
-                          <div className="flex flex-col gap-2">
-                            <div className="slider-label">
-                              <span className="text-muted text-xs">Patient ID</span>
-                              <span className="font-bold">#{selectedRecord.patient_id}</span>
-                            </div>
-                            <div className="slider-label">
-                              <span className="text-muted text-xs">Age / Sex</span>
-                              <span className="font-bold">{selectedRecord.age || "Unknown"} years / {selectedRecord.sex === 0 ? "Male" : "Female"}</span>
-                            </div>
-                            <div className="slider-label">
-                              <span className="text-muted text-xs">Chest Pain Type</span>
-                              <span className="font-bold">{selectedRecord.chest_pain_type === 0 ? "Asymptomatic" : selectedRecord.chest_pain_type === 1 ? "Atypical Angina" : "Non-Anginal"}</span>
-                            </div>
-                            <div className="slider-label">
-                              <span className="text-muted text-xs">Medication</span>
-                              <span className="font-bold">{selectedRecord.medication_history ? selectedRecord.medication_history : "None on file"}</span>
-                            </div>
-                            <div className="slider-label">
-                              <span className="text-muted text-xs">Height / Weight</span>
-                              <span className="font-bold">{selectedRecord.height ? `${selectedRecord.height} cm` : "N/A"} / {selectedRecord.weight ? `${selectedRecord.weight} kg` : "N/A"}</span>
-                            </div>
-                          </div>
+                      {/* Findings Banner */}
+                      <div 
+                        className="manual-banner" 
+                        style={{ 
+                          display: "block", 
+                          marginBottom: "0.8rem",
+                          borderLeft: `4px solid ${
+                            selectedRecord.superclass === "NORM"
+                              ? "var(--correct)"
+                              : selectedRecord.superclass === "MI"
+                              ? "var(--wrong)"
+                              : selectedRecord.superclass === "CD"
+                              ? "var(--rhythm-metabolic)"
+                              : selectedRecord.superclass === "HYP"
+                              ? "var(--rhythm-block)"
+                              : "var(--rhythm-ischemia)"
+                          }`
+                        }}
+                      >
+                        <div className="manual-banner-text flex justify-between items-center w-full">
+                          <span>Superclass: {selectedRecord.superclass}</span>
+                          <span 
+                            className={`rc-tag ${selectedRecord.superclass !== "NORM" ? "abnormal" : ""}`}
+                            style={{ fontSize: "9px", padding: "1px 6px" }}
+                          >
+                            {SCP_DESCRIPTIONS[selectedRecord.superclass] || "Abnormality"}
+                          </span>
                         </div>
+                        <div className="manual-banner-desc mt-1 text-[10px] text-muted-foreground opacity-90 font-mono">
+                          Record #{selectedRecord.ecg_id} &middot; Patient #{selectedRecord.patient_id}
+                        </div>
+                      </div>
 
-                        <div className="param-card flex flex-col">
-                          <div className="param-card-title">SCP Statements</div>
-                          <div className="text-[10px] text-muted-foreground leading-relaxed flex-1">
-                            {selectedRecord.class_explanation || "No explanation provided for this patient group."}
+                      {/* Sub-tab Navigation Buttons */}
+                      <div className="flex bg-surface2 border border-border rounded-lg p-0.5 mb-3" style={{ background: "rgba(0,0,0,0.2)" }}>
+                        <button
+                          className={`flex-1 py-1.5 text-[10px] font-bold rounded-md transition-all ${
+                            diagSubTab === "overview"
+                              ? "bg-accent text-white shadow-sm"
+                              : "text-muted hover:text-foreground"
+                          }`}
+                          onClick={() => setDiagSubTab("overview")}
+                        >
+                          Overview
+                        </button>
+                        <button
+                          className={`flex-1 py-1.5 text-[10px] font-bold rounded-md transition-all flex items-center justify-center gap-1 ${
+                            diagSubTab === "peaks"
+                              ? "bg-accent text-white shadow-sm"
+                              : "text-muted hover:text-foreground"
+                          }`}
+                          onClick={() => setDiagSubTab("peaks")}
+                        >
+                          <i className="fa-solid fa-heart-pulse text-[9px] animate-pulse"></i> Peaks
+                        </button>
+                        <button
+                          className={`flex-1 py-1.5 text-[10px] font-bold rounded-md transition-all ${
+                            diagSubTab === "length"
+                              ? "bg-accent text-white shadow-sm"
+                              : "text-muted hover:text-foreground"
+                          }`}
+                          onClick={() => setDiagSubTab("length")}
+                        >
+                          Length & Info
+                        </button>
+                      </div>
+
+                      {/* SUBTAB 1: CLINICAL OVERVIEW */}
+                      {diagSubTab === "overview" && (
+                        <div className="flex flex-col gap-3 animate-fade-in">
+                          {/* Clinical Report Card */}
+                          <div className="param-card">
+                            <div className="param-card-title flex items-center gap-1">
+                              <i className="fa-solid fa-clipboard-question"></i> Clinical Report Summary
+                            </div>
+                            <div className="text-[11px] text-foreground leading-relaxed bg-surface2 p-3 rounded-lg border border-border font-sans italic">
+                              "{selectedRecord.report || "No summary report text is cataloged in the database for this record."}"
+                            </div>
                           </div>
-                          
+
+                          {/* SCP Statement Table */}
                           {selectedRecord.scp_codes && (
-                            <div className="mt-3 pt-3 border-t border-border">
-                              <div className="text-[10px] text-accent font-bold uppercase tracking-wider mb-2">Secondary Codes</div>
-                              <div className="bg-surface2 p-2 rounded text-[10px] font-mono break-words border border-border max-h-[80px] overflow-y-auto">
-                                {Object.entries(JSON.parse(selectedRecord.scp_codes)).map(([code, value]) => (
-                                  <div key={code} className="flex justify-between pb-1 mb-1 border-b border-border border-opacity-30">
-                                    <span className="font-semibold text-accent font-sans">{code}</span>
-                                    <span className="text-foreground">{String(value)}</span>
+                            <div className="bg-surface2 p-3 rounded-lg border border-border">
+                              <div className="text-[10px] text-accent font-bold uppercase tracking-wider mb-2 flex items-center gap-1">
+                                <i className="fa-solid fa-book-medical"></i> Diagnostic SCP Codes Breakdown
+                              </div>
+                              <div className="flex flex-col gap-2 max-h-[140px] overflow-y-auto pr-1">
+                                {Object.entries(JSON.parse(selectedRecord.scp_codes)).map(([code, value]) => {
+                                  const desc = SCP_DESCRIPTIONS[code] || "Associated clinical condition";
+                                  const prob = typeof value === "number" ? Math.round(value) : 100;
+                                  return (
+                                    <div key={code} className="flex flex-col gap-1 pb-2 border-b border-border border-opacity-30 last:border-0 last:pb-0">
+                                      <div className="flex justify-between items-baseline text-[10px]">
+                                        <span className="font-bold text-accent">{code} <span className="font-normal text-muted-foreground">- {desc}</span></span>
+                                        <span className="font-mono text-foreground font-semibold">{prob}%</span>
+                                      </div>
+                                      <div className="h-1 bg-surface rounded-full overflow-hidden">
+                                        <div className="h-full bg-accent" style={{ width: `${prob}%` }}></div>
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Infarction Stadium Details */}
+                          {(selectedRecord.infarction_stadium1 || selectedRecord.infarction_stadium2) && (
+                            <div className="param-card">
+                              <div className="param-card-title flex items-center gap-1">
+                                <i className="fa-solid fa-layer-group"></i> Myocardial Infarction Stadium
+                              </div>
+                              <div className="flex flex-col gap-2 p-2 bg-surface2 rounded-lg border border-border">
+                                {selectedRecord.infarction_stadium1 && (
+                                  <div className="flex justify-between items-center text-xs">
+                                    <span className="text-muted text-[10px]">Primary Infarct Stadium:</span>
+                                    <span className="font-semibold text-wrong bg-wrong bg-opacity-10 px-2 py-0.5 rounded text-[9px] uppercase font-mono border border-wrong border-opacity-20">{selectedRecord.infarction_stadium1}</span>
                                   </div>
-                                ))}
+                                )}
+                                {selectedRecord.infarction_stadium2 && (
+                                  <div className="flex justify-between items-center text-xs">
+                                    <span className="text-muted text-[10px]">Secondary Infarct Stadium:</span>
+                                    <span className="font-semibold text-accent bg-accent bg-opacity-10 px-2 py-0.5 rounded text-[9px] uppercase font-mono border border-accent border-opacity-20">{selectedRecord.infarction_stadium2}</span>
+                                  </div>
+                                )}
                               </div>
                             </div>
                           )}
                         </div>
-                      </div>
+                      )}
+
+                      {/* SUBTAB 2: PEAK DETECTION & ANALYSIS */}
+                      {diagSubTab === "peaks" && (
+                        <div className="flex flex-col gap-3 animate-fade-in">
+                          {signalsLoading ? (
+                            <div className="py-8 flex flex-col items-center justify-center gap-2">
+                              <div className="animate-spin text-accent text-lg"><i className="fa-solid fa-spinner"></i></div>
+                              <span className="text-xs text-muted">Analyzing waveform peaks...</span>
+                            </div>
+                          ) : !peaksAnalysis ? (
+                            <div className="py-6 text-center text-xs text-muted">
+                              Could not load trace waveforms to perform peak detection. Verify signal cache.
+                            </div>
+                          ) : (
+                            <>
+                              {/* R-Peak Stats Grid */}
+                              <div className="grid grid-cols-2 gap-2">
+                                <div className="bg-surface2 p-2 rounded-lg border border-border flex flex-col items-center justify-center text-center">
+                                  <div className="text-[9px] text-muted-foreground uppercase font-bold tracking-wider mb-0.5">Calculated Heart Rate</div>
+                                  <div className="text-lg font-extrabold text-accent flex items-baseline gap-1">
+                                    <i className="fa-solid fa-heart-pulse text-xs animate-bounce text-red-500"></i>
+                                    {peaksAnalysis.calculatedBPM}
+                                    <span className="text-[9px] font-normal text-muted-foreground font-sans">bpm</span>
+                                  </div>
+                                </div>
+                                <div className="bg-surface2 p-2 rounded-lg border border-border flex flex-col items-center justify-center text-center">
+                                  <div className="text-[9px] text-muted-foreground uppercase font-bold tracking-wider mb-0.5">Total R-Peaks</div>
+                                  <div className="text-lg font-extrabold text-accent">
+                                    {peaksAnalysis.peaksCount}
+                                    <span className="text-[9px] font-normal text-muted-foreground font-sans ml-1">beats</span>
+                                  </div>
+                                </div>
+                                <div className="bg-surface2 p-2 rounded-lg border border-border flex flex-col items-center justify-center text-center">
+                                  <div className="text-[9px] text-muted-foreground uppercase font-bold tracking-wider mb-0.5" title="Standard Deviation of Normal-to-Normal Intervals">HRV Index (SDNN)</div>
+                                  <div className="text-lg font-extrabold text-correct">
+                                    {peaksAnalysis.sdnn}
+                                    <span className="text-[9px] font-normal text-muted-foreground font-sans ml-1">ms</span>
+                                  </div>
+                                </div>
+                                <div className="bg-surface2 p-2 rounded-lg border border-border flex flex-col items-center justify-center text-center">
+                                  <div className="text-[9px] text-muted-foreground uppercase font-bold tracking-wider mb-0.5" title="Root Mean Square of Successive Differences">Vagal Index (RMSSD)</div>
+                                  <div className="text-lg font-extrabold text-correct">
+                                    {peaksAnalysis.rmssd}
+                                    <span className="text-[9px] font-normal text-muted-foreground font-sans ml-1">ms</span>
+                                  </div>
+                                </div>
+                              </div>
+
+                              {/* HRV Clinical Interpretation */}
+                              <div className="bg-surface2 p-2.5 rounded-lg border border-border text-[9px] leading-relaxed text-muted-foreground">
+                                <span className="font-bold text-foreground uppercase tracking-wider block mb-1">Clinical Interpretation Summary</span>
+                                {peaksAnalysis.sdnn < 30 ? (
+                                  <span><i className="fa-solid fa-circle-exclamation text-amber-500 mr-1"></i> HRV indices are depressed ({peaksAnalysis.sdnn}ms), which can indicate systemic autonomic distress or autonomic neuropathy under clinical settings.</span>
+                                ) : (
+                                  <span><i className="fa-solid fa-circle-check text-emerald-500 mr-1"></i> Autonomic cardiac modulation is healthy and normal ({peaksAnalysis.sdnn}ms SDNN, {peaksAnalysis.rmssd}ms RMSSD parasympathetic index).</span>
+                                )}
+                              </div>
+
+                              {/* R-Peaks Timings List */}
+                              <div className="bg-surface2 p-3 rounded-lg border border-border">
+                                <div className="text-[10px] text-accent font-bold uppercase tracking-wider mb-2 flex justify-between items-center">
+                                  <span><i className="fa-solid fa-list-ol mr-1"></i> R-Peak Timeline (Lead {currentLead})</span>
+                                  <span className="text-[8px] text-muted font-normal lowercase">visual markers active on grid</span>
+                                </div>
+                                <div className="overflow-y-auto max-h-[140px] pr-1">
+                                  <table className="w-full text-[10px] font-mono">
+                                    <thead>
+                                      <tr className="border-b border-border border-opacity-40 text-[9px] text-muted-foreground text-left">
+                                        <th className="pb-1.5 font-bold">Beat</th>
+                                        <th className="pb-1.5 font-bold">Timestamp</th>
+                                        <th className="pb-1.5 font-bold text-right">R-Amp (mV)</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {peaksAnalysis.peaksInfo.map((p: any, idx: number) => {
+                                        return (
+                                          <tr key={idx} className="border-b border-border border-opacity-20 last:border-0 hover:bg-surface py-1">
+                                            <td className="py-1">#{idx + 1}</td>
+                                            <td className="py-1">{p.time.toFixed(3)} s</td>
+                                            <td className={`py-1 text-right font-semibold ${p.value > 0.6 ? "text-emerald-400" : "text-foreground"}`}>
+                                              {p.value.toFixed(3)}
+                                            </td>
+                                          </tr>
+                                        );
+                                      })}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      )}
+
+                      {/* SUBTAB 3: RECORD METADATA & PHYSICAL INFO */}
+                      {diagSubTab === "length" && (
+                        <div className="flex flex-col gap-3 animate-fade-in">
+                          {/* Physical Demographics & BMI */}
+                          <div className="bg-surface2 p-3 rounded-lg border border-border">
+                            <div className="text-[10px] text-accent font-bold uppercase tracking-wider mb-2.5 flex items-center gap-1">
+                              <i className="fa-solid fa-user-doctor"></i> Physical Characteristics & BMI
+                            </div>
+                            <div className="grid grid-cols-2 gap-3 text-xs mb-3">
+                              <div className="flex flex-col">
+                                <span className="text-[9px] text-muted-foreground uppercase font-bold tracking-wider mb-0.5">Age / Sex</span>
+                                <span className="font-semibold">{selectedRecord.age || "Unknown"} yr &middot; {selectedRecord.sex === 0 ? "Male" : "Female"}</span>
+                              </div>
+                              <div className="flex flex-col">
+                                <span className="text-[9px] text-muted-foreground uppercase font-bold tracking-wider mb-0.5">Physical Frame</span>
+                                <span className="font-semibold">{selectedRecord.height ? `${selectedRecord.height} cm` : "N/A"} &middot; {selectedRecord.weight ? `${selectedRecord.weight} kg` : "N/A"}</span>
+                              </div>
+                            </div>
+                            
+                            {/* Dynamic BMI Gauge */}
+                            {selectedRecord.height && selectedRecord.weight ? (() => {
+                              const heightM = selectedRecord.height / 100;
+                              const bmiVal = Number((selectedRecord.weight / (heightM * heightM)).toFixed(1));
+                              let cat = "Normal";
+                              let color = "var(--correct)";
+                              if (bmiVal < 18.5) { cat = "Underweight"; color = "var(--accent)"; }
+                              else if (bmiVal >= 25 && bmiVal < 30) { cat = "Overweight"; color = "var(--accent)"; }
+                              else if (bmiVal >= 30) { cat = "Obese"; color = "var(--wrong)"; }
+                              
+                              return (
+                                <div className="border-t border-border border-opacity-40 pt-2.5 flex justify-between items-center">
+                                  <div className="flex flex-col">
+                                    <span className="text-[9px] text-muted-foreground uppercase font-bold tracking-wider mb-0.5">Body Mass Index (BMI)</span>
+                                    <span className="font-mono text-sm font-extrabold">{bmiVal} <span className="text-[9px] font-normal text-muted-foreground font-sans">kg/m²</span></span>
+                                  </div>
+                                  <span 
+                                    className="px-2 py-0.5 rounded text-[9px] font-bold uppercase border"
+                                    style={{ color, borderColor: `${color}40`, backgroundColor: `${color}10` }}
+                                  >
+                                    {cat}
+                                  </span>
+                                </div>
+                              );
+                            })() : (
+                              <div className="border-t border-border border-opacity-40 pt-2 text-[10px] text-muted">
+                                Height or weight missing. Cannot calculate Body Mass Index.
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Technical Waveform Stats */}
+                          <div className="bg-surface2 p-3 rounded-lg border border-border">
+                            <div className="text-[10px] text-accent font-bold uppercase tracking-wider mb-2 flex items-center gap-1">
+                              <i className="fa-solid fa-wave-square"></i> Waveform & Signal Properties
+                            </div>
+                            <div className="flex flex-col gap-1.5 text-[10px] font-mono">
+                              <div className="flex justify-between py-0.5 border-b border-border border-opacity-20">
+                                <span className="text-muted-foreground">ECG Duration</span>
+                                <span className="font-semibold text-foreground">10.0 seconds</span>
+                              </div>
+                              <div className="flex justify-between py-0.5 border-b border-border border-opacity-20">
+                                <span className="text-muted-foreground">Sampling Rate</span>
+                                <span className="font-semibold text-foreground">500 Hz</span>
+                              </div>
+                              <div className="flex justify-between py-0.5 border-b border-border border-opacity-20">
+                                <span className="text-muted-foreground">Raw Data Points</span>
+                                <span className="font-semibold text-foreground">5,000 samples / lead</span>
+                              </div>
+                              <div className="flex justify-between py-0.5">
+                                <span className="text-muted-foreground">Channel Setup</span>
+                                <span className="font-semibold text-foreground">12 Leads (Standard)</span>
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* Complete Administrative Database Fields */}
+                          <div className="bg-surface2 p-3 rounded-lg border border-border">
+                            <div className="text-[10px] text-accent font-bold uppercase tracking-wider mb-2 flex items-center gap-1">
+                              <i className="fa-solid fa-database"></i> Clinical Registry Database Metadata
+                            </div>
+                            <div className="flex flex-col gap-1.5 text-[10px] font-mono">
+                              <div className="flex justify-between py-0.5 border-b border-border border-opacity-20">
+                                <span className="text-muted-foreground">Recording Date</span>
+                                <span className="font-semibold text-foreground">{selectedRecord.recording_date ? selectedRecord.recording_date.replace("T", " ") : "N/A"}</span>
+                              </div>
+                              <div className="flex justify-between py-0.5 border-b border-border border-opacity-20">
+                                <span className="text-muted-foreground">Device / Model</span>
+                                <span className="font-semibold text-foreground truncate max-w-[150px]">{selectedRecord.device || "Schiller System"}</span>
+                              </div>
+                              <div className="flex justify-between py-0.5 border-b border-border border-opacity-20">
+                                <span className="text-muted-foreground">Electrical Axis</span>
+                                <span className="font-semibold text-foreground flex items-center gap-1">
+                                  {selectedRecord.heart_axis || "NORMAL"}
+                                  <span className="text-[8px] text-muted-foreground font-normal font-sans">
+                                    ({selectedRecord.heart_axis === "LAD" ? "Left Dev" : selectedRecord.heart_axis === "RAD" ? "Right Dev" : "Normal"})
+                                  </span>
+                                </span>
+                              </div>
+                              <div className="flex justify-between py-0.5 border-b border-border border-opacity-20">
+                                <span className="text-muted-foreground">Pacemaker State</span>
+                                <span className={`font-bold px-1.5 py-0.2 rounded text-[8px] uppercase border ${
+                                  selectedRecord.pacemaker === 1 
+                                    ? "text-emerald-400 bg-emerald-500 bg-opacity-10 border-emerald-500 border-opacity-20" 
+                                    : "text-muted-foreground bg-surface border-border border-opacity-40"
+                                }`}>
+                                  {selectedRecord.pacemaker === 1 ? "Active" : "None"}
+                                </span>
+                              </div>
+                              <div className="flex justify-between py-0.5 border-b border-border border-opacity-20">
+                                <span className="text-muted-foreground">validated Cardiologist</span>
+                                <span className="font-semibold text-foreground">MD-Cardio #{selectedRecord.validated_by || "0"}</span>
+                              </div>
+                              <div className="flex justify-between py-0.5 border-b border-border border-opacity-20">
+                                <span className="text-muted-foreground">Nurse Technician</span>
+                                <span className="font-semibold text-foreground">Nurse #{selectedRecord.nurse || "0"}</span>
+                              </div>
+                              <div className="flex justify-between py-0.5">
+                                <span className="text-muted-foreground">Recording Site ID</span>
+                                <span className="font-semibold text-foreground">Site #{selectedRecord.site || "0"}</span>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
 
-                {/* DATABASE ENGINE SEEDER SETUP TAB */}
+                    {/* DATABASE ENGINE SEEDER SETUP TAB */}
                 <div className={`tab-content ${activeTab === "db-setup" ? "active" : ""}`} id="tab-db-setup">
                   <div className="wave-customizer">
                     <div className="manual-banner" style={{ display: "block" }}>
@@ -2902,13 +3559,15 @@ export default function ECGSimulatorPage() {
                           onChange={(e) => {
                             const val = e.target.value;
                             setPullMode(val);
-                            if (val === "full_force") setPullCount(21837);
+                            if (val === "metadata_only") setPullCount(21837);
+                            else if (val === "full_force") setPullCount(21837);
                             else setPullCount(36);
                           }}
                           disabled={seedingActive}
                         >
-                          <option value="partial">Partial Representative Preview</option>
-                          <option value="full_force">Full Database Download</option>
+                          <option value="metadata_only">Online Mode (Metadata Only - Recommended)</option>
+                          <option value="partial">Local Mode (Partial + Signals cached)</option>
+                          <option value="full_force">Local Mode (Full + Signals cached)</option>
                         </select>
                       </div>
 
@@ -2922,14 +3581,43 @@ export default function ECGSimulatorPage() {
                           className="bg-surface2 text-foreground border border-border rounded px-2 py-1 text-xs outline-none w-24 text-right"
                           value={pullCount}
                           onChange={(e) => setPullCount(Number(e.target.value))}
-                          min={pullMode === "full_force" ? 100 : 36}
-                          step={pullMode === "full_force" ? 500 : 36}
+                          min={36}
+                          step={36}
                           disabled={seedingActive}
                         />
                       </div>
+
+                      {/* Overwrite existing data toggle */}
+                      <div className="toggle-row" style={{ borderTop: "1px solid var(--border)", paddingTop: "0.75rem" }}>
+                        <div>
+                          <div className="tr-label">Overwrite Existing Data</div>
+                          <div className="tr-desc">Clear and re-import all records</div>
+                        </div>
+                        <label className="toggle-switch">
+                          <input
+                            type="checkbox"
+                            checked={overwriteDb}
+                            onChange={(e) => setOverwriteDb(e.target.checked)}
+                          />
+                          <span className="toggle-slider"></span>
+                        </label>
+                      </div>
                     </div>
 
-                    <div className="action-row">
+                    {/* Download progress bar */}
+                    {seedingActive && (
+                      <div className="mt-2 mb-3">
+                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: "10px", color: "var(--text-muted)", marginBottom: "4px" }}>
+                          <span><i className="fa-solid fa-download mr-1"></i> Downloading...</span>
+                          <span>{downloadProgress}/{downloadTotal}</span>
+                        </div>
+                        <div style={{ height: "6px", background: "var(--border)", borderRadius: "3px", overflow: "hidden" }}>
+                          <div style={{ height: "100%", width: `${downloadTotal > 0 ? (downloadProgress / downloadTotal) * 100 : 5}%`, background: "var(--accent)", borderRadius: "3px", transition: "width 0.3s ease" }}></div>
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="action-row flex flex-col gap-2">
                       <button
                         className="btn-action primary disabled:opacity-50 flex items-center justify-center gap-1.5"
                         onClick={triggerDbSeeding}
@@ -2938,6 +3626,42 @@ export default function ECGSimulatorPage() {
                         <i className={`fa-solid fa-database ${seedingActive ? "animate-bounce" : ""}`}></i> 
                         {seedingActive ? " Seeding Archive..." : " Re-trigger SQLite DB Seed"}
                       </button>
+
+                      {dbSeeded && !seedingActive && (
+                        <button
+                          className="btn-action danger disabled:opacity-50 flex items-center justify-center gap-1.5 mt-1"
+                          onClick={async () => {
+                            setOverwriteDb(true);
+                            setSeedingActive(true);
+                            setDbStatus("running");
+                            setDbProgress("Clearing existing database and re-importing...");
+                            setDownloadProgress(0);
+                            setDownloadTotal(pullCount);
+                            try {
+                              const res = await fetch("/api/setup", {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({ pullConfig: { mode: pullMode, count: pullCount }, overwrite: true })
+                              });
+                              const data = await res.json();
+                              if (data.seeded) {
+                                setDbSeeded(true);
+                                setSeedingActive(false);
+                                setOverwriteDb(false);
+                                setDownloadProgress(pullCount);
+                                fetchRecords();
+                                showToastMsg("Database cleared and re-seeded successfully!");
+                              }
+                            } catch {
+                              setDbStatus("failed");
+                              setDbProgress("Failed to clear and re-import.");
+                              setSeedingActive(false);
+                            }
+                          }}
+                        >
+                          <i className="fa-solid fa-trash-can"></i> Clear & Re-Import All Records
+                        </button>
+                      )}
                     </div>
 
                     {dbProgress && (
@@ -2948,6 +3672,8 @@ export default function ECGSimulatorPage() {
                     )}
                   </div>
                 </div>
+
+
               </>
             )}
 

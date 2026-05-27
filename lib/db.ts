@@ -36,7 +36,19 @@ export function getDB() {
       filename_hr TEXT,
       superclass TEXT,
       scp_codes TEXT, -- JSON string
-      patient_metadata TEXT -- JSON string for other patient details
+      patient_metadata TEXT, -- JSON string for other patient details
+      height INTEGER,
+      weight INTEGER,
+      report TEXT,
+      recording_date TEXT,
+      heart_axis TEXT,
+      pacemaker INTEGER,
+      device TEXT,
+      nurse TEXT,
+      site TEXT,
+      validated_by TEXT,
+      infarction_stadium1 TEXT,
+      infarction_stadium2 TEXT
     );
 
     CREATE TABLE IF NOT EXISTS signals (
@@ -46,6 +58,33 @@ export function getDB() {
       PRIMARY KEY (ecg_id, frequency)
     );
   `);
+
+  // Check and upgrade schema for existing databases
+  try {
+    const columns = dbInstance.pragma("table_info(records)").map((c: any) => c.name);
+    const requiredColumns = [
+      { name: "height", type: "INTEGER" },
+      { name: "weight", type: "INTEGER" },
+      { name: "report", type: "TEXT" },
+      { name: "recording_date", type: "TEXT" },
+      { name: "heart_axis", type: "TEXT" },
+      { name: "pacemaker", type: "INTEGER" },
+      { name: "device", type: "TEXT" },
+      { name: "nurse", type: "TEXT" },
+      { name: "site", type: "TEXT" },
+      { name: "validated_by", type: "TEXT" },
+      { name: "infarction_stadium1", type: "TEXT" },
+      { name: "infarction_stadium2", type: "TEXT" }
+    ];
+
+    for (const col of requiredColumns) {
+      if (!columns.includes(col.name)) {
+        dbInstance.exec(`ALTER TABLE records ADD COLUMN ${col.name} ${col.type}`);
+      }
+    }
+  } catch (err) {
+    console.error("Failed to run database schema upgrades:", err);
+  }
 
   return dbInstance;
 }
