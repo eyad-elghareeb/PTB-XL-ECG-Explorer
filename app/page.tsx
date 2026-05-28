@@ -59,6 +59,138 @@ function getRecordSignalForLead(signals: any, leadName: string): number[] | null
   return targetArr;
 }
 
+interface DbLoopWindow {
+  startSec: number;
+  durationSec: number;
+  source: "rpeak" | "full";
+}
+
+const DEFAULT_DB_SIGNAL_DURATION_SEC = 10.0;
+
+function positiveModulo(value: number, modulo: number): number {
+  if (modulo <= 0) return 0;
+  return ((value % modulo) + modulo) % modulo;
+}
+
+function clampSignalValue(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function catmullRom(p0: number, p1: number, p2: number, p3: number, t: number): number {
+  const t2 = t * t;
+  const t3 = t2 * t;
+  return 0.5 * (
+    (2 * p1) +
+    (-p0 + p2) * t +
+    (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
+    (-p0 + 3 * p1 - 3 * p2 + p3) * t3
+  );
+}
+
+function sampleDbSignal(
+  signal: number[],
+  absoluteTimeSec: number,
+  frequency: number,
+  loop: DbLoopWindow,
+  smoothing: boolean
+): { value: number; sampleIndex: number; wrappedTimeSec: number } {
+  const len = signal.length;
+  if (len === 0) return { value: 0, sampleIndex: 0, wrappedTimeSec: 0 };
+
+  const inferredDuration = frequency > 0 ? len / frequency : DEFAULT_DB_SIGNAL_DURATION_SEC;
+  const fullDuration = Math.max(0.001, inferredDuration || DEFAULT_DB_SIGNAL_DURATION_SEC);
+  const loopStart = Math.min(Math.max(loop.startSec, 0), fullDuration);
+  const loopDuration = Math.min(Math.max(loop.durationSec, 0.001), fullDuration);
+  const wrappedTimeSec = positiveModulo(absoluteTimeSec, loopDuration);
+  const signalTimeSec = positiveModulo(loopStart + wrappedTimeSec, fullDuration);
+  const floatIndex = positiveModulo(signalTimeSec * Math.max(1, frequency), len);
+  const idx1 = Math.floor(floatIndex) % len;
+  const frac = floatIndex - Math.floor(floatIndex);
+  const idx2 = (idx1 + 1) % len;
+
+  if (!smoothing) {
+    const val1 = clampSignalValue(signal[idx1]);
+    const val2 = clampSignalValue(signal[idx2]);
+    return {
+      value: val1 * (1 - frac) + val2 * frac,
+      sampleIndex: idx1,
+      wrappedTimeSec
+    };
+  }
+
+  const idx0 = (idx1 - 1 + len) % len;
+  const idx3 = (idx1 + 2) % len;
+  return {
+    value: catmullRom(
+      clampSignalValue(signal[idx0]),
+      clampSignalValue(signal[idx1]),
+      clampSignalValue(signal[idx2]),
+      clampSignalValue(signal[idx3]),
+      frac
+    ),
+    sampleIndex: idx1,
+    wrappedTimeSec
+  };
+}
+
+function buildDbLoopWindow(signals: any, frequency: number): DbLoopWindow {
+  const fallback: DbLoopWindow = {
+    startSec: 0,
+    durationSec: DEFAULT_DB_SIGNAL_DURATION_SEC,
+    source: "full"
+  };
+  const leadII = getRecordSignalForLead(signals, "II");
+  if (!leadII || leadII.length < Math.max(10, frequency * 2)) return fallback;
+
+  const fullDuration = frequency > 0 ? leadII.length / frequency : DEFAULT_DB_SIGNAL_DURATION_SEC;
+  const analysis = analyzeECGPeaks(signals, "II", frequency);
+  const peaks = analysis?.peaksInfo || [];
+  if (peaks.length < 3) {
+    return { ...fallback, durationSec: Math.max(0.001, fullDuration || DEFAULT_DB_SIGNAL_DURATION_SEC) };
+  }
+
+  const firstPeak = peaks[0]?.time;
+  const lastPeak = peaks[peaks.length - 1]?.time;
+  if (typeof firstPeak !== "number" || typeof lastPeak !== "number" || lastPeak <= firstPeak) {
+    return { ...fallback, durationSec: Math.max(0.001, fullDuration || DEFAULT_DB_SIGNAL_DURATION_SEC) };
+  }
+
+  const rrIntervals: number[] = [];
+  for (let i = 1; i < peaks.length; i++) {
+    const prev = peaks[i - 1]?.time;
+    const next = peaks[i]?.time;
+    if (typeof prev === "number" && typeof next === "number" && next > prev) {
+      rrIntervals.push(next - prev);
+    }
+  }
+  const medianRR = rrIntervals.length > 0
+    ? [...rrIntervals].sort((a, b) => a - b)[Math.floor(rrIntervals.length / 2)]
+    : 0.8;
+
+  const startSec = Math.max(0, firstPeak - medianRR * 0.45);
+  const endSec = Math.min(fullDuration, lastPeak + medianRR * 0.55);
+  const durationSec = endSec - startSec;
+  if (durationSec < 2.0) {
+    return { ...fallback, durationSec: Math.max(0.001, fullDuration || DEFAULT_DB_SIGNAL_DURATION_SEC) };
+  }
+
+  return { startSec, durationSec, source: "rpeak" };
+}
+
+function isLikelyEnglishReport(raw: string | null): boolean {
+  if (!raw) return true;
+  const text = raw.trim();
+  if (!text) return true;
+  if (/[äöüÄÖÜß]|Linkstyp|Rechtstyp|Schenkelblock|Vorhof|Herz|Infarkt|Strecke|Sinusrhythmus/i.test(text)) {
+    return false;
+  }
+  if (/[åäöÅÄÖ]|vänster|höger|sinusrytm|förmaks|hjärt/i.test(text)) {
+    return false;
+  }
+  const englishHints = /\b(normal|sinus|rhythm|block|infarction|ischemia|axis|ventricular|atrial|left|right|heart|ecg|st|t wave)\b/i;
+  return englishHints.test(text) || /^[\x00-\x7F]+$/.test(text);
+}
+
 // ── Rich SCP Code Reference (PhysioNet 1.0.1 aligned) ─────────────────────────
 interface ScpInfo {
   name: string;         // Full human-readable medical name
@@ -675,114 +807,6 @@ const SCP_DESCRIPTIONS: Record<string, string> = Object.fromEntries(
   Object.entries(SCP_INFO).map(([k, v]) => [k, v.name])
 );
 
-// ── German → English ECG Term Translation Table ────────────────────────────────
-const DE_EN_TERMS: [RegExp, string][] = [
-  // Rhythms
-  [/Sinusrhythmus/gi,               "Sinus rhythm (normal)"],
-  [/Sinusbradykardie/gi,            "Sinus bradycardia (slow heart rate)"],
-  [/Sinustachykardie/gi,            "Sinus tachycardia (fast heart rate)"],
-  [/Sinusarrhythmie/gi,             "Sinus arrhythmia (normal breathing variation)"],
-  [/Vorhofflimmern/gi,              "Atrial fibrillation"],
-  [/Vorhofflattern/gi,              "Atrial flutter"],
-  [/Vorhoftachykardie/gi,           "Atrial tachycardia"],
-  [/supraventrikuläre Tachykardie/gi,"Supraventricular tachycardia (SVT)"],
-  [/ventrikuläre Tachykardie/gi,    "Ventricular tachycardia"],
-  [/Kammerflattern/gi,              "Ventricular flutter"],
-  [/Kammerflimmern/gi,              "Ventricular fibrillation"],
-  // Conduction
-  [/Linksschenkelblock/gi,          "Left bundle branch block (LBBB)"],
-  [/Rechtsschenkelblock/gi,         "Right bundle branch block (RBBB)"],
-  [/inkompletter Linksschenkelblock/gi, "Incomplete LBBB"],
-  [/inkompletter Rechtsschenkelblock/gi,"Incomplete RBBB"],
-  [/AV-Block I\. Grades?/gi,        "1st degree AV block (delayed conduction)"],
-  [/AV-Block II\. Grades?/gi,       "2nd degree AV block"],
-  [/AV-Block III\. Grades?/gi,      "Complete (3rd degree) AV block"],
-  [/AV-Block/gi,                    "AV conduction block"],
-  [/linksanteriorer Hemiblock/gi,   "Left anterior fascicular block (LAFB)"],
-  [/Hemiblock/gi,                   "Fascicular block"],
-  // Axis
-  [/Linkstyp/gi,                    "Left axis deviation"],
-  [/Rechtstyp/gi,                   "Right axis deviation"],
-  [/Steiltyp/gi,                    "Vertical axis"],
-  [/Normaltyp/gi,                   "Normal axis"],
-  [/überdrehter Linkstyp/gi,        "Extreme left axis deviation"],
-  [/überdrehter Rechtstyp/gi,       "Extreme right axis deviation"],
-  // ST changes
-  [/ST-Streckenerhebung/gi,         "ST segment elevation (possible heart attack)"],
-  [/ST-Streckensenkung/gi,          "ST segment depression (ischemia/reduced blood flow)"],
-  [/ST-Streckenveränderungen/gi,    "ST segment changes"],
-  [/ST-Veränderungen/gi,            "ST changes"],
-  [/signifikante ST/gi,             "significant ST"],
-  // T-wave
-  [/T-Negativierungen/gi,           "inverted T waves"],
-  [/T-Wellen-Veränderungen/gi,      "T wave changes"],
-  [/T-Wellen-Negativierungen/gi,    "T wave inversions"],
-  [/T-Negativierung/gi,             "T wave inversion"],
-  // Q waves / infarction
-  [/pathologische Q-Zacken/gi,      "pathological Q waves (sign of prior heart attack)"],
-  [/Q-Zacken/gi,                    "Q waves"],
-  [/Infarktnarbe/gi,                "heart attack scar"],
-  [/Herzinfarkt/gi,                 "heart attack"],
-  [/Hinterwandinfarkt/gi,           "inferior wall heart attack"],
-  [/Vorderwandinfarkt/gi,           "anterior wall heart attack"],
-  [/Seitenwandinfarkt/gi,           "lateral wall heart attack"],
-  [/subendokardialer Infarkt/gi,    "subendocardial heart attack (inner layer only)"],
-  // Hypertrophy
-  [/Linksherzhypertrophie/gi,       "left ventricular hypertrophy (enlarged left chamber)"],
-  [/Rechtsherzhypertrophie/gi,      "right ventricular hypertrophy (enlarged right chamber)"],
-  [/Vorhofhypertrophie/gi,          "atrial hypertrophy"],
-  [/linksventrikuläre Hypertrophie/gi,"left ventricular hypertrophy"],
-  [/rechtsventrikuläre Hypertrophie/gi,"right ventricular hypertrophy"],
-  // General
-  [/Normalbefund/gi,                "normal ECG findings"],
-  [/Normaler Befund/gi,             "normal ECG"],
-  [/unauffälliges EKG/gi,           "unremarkable ECG"],
-  [/Ischämiezeichen/gi,             "signs of ischemia (reduced blood flow)"],
-  [/Repolarisationsstörungen/gi,    "repolarization disturbances"],
-  [/Extrasystolen/gi,               "premature beats"],
-  [/ventrikuläre Extrasystolen/gi,  "premature ventricular beats (PVCs)"],
-  [/supraventrikuläre Extrasystolen/gi,"premature atrial beats (PACs)"],
-  [/Steigerung der Vorhofexzitation/gi,"enhanced atrial excitation"],
-  [/Überleitungsstörung/gi,         "conduction disturbance"],
-  [/Erregungsausbreitung/gi,        "electrical conduction"],
-  [/Erregungsrückbildung/gi,        "repolarization"],
-  [/Niedervoltage/gi,               "low voltage (small QRS complexes)"],
-  [/Schrittmacher/gi,               "pacemaker"],
-  [/früheren Infarkt/gi,            "previous heart attack"],
-  [/alten Infarkt/gi,               "old (healed) heart attack"],
-  [/akuten Infarkt/gi,              "acute (current) heart attack"],
-  [/Verdacht auf/gi,                "suspected"],
-  [/kein Hinweis auf/gi,            "no evidence of"],
-  [/klinischer Kontext/gi,          "clinical context"],
-  [/Bigeminus/gi,                   "bigeminy (every other beat is a premature beat)"],
-  [/Trigeminus/gi,                  "trigeminy (every third beat is premature)"],
-];
-
-/** Returns a plain-English translation of common German ECG report terms.
- *  Falls back gracefully if the text isn't German. */
-function translateClinicalReport(raw: string | null): Array<{ original: string; translated: string }> {
-  if (!raw) return [];
-  // Detect if German characters present
-  const isLikelyGerman = /[äöüÄÖÜß]|Sinus|Vorhof|Herz|Infarkt|Schenkelblock|Strecke/i.test(raw);
-  if (!isLikelyGerman) return [];
-
-  const findings: Array<{ original: string; translated: string }> = [];
-  const seen = new Set<string>();
-
-  for (const [pattern, en] of DE_EN_TERMS) {
-    const matches = raw.match(pattern);
-    if (matches) {
-      const orig = matches[0];
-      const key = en.toLowerCase();
-      if (!seen.has(key)) {
-        seen.add(key);
-        findings.push({ original: orig, translated: en });
-      }
-    }
-  }
-  return findings;
-}
-
 /** Returns the overall worst severity among SCP codes present */
 function getOverallSeverity(scpCodes: Record<string, number>): "normal" | "mild" | "moderate" | "severe" | "critical" {
   const order: Record<string, number> = { normal: 0, mild: 1, moderate: 2, severe: 3, critical: 4 };
@@ -1108,6 +1132,33 @@ export default function ECGSimulatorPage() {
   const [recordsLoading, setRecordsLoading] = useState<boolean>(false);
   const [signalsLoading, setSignalsLoading] = useState<boolean>(false);
   const [selectedFreq, setSelectedFreq] = useState<number>(500);
+  const [dbVisualSmoothing, setDbVisualSmoothing] = useState<boolean>(true);
+  const [dbLoopWindow, setDbLoopWindow] = useState<DbLoopWindow>({
+    startSec: 0,
+    durationSec: DEFAULT_DB_SIGNAL_DURATION_SEC,
+    source: "full"
+  });
+  const [translationState, setTranslationState] = useState<{
+    reportKey: string;
+    status: "idle" | "loading" | "translated" | "skipped" | "error";
+    translatedText: string;
+    source: string;
+    provider: string;
+    error?: string;
+  }>({
+    reportKey: "",
+    status: "idle",
+    translatedText: "",
+    source: "",
+    provider: ""
+  });
+  const translationCacheRef = useRef<Record<string, {
+    status: "translated" | "skipped" | "error";
+    translatedText: string;
+    source: string;
+    provider: string;
+    error?: string;
+  }>>({});
 
   // ── Rhythm and lead selections ──
   const [currentRhythm, setCurrentRhythm] = useState<string>("nsr");
@@ -1209,6 +1260,12 @@ export default function ECGSimulatorPage() {
     mode: "database",
     signals: null as any | null,
     frequency: 500,
+    dbVisualSmoothing: true,
+    dbLoopWindow: {
+      startSec: 0,
+      durationSec: DEFAULT_DB_SIGNAL_DURATION_SEC,
+      source: "full" as "rpeak" | "full"
+    },
     timeElapsed: 0.0,
     // 12-lead scrolling offset for database mode
     scrollOffset: 0.0,
@@ -1242,6 +1299,8 @@ export default function ECGSimulatorPage() {
     stateRef.current.mode = mode;
     stateRef.current.signals = recordSignals;
     stateRef.current.frequency = selectedFreq;
+    stateRef.current.dbVisualSmoothing = dbVisualSmoothing;
+    stateRef.current.dbLoopWindow = dbLoopWindow;
     stateRef.current.activeTab = activeTab;
     stateRef.current.diagSubTab = diagSubTab;
   }, [
@@ -1266,6 +1325,8 @@ export default function ECGSimulatorPage() {
     mode,
     recordSignals,
     selectedFreq,
+    dbVisualSmoothing,
+    dbLoopWindow,
     activeTab,
     diagSubTab
   ]);
@@ -1332,6 +1393,9 @@ export default function ECGSimulatorPage() {
     stateRef.current.scanX = 0.0;
     stateRef.current.phase = 0.0;
     stateRef.current.beatIndex = 0;
+    const resetLoop = { startSec: 0, durationSec: DEFAULT_DB_SIGNAL_DURATION_SEC, source: "full" as const };
+    setDbLoopWindow(resetLoop);
+    stateRef.current.dbLoopWindow = resetLoop;
     // Clear sweep buffers
     if (stateRef.current.sweepBuf) stateRef.current.sweepBuf.fill(lastDimensions.current.H / 2);
     if (stateRef.current.sweepWritten) stateRef.current.sweepWritten.fill(0);
@@ -1342,6 +1406,9 @@ export default function ECGSimulatorPage() {
       const data = await res.json();
       if (data.signals) {
         setRecordSignals(data.signals);
+        const loopWindow = buildDbLoopWindow(data.signals, freq);
+        setDbLoopWindow(loopWindow);
+        stateRef.current.dbLoopWindow = loopWindow;
         if (data.signals["II"]) {
           const bpmEst = estimateHeartRate(data.signals["II"], freq);
           setHeartRate(bpmEst);
@@ -1372,6 +1439,89 @@ export default function ECGSimulatorPage() {
       stateRef.current.peaksAnalysis = null;
     }
   }, [recordSignals, currentLead, selectedFreq, mode]);
+
+  useEffect(() => {
+    const rawReport = selectedRecord?.report || "";
+    const reportKey = rawReport.trim();
+    if (!reportKey) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setTranslationState({
+        reportKey: "",
+        status: "idle",
+        translatedText: "",
+        source: "",
+        provider: ""
+      });
+      return;
+    }
+
+    const cached = translationCacheRef.current[reportKey];
+    if (cached) {
+      setTranslationState({ reportKey, ...cached });
+      return;
+    }
+
+    if (isLikelyEnglishReport(reportKey)) {
+      const skipped = {
+        status: "skipped" as const,
+        translatedText: "",
+        source: "en",
+        provider: "local-language-check"
+      };
+      translationCacheRef.current[reportKey] = skipped;
+      setTranslationState({ reportKey, ...skipped });
+      return;
+    }
+
+    let cancelled = false;
+    setTranslationState({
+      reportKey,
+      status: "loading",
+      translatedText: "",
+      source: "",
+      provider: "MyMemory"
+    });
+
+    fetch("/api/translate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: reportKey, target: "en" })
+    })
+      .then(async (res) => {
+        const payload = await res.json();
+        if (!res.ok) throw new Error(payload?.error || "Translation request failed");
+        return payload;
+      })
+      .then((payload) => {
+        if (cancelled) return;
+        const translatedText = String(payload.translatedText || "").trim();
+        if (!translatedText) throw new Error("Translation provider returned no text");
+        const translated = {
+          status: "translated" as const,
+          translatedText,
+          source: String(payload.source || "auto"),
+          provider: String(payload.provider || "MyMemory")
+        };
+        translationCacheRef.current[reportKey] = translated;
+        setTranslationState({ reportKey, ...translated });
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        const failed = {
+          status: "error" as const,
+          translatedText: "",
+          source: "auto",
+          provider: "MyMemory",
+          error: err instanceof Error ? err.message : "Translation unavailable"
+        };
+        translationCacheRef.current[reportKey] = failed;
+        setTranslationState({ reportKey, ...failed });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedRecord?.report]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -1809,8 +1959,8 @@ export default function ECGSimulatorPage() {
       if (state.viewMode === "single") {
         if (state.mode === "database") {
           if (!state.paused) {
-            state.scrollOffset = (state.scrollOffset || 0) + dt;
-            if (state.scrollOffset >= 10.0) state.scrollOffset -= 10.0;
+            const loopDuration = state.dbLoopWindow?.durationSec || DEFAULT_DB_SIGNAL_DURATION_SEC;
+            state.scrollOffset = positiveModulo((state.scrollOffset || 0) + dt, loopDuration);
           }
         } else if (!state.paused) {
           const bpm = state.heartRate;
@@ -1959,7 +2109,7 @@ export default function ECGSimulatorPage() {
             ctx.beginPath();
             let first = true;
             const signalLen = dbSignalArray.length;
-            const signalFreq = (signalLen - 1) / 10.0;
+            const signalFreq = state.frequency || selectedFreq || 500;
             const drawSteps = Math.max(Math.ceil(W), Math.ceil(displayDuration * signalFreq));
             
             let prevIdx = -1;
@@ -1967,16 +2117,15 @@ export default function ECGSimulatorPage() {
               const norm = i / drawSteps;
               const px = norm * W;
               const t = norm * displayDuration;
-              
-              let signalT = t + (state.scrollOffset || 0);
-              signalT = ((signalT % 10.0) + 10.0) % 10.0;
-              const floatIdx = (signalT / 10.0) * (signalLen - 1);
-              const idx0 = Math.floor(floatIdx);
-              const idx1 = Math.min(signalLen - 1, idx0 + 1);
-              const frac = floatIdx - idx0;
-              const val0 = dbSignalArray[idx0];
-              const val1 = dbSignalArray[idx1];
-              let val = (val0 * (1 - frac) + val1 * frac) * state.amplitude;
+              const sample = sampleDbSignal(
+                dbSignalArray,
+                t + (state.scrollOffset || 0),
+                signalFreq,
+                state.dbLoopWindow,
+                state.dbVisualSmoothing
+              );
+              const idx0 = sample.sampleIndex;
+              let val = sample.value * state.amplitude;
 
               if (state.noise > 0) {
                 val = addTraceNoise(val, px * 0.05, 0, state.noise, state.realistic, state.heartRate);
@@ -1987,7 +2136,7 @@ export default function ECGSimulatorPage() {
                 ctx.moveTo(px, yCoord);
                 first = false;
               } else {
-                if (prevIdx !== -1 && Math.abs(idx0 - prevIdx) > signalLen / 2) {
+                if (prevIdx !== -1 && Math.abs(idx0 - prevIdx) > signalLen / 2 && state.dbLoopWindow?.source === "full") {
                   ctx.moveTo(px, yCoord);
                 } else {
                   ctx.lineTo(px, yCoord);
@@ -2011,11 +2160,13 @@ export default function ECGSimulatorPage() {
               const analysis = state.peaksAnalysis;
               const scroll = state.scrollOffset || 0;
               const dur = displayDuration;
+              const loop = state.dbLoopWindow || { startSec: 0, durationSec: DEFAULT_DB_SIGNAL_DURATION_SEC, source: "full" as const };
               
               ctx.save();
               analysis.peaksInfo.forEach((peak: any) => {
-                let diffT = peak.time - scroll;
-                diffT = ((diffT % 10.0) + 10.0) % 10.0;
+                const peakLoopTime = positiveModulo(peak.time - loop.startSec, loop.durationSec);
+                let diffT = peakLoopTime - scroll;
+                diffT = positiveModulo(diffT, loop.durationSec);
                 
                 if (diffT >= 0 && diffT < dur) {
                   const px = (diffT / dur) * W;
@@ -2051,8 +2202,13 @@ export default function ECGSimulatorPage() {
             }
 
             if (!state.paused) {
-              const currentSampleIdx = Math.floor(((state.scrollOffset || 0) / 10.0) * (signalLen - 1));
-              const currentSampleVal = dbSignalArray[currentSampleIdx];
+              const currentSampleVal = sampleDbSignal(
+                dbSignalArray,
+                state.scrollOffset || 0,
+                signalFreq,
+                state.dbLoopWindow,
+                false
+              ).value;
               const threshold = 0.55;
               if (currentSampleVal > threshold && !state.rPeakDetected) {
                 state.rPeakDetected = true;
@@ -2150,12 +2306,8 @@ export default function ECGSimulatorPage() {
 
         if (state.mode === "database" && state.signals) {
           if (!state.paused) {
-            // Advance scroll offset for continuous 12-lead scrolling
-            // Real-world speed: scroll through the full 10s signal in 10 real seconds
-            state.scrollOffset += dt * 1.0 * state.zoom;
-            if (state.scrollOffset >= 10.0) {
-              state.scrollOffset -= 10.0;
-            }
+            const loopDuration = state.dbLoopWindow?.durationSec || DEFAULT_DB_SIGNAL_DURATION_SEC;
+            state.scrollOffset = positiveModulo((state.scrollOffset || 0) + dt * state.zoom, loopDuration);
           }
 
           ctx.fillStyle = colors.bg;
@@ -2193,23 +2345,22 @@ export default function ECGSimulatorPage() {
                 ctx.beginPath();
                 let first = true;
                 const signalLen = leadSignal.length;
-                const signalFreq = (signalLen - 1) / 10.0;
+                const signalFreq = state.frequency || selectedFreq || 500;
                 const drawSteps = Math.max(Math.ceil(cellW), Math.ceil(cellDuration * signalFreq));
                 
                 let prevIdx = -1;
                 for (let px = 0; px <= drawSteps; px++) {
                   const frac = px / drawSteps;
-                  const t = (col + frac) * cellDuration;
-                  // Apply scrollOffset and wrap around 10s signal duration
-                  let signalT = t + state.scrollOffset;
-                  signalT = ((signalT % 10.0) + 10.0) % 10.0;
-                  const floatIdx = (signalT / 10.0) * (signalLen - 1);
-                  const idx0 = Math.floor(floatIdx);
-                  const idx1 = Math.min(signalLen - 1, idx0 + 1);
-                  const fracIdx = floatIdx - idx0;
-                  const val0 = leadSignal[idx0];
-                  const val1 = leadSignal[idx1];
-                  let val = (val0 * (1 - fracIdx) + val1 * fracIdx) * state.amplitude;
+                  const t = frac * cellDuration;
+                  const sample = sampleDbSignal(
+                    leadSignal,
+                    t + (state.scrollOffset || 0),
+                    signalFreq,
+                    state.dbLoopWindow,
+                    state.dbVisualSmoothing
+                  );
+                  const idx0 = sample.sampleIndex;
+                  let val = sample.value * state.amplitude;
 
                   if (state.noise > 0) {
                     val = addTraceNoise(val, idx0 * 0.05, 0, state.noise, state.realistic, state.heartRate);
@@ -2221,7 +2372,7 @@ export default function ECGSimulatorPage() {
                     ctx.moveTo(xCoord, yCoord);
                     first = false;
                   } else {
-                    if (prevIdx !== -1 && Math.abs(idx0 - prevIdx) > signalLen / 2) {
+                    if (prevIdx !== -1 && Math.abs(idx0 - prevIdx) > signalLen / 2 && state.dbLoopWindow?.source === "full") {
                       ctx.moveTo(xCoord, yCoord);
                     } else {
                       ctx.lineTo(xCoord, yCoord);
@@ -2288,24 +2439,22 @@ export default function ECGSimulatorPage() {
             ctx.beginPath();
             let firstR = true;
             const iiLen = iiSignal.length;
-            const signalFreq = (iiLen - 1) / 10.0;
+            const signalFreq = state.frequency || selectedFreq || 500;
             const drawSteps = Math.max(Math.ceil(W), Math.ceil(totalDuration * signalFreq));
             let prevRIdx = -1;
             for (let i = 0; i <= drawSteps; i++) {
               const norm = i / drawSteps;
               const px = norm * W;
-              // Time position along the visible strip
               const t = norm * totalDuration;
-              // Apply scrollOffset to get position in the 10s signal
-              let signalT = t + state.scrollOffset;
-              signalT = ((signalT % 10.0) + 10.0) % 10.0;
-              const floatIdx = (signalT / 10.0) * (iiLen - 1);
-              const idx0 = Math.floor(floatIdx);
-              const idx1 = Math.min(iiLen - 1, idx0 + 1);
-              const fracR = floatIdx - idx0;
-              const val0 = iiSignal[idx0];
-              const val1 = iiSignal[idx1];
-              let val = (val0 * (1 - fracR) + val1 * fracR) * state.amplitude;
+              const sample = sampleDbSignal(
+                iiSignal,
+                t + (state.scrollOffset || 0),
+                signalFreq,
+                state.dbLoopWindow,
+                state.dbVisualSmoothing
+              );
+              const idx0 = sample.sampleIndex;
+              let val = sample.value * state.amplitude;
 
               if (state.noise > 0) {
                 val = addTraceNoise(val, px * 0.05, 0, state.noise, state.realistic, state.heartRate);
@@ -2316,7 +2465,7 @@ export default function ECGSimulatorPage() {
                 ctx.moveTo(px, yCoord);
                 firstR = false;
               } else {
-                if (prevRIdx !== -1 && Math.abs(idx0 - prevRIdx) > iiLen / 2) {
+                if (prevRIdx !== -1 && Math.abs(idx0 - prevRIdx) > iiLen / 2 && state.dbLoopWindow?.source === "full") {
                   ctx.moveTo(px, yCoord);
                 } else {
                   ctx.lineTo(px, yCoord);
@@ -3789,6 +3938,24 @@ export default function ECGSimulatorPage() {
                 <div className={`tab-content ${activeTab === "db-explorer" ? "active" : ""}`} id="tab-db-explorer">
                   <div className="wave-customizer">
 
+                    <div className="toggle-row">
+                      <div>
+                        <div className="tr-label">DB Visual Smoothing</div>
+                        <div className="tr-desc">
+                          {dbVisualSmoothing ? "Cubic display interpolation is on" : "Raw linear interpolation is shown"}
+                          {recordSignals ? ` · Loop: ${dbLoopWindow.source === "rpeak" ? "beat-aligned" : "full record"}` : ""}
+                        </div>
+                      </div>
+                      <label className="toggle-switch">
+                        <input
+                          type="checkbox"
+                          checked={dbVisualSmoothing}
+                          onChange={(e) => setDbVisualSmoothing(e.target.checked)}
+                        />
+                        <span className="toggle-slider"></span>
+                      </label>
+                    </div>
+
                     {/* Search box controls */}
                     <div className="db-search-container">
                       <input
@@ -4006,7 +4173,6 @@ export default function ECGSimulatorPage() {
                         const verdictSummary = getVerdictSummary(selectedRecord.superclass, overallSeverity, parsedCodes);
                         const verdictMeta = SEVERITY_META[overallSeverity];
                         const axisInfo = getHeartAxisInterpretation(selectedRecord.heart_axis);
-                        const translations = translateClinicalReport(selectedRecord.report);
 
                         // Sort findings: critical → severe → moderate → mild → normal, then by probability desc
                         const sortedFindings = Object.entries(parsedCodes).sort(([codeA, probA], [codeB, probB]) => {
@@ -4146,31 +4312,44 @@ export default function ECGSimulatorPage() {
                                     <i className="fa-solid fa-file-medical"></i>
                                     Original Clinical Notes
                                   </div>
-                                  {translations.length > 0 && (
-                                    <span className="diag-lang-badge">DE → EN</span>
+                                  {translationState.status === "translated" && (
+                                    <span className="diag-lang-badge">{translationState.source.toUpperCase()} → EN</span>
                                   )}
                                 </div>
                                 <div className="diag-report-original">
                                   {selectedRecord.report}
                                 </div>
 
-                                {translations.length > 0 ? (
+                                {translationState.status === "loading" ? (
+                                  <div className="diag-translation-body">
+                                    <div className="diag-translation-item">
+                                      <div className="diag-translation-dot"></div>
+                                      <div className="diag-translation-text">
+                                        <i className="fa-solid fa-spinner animate-spin" style={{ marginRight: "0.35rem" }}></i>
+                                        Translating clinical notes to English...
+                                      </div>
+                                    </div>
+                                  </div>
+                                ) : translationState.status === "translated" ? (
                                   <>
                                     <div className="diag-translation-label">
                                       <i className="fa-solid fa-language"></i>
-                                      Plain English Translation
+                                      English Translation · {translationState.provider}
                                     </div>
                                     <div className="diag-translation-body">
-                                      {translations.map(({ original, translated }, i) => (
-                                        <div key={i} className="diag-translation-item">
-                                          <div className="diag-translation-dot"></div>
-                                          <div className="diag-translation-text">
-                                            <b>{original}</b> → {translated}
-                                          </div>
+                                      <div className="diag-translation-item">
+                                        <div className="diag-translation-dot"></div>
+                                        <div className="diag-translation-text">
+                                          {translationState.translatedText}
                                         </div>
-                                      ))}
+                                      </div>
                                     </div>
                                   </>
+                                ) : translationState.status === "error" ? (
+                                  <div style={{ padding: "0.5rem 0.75rem", fontSize: "0.65rem", color: "var(--text-muted)", fontStyle: "italic" }}>
+                                    <i className="fa-solid fa-triangle-exclamation" style={{ marginRight: "0.35rem" }}></i>
+                                    Translation unavailable, showing original notes.
+                                  </div>
                                 ) : (
                                   <div style={{ padding: "0.5rem 0.75rem", fontSize: "0.65rem", color: "var(--text-muted)", fontStyle: "italic" }}>
                                     <i className="fa-solid fa-circle-info" style={{ marginRight: "0.35rem" }}></i>
