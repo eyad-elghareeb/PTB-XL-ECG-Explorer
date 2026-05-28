@@ -1,11 +1,9 @@
 node_modules/
-.next/
+.next/*
 coverage/
 .DS_Store
 *.log
 .env*
 !.env.example
-ptbxl.db
-ptbxl.db-shm
-ptbxl.db-wal
+
 implementation_plan.md
