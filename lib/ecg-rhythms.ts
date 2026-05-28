@@ -544,6 +544,106 @@ export const INTENSITY_STAGES: Record<string, IntensityConfig> = {
     hrMod: (i) => 70 - 10 * i,
     params: (i) => ({ pAmp: 0.12, pDur: 0.096, prInt: 0.19 + 0.03*i, qrsAmp: 1.0, qrsDur: 0.06, stElev: -(0.12 + 0.18*i), stDur: 0.16, stSlope: -1, tAmp: 0.08 - 0.06*i, tDur: 0.12, tShape: 1, jNotch: 0, uAmp: 0, uDur: 0.10 })
   },
+  wellens: {
+    stages: [
+      { name: 'Type A Pattern', range: [0, 35], desc: 'Biphasic T waves in V2-V3 with minimal ST elevation; pain-free LAD warning pattern.' },
+      { name: 'Type B Pattern', range: [35, 70], desc: 'Deep symmetric anterior T-wave inversion with preserved R waves and no pathologic Q waves.' },
+      { name: 'Critical LAD Pattern', range: [70, 100], desc: 'Marked V2-V4 T-wave inversion suggesting high-risk proximal LAD stenosis.' }
+    ],
+    defaultIntensity: 0.55,
+    hrMod: (i) => 65 + 6 * i,
+    params: (i) => ({ pAmp: 0.10, pDur: 0.096, prInt: 0.19, qrsAmp: 0.9, qrsDur: 0.06, stElev: 0.02, stDur: 0.12, stSlope: 0, tAmp: -0.12 - 0.30*i, tDur: 0.22, tShape: i > 0.35 ? 2 : 1, jNotch: 0, uAmp: 0, uDur: 0.10 })
+  },
+  dewinter: {
+    stages: [
+      { name: 'Early De Winter', range: [0, 35], desc: 'Upsloping ST depression at the J point in precordial leads with tall symmetric T waves.' },
+      { name: 'Occlusion Pattern', range: [35, 70], desc: 'Prominent precordial ST depression and hyperacute T waves, a STEMI-equivalent LAD occlusion pattern.' },
+      { name: 'Severe LAD Occlusion', range: [70, 100], desc: 'Marked upsloping ST depression V2-V6 with very tall T waves and possible aVR elevation.' }
+    ],
+    defaultIntensity: 0.55,
+    hrMod: (i) => 92 + 15 * i,
+    params: (i) => ({ pAmp: 0.10, pDur: 0.096, prInt: 0.18, qrsAmp: 0.82, qrsDur: 0.06, stElev: -(0.10 + 0.24*i), stDur: 0.16, stSlope: -1, tAmp: 0.30 + 0.42*i, tDur: 0.20, tShape: 1, jNotch: 0, uAmp: 0, uDur: 0.10 })
+  },
+  pe: {
+    stages: [
+      { name: 'Sinus Tachycardia', range: [0, 30], desc: 'Tachycardia with subtle right heart strain features.' },
+      { name: 'Right Strain Pattern', range: [30, 65], desc: 'S1Q3T3 tendency, right axis strain, and anterior T-wave flattening/inversion.' },
+      { name: 'Massive PE Pattern', range: [65, 100], desc: 'Marked tachycardia with RV strain pattern and anterior/inferior repolarization changes.' }
+    ],
+    defaultIntensity: 0.5,
+    hrMod: (i) => 105 + 35 * i,
+    params: (i) => ({ pAmp: 0.11, pDur: 0.09, prInt: 0.17, qrsAmp: 0.85, qrsDur: 0.07, stElev: -0.04*i, stDur: 0.12, stSlope: 0, tAmp: 0.16 - 0.30*i, tDur: 0.17, tShape: 1, jNotch: 0, uAmp: 0, uDur: 0.10 })
+  },
+  lvh: {
+    stages: [
+      { name: 'Voltage Criteria', range: [0, 35], desc: 'Tall lateral R waves and deep right-precordial S waves meet LVH voltage criteria.' },
+      { name: 'LVH with Strain', range: [35, 70], desc: 'Lateral ST depression and asymmetric T-wave inversion develop.' },
+      { name: 'Severe LVH Strain', range: [70, 100], desc: 'Marked high-voltage QRS with pronounced lateral repolarization strain.' }
+    ],
+    defaultIntensity: 0.5,
+    hrMod: () => 72,
+    params: (i) => ({ pAmp: 0.10, pDur: 0.096, prInt: 0.19, qrsAmp: 1.15 + 0.55*i, qrsDur: 0.07 + 0.02*i, stElev: -0.05 - 0.18*i, stDur: 0.14, stSlope: -1, tAmp: 0.10 - 0.35*i, tDur: 0.20, tShape: 1, jNotch: 0, uAmp: 0, uDur: 0.10 })
+  },
+  rvh: {
+    stages: [
+      { name: 'Rightward Voltage', range: [0, 35], desc: 'Dominant R in V1 and right-axis tendency with preserved narrow QRS.' },
+      { name: 'RVH Strain', range: [35, 70], desc: 'Right precordial ST depression and T-wave inversion appear with increasing RV load.' },
+      { name: 'Severe RVH', range: [70, 100], desc: 'Large V1 R wave with marked right ventricular strain pattern.' }
+    ],
+    defaultIntensity: 0.5,
+    hrMod: (i) => 76 + 8 * i,
+    params: (i) => ({ pAmp: 0.11, pDur: 0.096, prInt: 0.18, qrsAmp: 0.9 + 0.45*i, qrsDur: 0.07 + 0.02*i, stElev: -0.04 - 0.14*i, stDur: 0.13, stSlope: -1, tAmp: 0.12 - 0.30*i, tDur: 0.18, tShape: 1, jNotch: 0, uAmp: 0, uDur: 0.10 })
+  },
+  bve: {
+    stages: [
+      { name: 'Combined Voltage', range: [0, 35], desc: 'Mixed LVH/RVH voltage features with broad high-amplitude QRS forces.' },
+      { name: 'Combined Strain', range: [35, 70], desc: 'Biventricular voltage with discordant ST-T abnormalities in right and left leads.' },
+      { name: 'Severe Enlargement', range: [70, 100], desc: 'Very high QRS voltage with bilateral ventricular strain features.' }
+    ],
+    defaultIntensity: 0.5,
+    hrMod: (i) => 74 + 6 * i,
+    params: (i) => ({ pAmp: 0.11, pDur: 0.096, prInt: 0.19, qrsAmp: 1.2 + 0.55*i, qrsDur: 0.075 + 0.025*i, stElev: -0.05 - 0.12*i, stDur: 0.14, stSlope: -1, tAmp: 0.12 - 0.25*i, tDur: 0.20, tShape: 1, jNotch: 0, uAmp: 0, uDur: 0.10 })
+  },
+  lah: {
+    stages: [
+      { name: 'Broad P Wave', range: [0, 35], desc: 'P mitrale pattern begins with broad notched P waves, best seen in lead II.' },
+      { name: 'Clear LA Enlargement', range: [35, 70], desc: 'Notched P wave >=120ms and terminal negative P component in V1.' },
+      { name: 'Marked LA Enlargement', range: [70, 100], desc: 'Very broad bifid P waves with pronounced terminal V1 negativity.' }
+    ],
+    defaultIntensity: 0.5,
+    hrMod: () => 72,
+    params: (i) => ({ pAmp: 0.12 + 0.04*i, pDur: 0.12 + 0.05*i, prInt: 0.19, qrsAmp: 1.0, qrsDur: 0.06, stElev: 0, stDur: 0.12, stSlope: 0, tAmp: 0.22, tDur: 0.19, tShape: 1, jNotch: 0, uAmp: 0, uDur: 0.10 })
+  },
+  rah: {
+    stages: [
+      { name: 'Tall P Wave', range: [0, 35], desc: 'P pulmonale pattern begins with taller peaked inferior P waves.' },
+      { name: 'Clear RA Enlargement', range: [35, 70], desc: 'Inferior P waves exceed typical amplitude thresholds with tall V1 initial positivity.' },
+      { name: 'Marked RA Enlargement', range: [70, 100], desc: 'Very tall narrow P waves indicating severe right atrial enlargement pattern.' }
+    ],
+    defaultIntensity: 0.5,
+    hrMod: (i) => 76 + 8 * i,
+    params: (i) => ({ pAmp: 0.16 + 0.16*i, pDur: 0.09, prInt: 0.18, qrsAmp: 1.0, qrsDur: 0.06, stElev: 0, stDur: 0.12, stSlope: 0, tAmp: 0.20, tDur: 0.18, tShape: 1, jNotch: 0, uAmp: 0, uDur: 0.10 })
+  },
+  lafb: {
+    stages: [
+      { name: 'Left Axis Deviation', range: [0, 40], desc: 'Left anterior fascicular block pattern with qR in I/aVL and rS inferiorly.' },
+      { name: 'Clear LAFB', range: [40, 75], desc: 'More pronounced left axis deviation with small QRS width increase.' },
+      { name: 'Marked LAFB', range: [75, 100], desc: 'Strong left-axis pattern with persistent narrow-to-mildly-wide QRS.' }
+    ],
+    defaultIntensity: 0.45,
+    hrMod: () => 72,
+    params: (i) => ({ pAmp: 0.10, pDur: 0.096, prInt: 0.19, qrsAmp: 0.95 + 0.2*i, qrsDur: 0.07 + 0.02*i, stElev: 0, stDur: 0.12, stSlope: 0, tAmp: 0.18, tDur: 0.18, tShape: 1, jNotch: 0, uAmp: 0, uDur: 0.10 })
+  },
+  lpfb: {
+    stages: [
+      { name: 'Right Axis Deviation', range: [0, 40], desc: 'Left posterior fascicular block pattern with right axis deviation after excluding RVH.' },
+      { name: 'Clear LPFB', range: [40, 75], desc: 'qR inferiorly and rS in I/aVL with preserved narrow-to-mildly-wide QRS.' },
+      { name: 'Marked LPFB', range: [75, 100], desc: 'Strong right-axis fascicular pattern with stable ventricular conduction.' }
+    ],
+    defaultIntensity: 0.45,
+    hrMod: () => 72,
+    params: (i) => ({ pAmp: 0.10, pDur: 0.096, prInt: 0.19, qrsAmp: 0.95 + 0.2*i, qrsDur: 0.07 + 0.02*i, stElev: 0, stDur: 0.12, stSlope: 0, tAmp: 0.18, tDur: 0.18, tShape: 1, jNotch: 0, uAmp: 0, uDur: 0.10 })
+  },
   pea: {
     stages: [
       { name: 'Organized Electrical Activity', range: [0, 30], desc: 'Organized QRS complexes are visible; PEA is a clinical diagnosis.' },
@@ -564,6 +664,109 @@ export const INTENSITY_STAGES: Record<string, IntensityConfig> = {
     params: (i) => ({ pAmp: 0, pDur: 0, prInt: 0, qrsAmp: 0, qrsDur: 0, stElev: 0, stDur: 0, stSlope: 0, tAmp: 0, tDur: 0, tShape: 1, jNotch: 0, uAmp: 0, uDur: 0 })
   }
 };
+
+export interface RhythmValidationCheck {
+  label: string;
+  passed: boolean;
+  detail: string;
+}
+
+export interface RhythmValidationSummary {
+  status: "validated" | "warning";
+  stageName: string;
+  targetHeartRate: number;
+  checks: RhythmValidationCheck[];
+}
+
+const RHYTHM_CLINICAL_SIGNATURES: Record<string, string[]> = {
+  nsr: ["Upright sinus P waves before each QRS", "Narrow QRS and physiologic P-QRS-T sequence"],
+  earlyrepo: ["Concave ST elevation with J-point notching", "Pattern favors benign early repolarization in lateral/inferior leads"],
+  st: ["Sinus P waves retained at elevated rate", "Shortened diastole without wide-complex tachycardia"],
+  sb: ["Sinus P waves retained at slow rate", "Longer cycle length with otherwise organized conduction"],
+  afib: ["No organized P waves", "Irregular fibrillatory baseline and ventricular response"],
+  aflutter: ["Sawtooth flutter baseline near 300/min", "Ventricular response governed by AV block ratio"],
+  svt: ["Regular narrow-complex tachycardia", "P waves hidden or retrograde at high rate"],
+  avb1: ["Constant PR prolongation with 1:1 conduction", "Every P wave conducts to QRS"],
+  avb2mob1: ["Progressive AV nodal delay", "Grouped beating with dropped QRS complexes"],
+  avb2mob2: ["Constant PR on conducted beats", "Sudden dropped QRS complexes with high-grade risk"],
+  avb3: ["AV dissociation with independent atrial and ventricular rhythms", "Slow escape rhythm with widening as severity rises"],
+  vtach: ["Regular or polymorphic wide-complex ventricular rhythm", "Absent organized sinus P-QRS relationship"],
+  vfib: ["Chaotic waveform without discrete QRS complexes", "Amplitude decreases toward fine VF at high intensity"],
+  pvc: ["Premature wide ventricular beat pattern", "Discordant ST-T morphology after ectopic beats"],
+  lbbb: ["Wide QRS with broad/notched lateral R waves", "Discordant ST-T changes in lateral and right-precordial leads"],
+  rbbb: ["rsR' / terminal R' pattern in V1-V2", "Wide terminal S waves in lateral leads"],
+  wpw: ["Short PR interval with delta-wave upstroke", "QRS widening and secondary ST-T discordance"],
+  longqt: ["Prolonged repolarization interval", "T-U complexity increases torsades risk"],
+  brugada: ["Right-precordial coved or saddleback ST elevation", "Negative or descending T wave in V1-V2 at high severity"],
+  hyperk: ["Tall narrow symmetric T waves early", "P-wave loss and QRS widening as severity rises"],
+  hypokalemia: ["T-wave flattening with ST depression", "Prominent U waves and T-U fusion"],
+  hypothermia: ["Bradycardia with Osborn J waves", "Intervals prolong as temperature severity rises"],
+  stemi_ant: ["Anterior ST elevation localized to V1-V4", "Reciprocal inferior depression when severe"],
+  stemi_inf: ["Inferior ST elevation localized to II/III/aVF", "Reciprocal high-lateral depression"],
+  stemi_lat: ["Lateral ST elevation localized to I/aVL/V5-V6", "Reciprocal anterior depression pattern"],
+  stemi_antlat: ["Anterior and lateral ST elevation territory", "Large LAD-territory occlusion pattern"],
+  stemi_inflat: ["Inferior and lateral ST elevation territory", "Reciprocal high-lateral/anterior depression pattern"],
+  stemi_rv: ["Right-sided/RV infarct suspicion from V1 pattern", "Reciprocal lateral depression when severe"],
+  pwmi: ["Posterior reciprocal ST depression in V1-V3", "Tall R waves and upright T waves in anterior leads"],
+  pericarditis: ["Diffuse concave ST elevation", "PR depression with reciprocal aVR/V1 behavior"],
+  digoxin: ["Scooped sagging ST depression", "Flattened T waves with mild PR effect"],
+  wellens: ["Biphasic or deep symmetric T inversion in V2-V3", "Minimal ST elevation with preserved R waves"],
+  dewinter: ["Upsloping precordial ST depression", "Tall symmetric T waves as LAD-occlusion equivalent"],
+  pe: ["Sinus tachycardia with right-heart strain", "S1Q3T3/right-axis tendency and anterior T changes"],
+  lvh: ["High-voltage lateral R and deep V1/V2 S pattern", "Lateral strain ST-T abnormalities"],
+  rvh: ["Dominant V1 R wave/rightward voltage", "Right-precordial strain changes"],
+  bve: ["Combined right and left voltage features", "Bilateral ventricular strain behavior"],
+  lah: ["Broad notched P waves in lead II", "Terminal negative P component in V1"],
+  rah: ["Tall peaked inferior P waves", "Right atrial P-pulmonale pattern"],
+  lafb: ["Left-axis fascicular pattern", "qR in I/aVL with inferior rS tendency"],
+  lpfb: ["Right-axis fascicular pattern", "Inferior qR with I/aVL rS tendency"],
+  pea: ["Organized electrical activity is present", "Clinical pulse absence must be assessed separately"],
+  asystole: ["Near-flat baseline without ventricular complexes", "Two-lead confirmation remains required"]
+};
+
+function getStageForIntensity(config: IntensityConfig, intensity: number): Stage {
+  const pct = Math.max(0, Math.min(100, intensity * 100));
+  return config.stages.find((stage) => pct >= stage.range[0] && pct <= stage.range[1]) || config.stages[config.stages.length - 1];
+}
+
+export function validateRhythmProfile(rhythmId: string, intensity: number): RhythmValidationSummary {
+  const config = INTENSITY_STAGES[rhythmId] || INTENSITY_STAGES._default;
+  const clampedIntensity = Math.max(0, Math.min(1, intensity));
+  const params = config.params(clampedIntensity);
+  const targetHeartRate = Math.max(0, Math.round(config.hrMod ? config.hrMod(clampedIntensity) : (rhythmRates[rhythmId] || 72)));
+  const finiteParams = Object.values(params).every((value) => typeof value === "number" && Number.isFinite(value));
+  const stage = getStageForIntensity(config, clampedIntensity);
+  const signatures = RHYTHM_CLINICAL_SIGNATURES[rhythmId] || [];
+
+  const checks: RhythmValidationCheck[] = [
+    {
+      label: "Finite waveform parameters",
+      passed: finiteParams,
+      detail: finiteParams ? "All configured P-QRS-ST-T parameters resolve to numeric values." : "One or more waveform parameters is invalid."
+    },
+    {
+      label: "Physiologic rate target",
+      passed: rhythmId === "vfib" || rhythmId === "asystole" || rhythmId === "pea" || (targetHeartRate >= 20 && targetHeartRate <= 240),
+      detail: rhythmId === "vfib" || rhythmId === "asystole" ? "No organized heart-rate target is expected." : `${targetHeartRate} bpm target remains within simulator bounds.`
+    },
+    {
+      label: "Clinical signature",
+      passed: signatures.length > 0,
+      detail: signatures.length > 0 ? signatures.join("; ") : "No rhythm-specific clinical signature has been registered."
+    }
+  ];
+
+  if (rhythmId.startsWith("stemi_")) {
+    checks.push({
+      label: "Territory mapping",
+      passed: !!(config.culpritLeads?.length && config.reciprocalLeads?.length),
+      detail: `Culprit: ${config.culpritLeads?.join(", ") || "none"}; reciprocal: ${config.reciprocalLeads?.join(", ") || "none"}.`
+    });
+  }
+
+  const status = checks.every((check) => check.passed) ? "validated" : "warning";
+  return { status, stageName: stage.name, targetHeartRate, checks };
+}
 
 export const rhythmRates: Record<string, number> = {
   nsr:72, st:130, sb:45, afib:95, aflutter:85, svt:180,

@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import Link from "next/link";
 import {
   RHYTHM_CLASSIFICATIONS,
@@ -11,7 +11,8 @@ import {
   LAYOUT_12,
   LEADS,
   BEAT_AWARE_RHYTHMS,
-  LEAD_TARGET_AMPLITUDE
+  LEAD_TARGET_AMPLITUDE,
+  validateRhythmProfile
 } from "../lib/ecg-rhythms";
 import {
   getWaveformForBeatIndex,
@@ -1102,7 +1103,7 @@ export default function ECGSimulatorPage() {
   const [pullCount, setPullCount] = useState<number>(21837);
 
   // ── Dev environment detection (hide DB Setup tab on Vercel/production) ──
-  const isDevEnvironment = typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
+  const [isDevEnvironment, setIsDevEnvironment] = useState<boolean>(false);
 
   // Safe accessor for INTENSITY_STAGES — falls back to _default for rhythms without pathological progression
   const getIntensityConfig = (rhythmId: string) => INTENSITY_STAGES[rhythmId] || INTENSITY_STAGES._default;
@@ -1273,6 +1274,11 @@ export default function ECGSimulatorPage() {
     diagSubTab: "overview",
     peaksAnalysis: null as any | null
   });
+
+  useEffect(() => {
+    const host = window.location.hostname;
+    setIsDevEnvironment(host === "localhost" || host === "127.0.0.1");
+  }, []);
 
   // ── Synchronize React state variations to the drawing variables thread ──
   useEffect(() => {
@@ -3712,6 +3718,16 @@ export default function ECGSimulatorPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [viewMode, zoom, currentLead, currentRhythm, stripMode, paused]);
 
+  const activeIntensityConfig = getIntensityConfig(currentRhythm);
+  const activeIntensityPct = Math.round(effectIntensity * 100);
+  const activeIntensityStage = activeIntensityConfig.stages.find(
+    (stage) => activeIntensityPct >= stage.range[0] && activeIntensityPct <= stage.range[1]
+  ) || activeIntensityConfig.stages[activeIntensityConfig.stages.length - 1];
+  const rhythmValidation = useMemo(
+    () => validateRhythmProfile(currentRhythm, effectIntensity),
+    [currentRhythm, effectIntensity]
+  );
+
   return (
     <div className="ecg-body-wrap" suppressHydrationWarning>
       {/* FontAwesome integration */}
@@ -4687,20 +4703,34 @@ export default function ECGSimulatorPage() {
               {/* PROGRESSIVE PATHOLOGY PANEL */}
               <div className="intensity-panel mt-3">
                 <div className="intensity-panel-header">
-                  <span className="intensity-label">Pathology Intensity</span>
-                  <span className="intensity-badge">
-                    {INTENSITY_STAGES[currentRhythm] ? Math.round(effectIntensity * 100) + "%" : "0%"}
-                  </span>
+                  <div>
+                    <span className="intensity-label">Pathology Intensity</span>
+                    <div className="intensity-stage-name">{activeIntensityStage.name}</div>
+                  </div>
+                  <span className="intensity-badge">{activeIntensityPct}%</span>
                 </div>
 
-                <div className="intensity-desc">
-                  {INTENSITY_STAGES[currentRhythm]
-                    ? (INTENSITY_STAGES[currentRhythm].stages.find(
-                        (s) =>
-                          effectIntensity * 100 >= s.range[0] &&
-                          effectIntensity * 100 <= s.range[1]
-                      )?.desc || "Select intensity range")
-                    : "Select a rhythm to activate the progressive pathology slider."}
+                <div className="intensity-desc">{activeIntensityStage.desc}</div>
+
+                <div className={`rhythm-validation-card ${rhythmValidation.status}`}>
+                  <div className="validation-header">
+                    <span>
+                      <i className={rhythmValidation.status === "validated" ? "fa-solid fa-circle-check" : "fa-solid fa-triangle-exclamation"}></i>
+                      Accuracy checks
+                    </span>
+                    <span>{rhythmValidation.targetHeartRate > 0 ? `${rhythmValidation.targetHeartRate} bpm` : "No organized HR"}</span>
+                  </div>
+                  <div className="validation-check-list">
+                    {rhythmValidation.checks.map((check) => (
+                      <div className={`validation-check ${check.passed ? "passed" : "warning"}`} key={check.label}>
+                        <i className={check.passed ? "fa-solid fa-check" : "fa-solid fa-triangle-exclamation"}></i>
+                        <div>
+                          <span>{check.label}</span>
+                          <p>{check.detail}</p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
                 </div>
 
                 {currentRhythm.startsWith("stemi_") && (
@@ -4722,9 +4752,10 @@ export default function ECGSimulatorPage() {
                     type="range"
                     min="0"
                     max="100"
-                    disabled={!INTENSITY_STAGES[currentRhythm]}
-                    value={INTENSITY_STAGES[currentRhythm] ? Math.round(effectIntensity * 100) : 0}
+                    value={activeIntensityPct}
                     onChange={(e) => handleIntensityChange(e.target.value)}
+                    style={{ "--intensity-progress": `${activeIntensityPct}%` } as React.CSSProperties}
+                    aria-label="Pathology intensity"
                   />
                 </div>
 
@@ -4737,19 +4768,20 @@ export default function ECGSimulatorPage() {
                 </div>
 
                 <div className="intensity-stage-dots mt-2">
-                  {INTENSITY_STAGES[currentRhythm] && INTENSITY_STAGES[currentRhythm].stages.map((stg) => {
+                  {activeIntensityConfig.stages.map((stg) => {
                     const isCurrent =
                       effectIntensity * 100 >= stg.range[0] &&
                       effectIntensity * 100 <= stg.range[1];
                     const midPoint = (stg.range[0] + stg.range[1]) / 2;
                     return (
-                      <span
+                      <button
+                        type="button"
                         key={stg.name}
                         className={`intensity-dot ${isCurrent ? "active" : ""}`}
                         onClick={() => handleIntensityChange(midPoint.toString())}
                       >
                         {stg.name}
-                      </span>
+                      </button>
                     );
                   })}
                 </div>

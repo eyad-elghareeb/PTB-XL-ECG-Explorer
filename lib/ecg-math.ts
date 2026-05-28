@@ -656,14 +656,27 @@ export function getWaveformForBeatIndex(
     const leadAmp = LEAD_TARGET_AMPLITUDE[lead] || 1.6;
     const leadScale = leadAmp / 1.6;
     val = cleanVal + fl * leadScale;
-  } else if (rhythm === 'avb1' || rhythm === 'avb2mob1' || rhythm === 'avb2mob2') {
+  } else if (rhythm === 'avb1') {
     val = generateLeadWaveformUnscaled(rhythm, lead, bpm, intensity, phase, beatIndex, waveParams, manualMode);
+  } else if (rhythm === 'avb2mob1' || rhythm === 'avb2mob2') {
+    const dropEvery = rhythm === 'avb2mob1'
+      ? (intensity > 0.55 ? 3 : intensity > 0.25 ? 4 : 5)
+      : (intensity > 0.55 ? 2 : intensity > 0.25 ? 3 : 4);
+    const droppedBeat = beatIndex % dropEvery === dropEvery - 1;
+    if (droppedBeat) {
+      const atrialOnly = generateLeadWaveformUnscaled('nsr', lead, bpm, 0.0, phase, beatIndex, waveParams, manualMode);
+      val = phase < 0.22 ? atrialOnly * (0.85 + 0.2 * intensity) : 0;
+    } else {
+      val = generateLeadWaveformUnscaled(rhythm, lead, bpm, intensity, phase, beatIndex, waveParams, manualMode);
+    }
   } else if (rhythm === 'avb3') {
-    const t_abs = (beatIndex + phase) * (60 / 40);
-    const phase_atrial = (t_abs * (80 / 60)) % 1;
-    const valAtrial = generateLeadWaveformUnscaled('nsr', lead, 80, 0.0, phase_atrial, 0, waveParams, manualMode);
+    const ventRate = Math.max(18, bpm);
+    const atrialRate = 82 + 10 * intensity;
+    const t_abs = (beatIndex + phase) * (60 / ventRate);
+    const phase_atrial = (t_abs * (atrialRate / 60)) % 1;
+    const valAtrial = generateLeadWaveformUnscaled('nsr', lead, atrialRate, 0.0, phase_atrial, 0, waveParams, manualMode);
     const pOnly = phase_atrial < 0.15 ? valAtrial : 0.0;
-    const valVent = generateLeadWaveformUnscaled('nsr', lead, 40, 0.0, phase, beatIndex, waveParams, manualMode);
+    const valVent = generateLeadWaveformUnscaled('avb3', lead, ventRate, intensity, phase, beatIndex, waveParams, manualMode);
     const qrstOnly = phase < 0.15 ? 0.0 : valVent;
     val = pOnly + qrstOnly;
   } else if (rhythm === 'pvc') {
