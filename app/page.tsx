@@ -338,6 +338,13 @@ function getInfarctionStadiumLabel(stadium: string): string {
   return "Infarction stage recorded — correlate with the clinical timeline for full interpretation.";
 }
 
+// Safely parse scp_codes: may already be an object (from lib/data.ts JSON) or a JSON string (from sql.js DB)
+function parseScpCodes(val: any): Record<string, number> {
+  if (!val) return {};
+  if (typeof val === "object") return val;
+  try { return JSON.parse(val); } catch { return {}; }
+}
+
 export default function ECGSimulatorPage() {
   // ── Mode selection (clinical db vs mathematical simulator) ──
   const [mode, setMode] = useState<string>("database"); // "database" or "simulation"
@@ -3185,7 +3192,7 @@ export default function ECGSimulatorPage() {
                               </div>
                               {record.scp_codes && (
                                 <div className="db-record-scp">
-                                  SCP: {Object.keys(JSON.parse(record.scp_codes)).slice(0, 3).join(", ")}{Object.keys(JSON.parse(record.scp_codes)).length > 3 ? "..." : ""}
+                                  SCP: {Object.keys(parseScpCodes(record.scp_codes)).slice(0, 3).join(", ")}{Object.keys(parseScpCodes(record.scp_codes)).length > 3 ? "..." : ""}
                                 </div>
                               )}
                             </div>
@@ -3293,7 +3300,7 @@ export default function ECGSimulatorPage() {
                                 <i className="fa-solid fa-book-medical"></i> Diagnostic SCP Codes
                               </div>
                               <div className="diag-scp-list">
-                                {Object.entries(JSON.parse(selectedRecord.scp_codes)).map(([code, value]) => {
+                                {Object.entries(parseScpCodes(selectedRecord.scp_codes)).map(([code, value]) => {
                                   const desc = SCP_DESCRIPTIONS[code] || "Associated clinical condition";
                                   const prob = typeof value === "number" ? Math.round(value) : 100;
                                   const cat = getScpCategory(code);
