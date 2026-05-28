@@ -1296,6 +1296,352 @@ body.resizing {
   text-overflow: ellipsis;
 }
 
+
+/* ── Enhanced Diagnostics Tab ─────────────────────────────────── */
+
+/* Verdict / severity card at the top */
+.diag-verdict {
+  border-radius: var(--radius-md);
+  padding: 0.85rem 1rem;
+  margin-bottom: 0.1rem;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+  border: 1px solid transparent;
+}
+.diag-verdict.sev-normal  { background: rgba(46,160,67,0.10);  border-color: rgba(46,160,67,0.28); }
+.diag-verdict.sev-mild    { background: rgba(56,139,253,0.10); border-color: rgba(56,139,253,0.28); }
+.diag-verdict.sev-moderate{ background: rgba(240,165,0,0.10);  border-color: rgba(240,165,0,0.28); }
+.diag-verdict.sev-severe  { background: rgba(255,107,107,0.10);border-color: rgba(255,107,107,0.30); }
+.diag-verdict.sev-critical{ background: rgba(218,54,51,0.13);  border-color: rgba(218,54,51,0.40); }
+
+.diag-verdict-icon {
+  font-size: 1.4rem;
+  flex-shrink: 0;
+  margin-top: 0.05rem;
+}
+.diag-verdict.sev-normal   .diag-verdict-icon { color: var(--rhythm-normal); }
+.diag-verdict.sev-mild     .diag-verdict-icon { color: #388bfd; }
+.diag-verdict.sev-moderate .diag-verdict-icon { color: var(--accent); }
+.diag-verdict.sev-severe   .diag-verdict-icon { color: var(--rhythm-ischemia); }
+.diag-verdict.sev-critical .diag-verdict-icon { color: var(--wrong); }
+
+.diag-verdict-body { flex: 1; min-width: 0; }
+.diag-verdict-title {
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-bottom: 0.25rem;
+}
+.diag-verdict.sev-normal   .diag-verdict-title { color: var(--rhythm-normal); }
+.diag-verdict.sev-mild     .diag-verdict-title { color: #388bfd; }
+.diag-verdict.sev-moderate .diag-verdict-title { color: var(--accent); }
+.diag-verdict.sev-severe   .diag-verdict-title { color: var(--rhythm-ischemia); }
+.diag-verdict.sev-critical .diag-verdict-title { color: var(--wrong); }
+
+.diag-verdict-summary {
+  font-size: 0.74rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+/* Finding cards (one per SCP code) */
+.diag-finding-card {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  transition: box-shadow 0.15s ease;
+}
+.diag-finding-card:hover { box-shadow: 0 4px 16px rgba(0,0,0,0.12); }
+
+.diag-finding-card.sev-normal   { border-left: 4px solid var(--rhythm-normal); }
+.diag-finding-card.sev-mild     { border-left: 4px solid #388bfd; }
+.diag-finding-card.sev-moderate { border-left: 4px solid var(--accent); }
+.diag-finding-card.sev-severe   { border-left: 4px solid var(--rhythm-ischemia); }
+.diag-finding-card.sev-critical { border-left: 4px solid var(--wrong); }
+
+.diag-finding-main {
+  padding: 0.65rem 0.75rem 0.55rem 0.75rem;
+}
+.diag-finding-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.3rem;
+}
+.diag-finding-left { flex: 1; min-width: 0; }
+.diag-finding-code-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-bottom: 0.2rem;
+}
+.diag-finding-code {
+  font-family: monospace;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 0.08rem 0.35rem;
+  border-radius: 4px;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+.diag-severity-pill {
+  font-size: 0.55rem;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  padding: 0.1rem 0.4rem;
+  border-radius: 99px;
+}
+.diag-severity-pill.sev-normal   { background: rgba(46,160,67,0.15);  color: var(--rhythm-normal);   border: 1px solid rgba(46,160,67,0.30); }
+.diag-severity-pill.sev-mild     { background: rgba(56,139,253,0.12); color: #388bfd;                border: 1px solid rgba(56,139,253,0.28); }
+.diag-severity-pill.sev-moderate { background: rgba(240,165,0,0.12);  color: var(--accent);          border: 1px solid rgba(240,165,0,0.28); }
+.diag-severity-pill.sev-severe   { background: rgba(255,107,107,0.12);color: var(--rhythm-ischemia); border: 1px solid rgba(255,107,107,0.30); }
+.diag-severity-pill.sev-critical { background: rgba(218,54,51,0.15);  color: var(--wrong);           border: 1px solid rgba(218,54,51,0.38); }
+
+.diag-finding-name {
+  font-size: 0.77rem;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 0.22rem;
+  line-height: 1.3;
+}
+.diag-finding-simple {
+  font-size: 0.71rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+.diag-finding-prob-col {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.2rem;
+  flex-shrink: 0;
+}
+.diag-finding-prob-num {
+  font-size: 0.9rem;
+  font-weight: 800;
+  color: var(--text);
+  line-height: 1;
+}
+.diag-finding-prob-label {
+  font-size: 0.52rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* Progress bar */
+.diag-finding-bar-wrap {
+  height: 4px;
+  background: rgba(255,255,255,0.07);
+  border-radius: 99px;
+  margin: 0.45rem 0 0 0;
+  overflow: hidden;
+}
+.diag-finding-bar-fill {
+  height: 100%;
+  border-radius: 99px;
+  transition: width 0.5s ease;
+}
+.diag-finding-card.sev-normal   .diag-finding-bar-fill { background: var(--rhythm-normal); }
+.diag-finding-card.sev-mild     .diag-finding-bar-fill { background: #388bfd; }
+.diag-finding-card.sev-moderate .diag-finding-bar-fill { background: var(--accent); }
+.diag-finding-card.sev-severe   .diag-finding-bar-fill { background: var(--rhythm-ischemia); }
+.diag-finding-card.sev-critical .diag-finding-bar-fill { background: var(--wrong); }
+
+/* Teaching tip toggle */
+.diag-finding-tip-toggle {
+  width: 100%;
+  background: transparent;
+  border: none;
+  border-top: 1px solid var(--border);
+  padding: 0.38rem 0.75rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+  font-size: 0.64rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-align: left;
+  gap: 0.4rem;
+  transition: background 0.12s;
+}
+.diag-finding-tip-toggle:hover { background: rgba(255,255,255,0.03); color: var(--text-secondary); }
+.diag-finding-tip-toggle i { font-size: 0.6rem; transition: transform 0.2s; }
+.diag-finding-tip-toggle.open i { transform: rotate(180deg); }
+
+.diag-finding-tip-body {
+  padding: 0.55rem 0.75rem 0.6rem;
+  border-top: 1px solid var(--border);
+  background: rgba(255,255,255,0.02);
+  font-size: 0.68rem;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+.diag-finding-tip-body b { color: var(--text); }
+
+/* Report translation section */
+.diag-report-section {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+.diag-report-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  background: rgba(255,255,255,0.025);
+}
+.diag-report-header-title {
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.diag-lang-badge {
+  font-size: 0.52rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 0.08rem 0.35rem;
+  border-radius: 4px;
+  background: rgba(240,165,0,0.12);
+  color: var(--accent);
+  border: 1px solid rgba(240,165,0,0.25);
+}
+.diag-report-original {
+  padding: 0.6rem 0.75rem;
+  font-size: 0.69rem;
+  color: var(--text-muted);
+  font-style: italic;
+  line-height: 1.55;
+  border-bottom: 1px solid var(--border);
+}
+.diag-translation-label {
+  padding: 0.4rem 0.75rem 0.2rem;
+  font-size: 0.58rem;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--rhythm-normal);
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.diag-translation-body {
+  padding: 0.2rem 0.75rem 0.65rem;
+  font-size: 0.71rem;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+.diag-translation-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 0.28rem 0;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+.diag-translation-item:last-child { border-bottom: none; }
+.diag-translation-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex-shrink: 0;
+  margin-top: 0.28rem;
+}
+.diag-translation-text { flex: 1; }
+.diag-translation-text b { color: var(--text); }
+
+/* Axis card */
+.diag-axis-card {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 0.65rem 0.75rem;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+}
+.diag-axis-icon {
+  font-size: 1rem;
+  flex-shrink: 0;
+  color: var(--text-muted);
+  margin-top: 0.05rem;
+}
+.diag-axis-content { flex: 1; }
+.diag-axis-label { font-size: 0.73rem; font-weight: 700; color: var(--text); }
+.diag-axis-desc  { font-size: 0.67rem; color: var(--text-secondary); line-height: 1.5; margin-top: 0.15rem; }
+
+/* Pacemaker badge */
+.diag-pacemaker-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.64rem;
+  font-weight: 700;
+  padding: 0.25rem 0.6rem;
+  border-radius: 99px;
+  background: rgba(46,160,67,0.12);
+  color: var(--rhythm-normal);
+  border: 1px solid rgba(46,160,67,0.28);
+}
+
+/* Infarction timeline card */
+.diag-infarct-timeline {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+.diag-infarct-header {
+  padding: 0.55rem 0.75rem;
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: var(--wrong);
+  background: rgba(218,54,51,0.07);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.diag-infarct-stage {
+  padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+.diag-infarct-stage:last-child { border-bottom: none; }
+.diag-infarct-stage-title {
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  margin-bottom: 0.18rem;
+}
+.diag-infarct-stage-raw {
+  font-size: 0.69rem;
+  font-weight: 700;
+  color: var(--wrong);
+  margin-bottom: 0.3rem;
+}
+.diag-infarct-stage-desc {
+  font-size: 0.68rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
 /* ── DB Setup Tab ──────────────────────────────────────────── */
 .db-setup-section {
   display: flex;

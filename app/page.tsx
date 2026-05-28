@@ -117,6 +117,160 @@ const SCP_DESCRIPTIONS: Record<string, string> = Object.fromEntries(
   Object.entries(SCP_INFO).map(([k, v]) => [k, v.name])
 );
 
+// ── German → English ECG Term Translation Table ────────────────────────────────
+const DE_EN_TERMS: [RegExp, string][] = [
+  // Rhythms
+  [/Sinusrhythmus/gi,               "Sinus rhythm (normal)"],
+  [/Sinusbradykardie/gi,            "Sinus bradycardia (slow heart rate)"],
+  [/Sinustachykardie/gi,            "Sinus tachycardia (fast heart rate)"],
+  [/Sinusarrhythmie/gi,             "Sinus arrhythmia (normal breathing variation)"],
+  [/Vorhofflimmern/gi,              "Atrial fibrillation"],
+  [/Vorhofflattern/gi,              "Atrial flutter"],
+  [/Vorhoftachykardie/gi,           "Atrial tachycardia"],
+  [/supraventrikuläre Tachykardie/gi,"Supraventricular tachycardia (SVT)"],
+  [/ventrikuläre Tachykardie/gi,    "Ventricular tachycardia"],
+  [/Kammerflattern/gi,              "Ventricular flutter"],
+  [/Kammerflimmern/gi,              "Ventricular fibrillation"],
+  // Conduction
+  [/Linksschenkelblock/gi,          "Left bundle branch block (LBBB)"],
+  [/Rechtsschenkelblock/gi,         "Right bundle branch block (RBBB)"],
+  [/inkompletter Linksschenkelblock/gi, "Incomplete LBBB"],
+  [/inkompletter Rechtsschenkelblock/gi,"Incomplete RBBB"],
+  [/AV-Block I\. Grades?/gi,        "1st degree AV block (delayed conduction)"],
+  [/AV-Block II\. Grades?/gi,       "2nd degree AV block"],
+  [/AV-Block III\. Grades?/gi,      "Complete (3rd degree) AV block"],
+  [/AV-Block/gi,                    "AV conduction block"],
+  [/linksanteriorer Hemiblock/gi,   "Left anterior fascicular block (LAFB)"],
+  [/Hemiblock/gi,                   "Fascicular block"],
+  // Axis
+  [/Linkstyp/gi,                    "Left axis deviation"],
+  [/Rechtstyp/gi,                   "Right axis deviation"],
+  [/Steiltyp/gi,                    "Vertical axis"],
+  [/Normaltyp/gi,                   "Normal axis"],
+  [/überdrehter Linkstyp/gi,        "Extreme left axis deviation"],
+  [/überdrehter Rechtstyp/gi,       "Extreme right axis deviation"],
+  // ST changes
+  [/ST-Streckenerhebung/gi,         "ST segment elevation (possible heart attack)"],
+  [/ST-Streckensenkung/gi,          "ST segment depression (ischemia/reduced blood flow)"],
+  [/ST-Streckenveränderungen/gi,    "ST segment changes"],
+  [/ST-Veränderungen/gi,            "ST changes"],
+  [/signifikante ST/gi,             "significant ST"],
+  // T-wave
+  [/T-Negativierungen/gi,           "inverted T waves"],
+  [/T-Wellen-Veränderungen/gi,      "T wave changes"],
+  [/T-Wellen-Negativierungen/gi,    "T wave inversions"],
+  [/T-Negativierung/gi,             "T wave inversion"],
+  // Q waves / infarction
+  [/pathologische Q-Zacken/gi,      "pathological Q waves (sign of prior heart attack)"],
+  [/Q-Zacken/gi,                    "Q waves"],
+  [/Infarktnarbe/gi,                "heart attack scar"],
+  [/Herzinfarkt/gi,                 "heart attack"],
+  [/Hinterwandinfarkt/gi,           "inferior wall heart attack"],
+  [/Vorderwandinfarkt/gi,           "anterior wall heart attack"],
+  [/Seitenwandinfarkt/gi,           "lateral wall heart attack"],
+  [/subendokardialer Infarkt/gi,    "subendocardial heart attack (inner layer only)"],
+  // Hypertrophy
+  [/Linksherzhypertrophie/gi,       "left ventricular hypertrophy (enlarged left chamber)"],
+  [/Rechtsherzhypertrophie/gi,      "right ventricular hypertrophy (enlarged right chamber)"],
+  [/Vorhofhypertrophie/gi,          "atrial hypertrophy"],
+  [/linksventrikuläre Hypertrophie/gi,"left ventricular hypertrophy"],
+  [/rechtsventrikuläre Hypertrophie/gi,"right ventricular hypertrophy"],
+  // General
+  [/Normalbefund/gi,                "normal ECG findings"],
+  [/Normaler Befund/gi,             "normal ECG"],
+  [/unauffälliges EKG/gi,           "unremarkable ECG"],
+  [/Ischämiezeichen/gi,             "signs of ischemia (reduced blood flow)"],
+  [/Repolarisationsstörungen/gi,    "repolarization disturbances"],
+  [/Extrasystolen/gi,               "premature beats"],
+  [/ventrikuläre Extrasystolen/gi,  "premature ventricular beats (PVCs)"],
+  [/supraventrikuläre Extrasystolen/gi,"premature atrial beats (PACs)"],
+  [/Steigerung der Vorhofexzitation/gi,"enhanced atrial excitation"],
+  [/Überleitungsstörung/gi,         "conduction disturbance"],
+  [/Erregungsausbreitung/gi,        "electrical conduction"],
+  [/Erregungsrückbildung/gi,        "repolarization"],
+  [/Niedervoltage/gi,               "low voltage (small QRS complexes)"],
+  [/Schrittmacher/gi,               "pacemaker"],
+  [/früheren Infarkt/gi,            "previous heart attack"],
+  [/alten Infarkt/gi,               "old (healed) heart attack"],
+  [/akuten Infarkt/gi,              "acute (current) heart attack"],
+  [/Verdacht auf/gi,                "suspected"],
+  [/kein Hinweis auf/gi,            "no evidence of"],
+  [/klinischer Kontext/gi,          "clinical context"],
+  [/Bigeminus/gi,                   "bigeminy (every other beat is a premature beat)"],
+  [/Trigeminus/gi,                  "trigeminy (every third beat is premature)"],
+];
+
+/** Returns a plain-English translation of common German ECG report terms.
+ *  Falls back gracefully if the text isn't German. */
+function translateClinicalReport(raw: string | null): Array<{ original: string; translated: string }> {
+  if (!raw) return [];
+  // Detect if German characters present
+  const isLikelyGerman = /[äöüÄÖÜß]|Sinus|Vorhof|Herz|Infarkt|Schenkelblock|Strecke/i.test(raw);
+  if (!isLikelyGerman) return [];
+
+  const findings: Array<{ original: string; translated: string }> = [];
+  const seen = new Set<string>();
+
+  for (const [pattern, en] of DE_EN_TERMS) {
+    const matches = raw.match(pattern);
+    if (matches) {
+      const orig = matches[0];
+      const key = en.toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        findings.push({ original: orig, translated: en });
+      }
+    }
+  }
+  return findings;
+}
+
+/** Returns the overall worst severity among SCP codes present */
+function getOverallSeverity(scpCodes: Record<string, number>): "normal" | "mild" | "moderate" | "severe" | "critical" {
+  const order: Record<string, number> = { normal: 0, mild: 1, moderate: 2, severe: 3, critical: 4 };
+  let worst: "normal" | "mild" | "moderate" | "severe" | "critical" = "normal";
+  for (const code of Object.keys(scpCodes)) {
+    const info = SCP_INFO[code];
+    if (info && order[info.severity] > order[worst]) {
+      worst = info.severity;
+    }
+  }
+  return worst;
+}
+
+/** Returns a plain-English one-liner summary for the overall ECG */
+function getVerdictSummary(superclass: string, severity: string, scpCodes: Record<string, number>): string {
+  const topCodes = Object.entries(scpCodes)
+    .sort(([, a], [, b]) => (b as number) - (a as number))
+    .slice(0, 2)
+    .map(([c]) => SCP_INFO[c]?.name || c)
+    .join(" and ");
+
+  if (superclass === "NORM" || severity === "normal") {
+    return "No significant cardiac abnormalities detected. The electrical activity of the heart appears within normal limits.";
+  }
+  if (severity === "critical") {
+    return `Critical cardiac findings detected${topCodes ? ` including ${topCodes}` : ""}. Urgent clinical correlation required.`;
+  }
+  if (severity === "severe") {
+    return `Significant abnormalities present${topCodes ? `: ${topCodes}` : ""}. Clinical evaluation is strongly recommended.`;
+  }
+  if (severity === "moderate") {
+    return `Moderate ECG abnormalities noted${topCodes ? ` (${topCodes})` : ""}. Correlation with symptoms and clinical history is advised.`;
+  }
+  return `Mild ECG abnormalities${topCodes ? ` (${topCodes})` : ""}. Likely clinically relevant — compare with prior recordings.`;
+}
+
+const SEVERITY_ORDER: Record<string, number> = { critical: 0, severe: 1, moderate: 2, mild: 3, normal: 4 };
+
+const SEVERITY_META: Record<string, { label: string; icon: string }> = {
+  critical: { label: "Critical", icon: "fa-solid fa-circle-exclamation" },
+  severe:   { label: "Severe",   icon: "fa-solid fa-triangle-exclamation" },
+  moderate: { label: "Moderate", icon: "fa-solid fa-circle-radiation" },
+  mild:     { label: "Mild",     icon: "fa-solid fa-circle-info" },
+  normal:   { label: "Normal",   icon: "fa-solid fa-circle-check" },
+};
+
 function estimateHeartRate(signalArray: number[], freq: number = 100): number {
   if (!signalArray || signalArray.length === 0) return 72;
   let peaks = 0;
@@ -3276,72 +3430,219 @@ export default function ECGSimulatorPage() {
                       </div>
 
                       {/* SUBTAB 1: CLINICAL OVERVIEW */}
-                      {diagSubTab === "overview" && (
-                        <div className="flex flex-col gap-3 animate-fade-in">
-                          {/* Clinical Report Card */}
-                          <div className="diag-report-card">
-                            <div className="diag-report-card-header">
-                              <i className="fa-solid fa-clipboard-question"></i> Clinical Report Summary
-                            </div>
-                            <div className="diag-report-card-body">
-                              &quot;{selectedRecord.report || "No summary report text is cataloged in the database for this record."}&quot;
-                            </div>
-                          </div>
+                      {diagSubTab === "overview" && (() => {
+                        const parsedCodes = parseScpCodes(selectedRecord.scp_codes);
+                        const overallSeverity = getOverallSeverity(parsedCodes);
+                        const verdictSummary = getVerdictSummary(selectedRecord.superclass, overallSeverity, parsedCodes);
+                        const verdictMeta = SEVERITY_META[overallSeverity];
+                        const axisInfo = getHeartAxisInterpretation(selectedRecord.heart_axis);
+                        const translations = translateClinicalReport(selectedRecord.report);
 
-                          {/* SCP Statement Table */}
-                          {selectedRecord.scp_codes && (
-                            <div className="diag-scp-section">
-                              <div className="diag-scp-header">
-                                <i className="fa-solid fa-book-medical"></i> Diagnostic SCP Codes
+                        // Sort findings: critical → severe → moderate → mild → normal, then by probability desc
+                        const sortedFindings = Object.entries(parsedCodes).sort(([codeA, probA], [codeB, probB]) => {
+                          const sevA = SCP_INFO[codeA]?.severity || "normal";
+                          const sevB = SCP_INFO[codeB]?.severity || "normal";
+                          const sevDiff = (SEVERITY_ORDER[sevA] ?? 4) - (SEVERITY_ORDER[sevB] ?? 4);
+                          if (sevDiff !== 0) return sevDiff;
+                          return (probB as number) - (probA as number);
+                        });
+
+                        return (
+                          <div className="flex flex-col gap-3 animate-fade-in">
+
+                            {/* ── 1. Overall Assessment Verdict ── */}
+                            <div className={`diag-verdict sev-${overallSeverity}`}>
+                              <div className="diag-verdict-icon">
+                                <i className={verdictMeta.icon}></i>
                               </div>
-                              <div className="diag-scp-list">
-                                {Object.entries(parseScpCodes(selectedRecord.scp_codes)).map(([code, value]) => {
-                                  const desc = SCP_DESCRIPTIONS[code] || "Associated clinical condition";
+                              <div className="diag-verdict-body">
+                                <div className="diag-verdict-title">
+                                  {verdictMeta.label} — {SUPERCLASS_INFO[selectedRecord.superclass]?.label || selectedRecord.superclass}
+                                </div>
+                                <div className="diag-verdict-summary">{verdictSummary}</div>
+                              </div>
+                            </div>
+
+                            {/* ── 2. Key Findings (SCP Code Cards) ── */}
+                            {sortedFindings.length > 0 && (
+                              <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+                                <div style={{ fontSize: "0.62rem", fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: "var(--text-muted)", marginBottom: "0.1rem" }}>
+                                  <i className="fa-solid fa-magnifying-glass-chart" style={{ marginRight: "0.35rem" }}></i>
+                                  Findings · {sortedFindings.length} diagnostic code{sortedFindings.length !== 1 ? "s" : ""}
+                                </div>
+
+                                {sortedFindings.map(([code, value]) => {
                                   const prob = typeof value === "number" ? Math.round(value) : 100;
-                                  const cat = getScpCategory(code);
-                                  const catLabel = cat === "norm" ? "Normal" : cat === "mi" ? "Infarction" : cat === "cd" ? "Conduction" : cat === "hyp" ? "Hypertrophy" : cat === "sttc" ? "ST/T Change" : "Other";
+                                  const info = SCP_INFO[code];
+                                  const sev = info?.severity || "normal";
+                                  const isExpanded = expandedScpTip === code;
+
+                                  if (!info) {
+                                    // Fallback for unknown codes
+                                    return (
+                                      <div key={code} className="diag-finding-card sev-mild">
+                                        <div className="diag-finding-main">
+                                          <div className="diag-finding-top">
+                                            <div className="diag-finding-left">
+                                              <div className="diag-finding-code-row">
+                                                <span className="diag-finding-code">{code}</span>
+                                              </div>
+                                              <div className="diag-finding-name">{code} — Clinical Code</div>
+                                              <div className="diag-finding-simple">SCP diagnostic code recorded in this ECG. No additional description available.</div>
+                                            </div>
+                                            <div className="diag-finding-prob-col">
+                                              <span className="diag-finding-prob-num">{prob}%</span>
+                                              <span className="diag-finding-prob-label">confidence</span>
+                                            </div>
+                                          </div>
+                                          <div className="diag-finding-bar-wrap">
+                                            <div className="diag-finding-bar-fill" style={{ width: `${prob}%` }}></div>
+                                          </div>
+                                        </div>
+                                      </div>
+                                    );
+                                  }
+
                                   return (
-                                    <div key={code} className={`diag-scp-item ${cat}`}>
-                                      <div className="diag-scp-item-header">
-                                        <span>
-                                          <span className="diag-scp-code" style={{ marginRight: "0.4rem" }}>{code}</span>
-                                          <span className={`diag-banner-tag ${cat}`} style={{ fontSize: "0.5rem", padding: "0.05rem 0.25rem", marginRight: "0.4rem", verticalAlign: "middle" }}>{catLabel}</span>
-                                          <span className="diag-scp-desc">- {desc}</span>
-                                        </span>
-                                        <span className="diag-scp-prob">{prob}%</span>
+                                    <div key={code} className={`diag-finding-card sev-${sev}`}>
+                                      <div className="diag-finding-main">
+                                        <div className="diag-finding-top">
+                                          <div className="diag-finding-left">
+                                            <div className="diag-finding-code-row">
+                                              <span className="diag-finding-code">{code}</span>
+                                              <span className={`diag-severity-pill sev-${sev}`}>
+                                                <i className={SEVERITY_META[sev]?.icon} style={{ marginRight: "0.25rem", fontSize: "0.5rem" }}></i>
+                                                {SEVERITY_META[sev]?.label}
+                                              </span>
+                                            </div>
+                                            <div className="diag-finding-name">
+                                              <i className={`${info.icon}`} style={{ marginRight: "0.4rem", fontSize: "0.75rem", opacity: 0.8 }}></i>
+                                              {info.name}
+                                            </div>
+                                            <div className="diag-finding-simple">{info.simple}</div>
+                                          </div>
+                                          <div className="diag-finding-prob-col">
+                                            <span className="diag-finding-prob-num">{prob}%</span>
+                                            <span className="diag-finding-prob-label">confidence</span>
+                                          </div>
+                                        </div>
+                                        <div className="diag-finding-bar-wrap">
+                                          <div className="diag-finding-bar-fill" style={{ width: `${prob}%` }}></div>
+                                        </div>
                                       </div>
-                                      <div className="diag-scp-bar">
-                                        <div className={`diag-scp-bar-fill ${cat}`} style={{ width: `${prob}%` }}></div>
-                                      </div>
+
+                                      {/* Teaching tip toggle */}
+                                      <button
+                                        className={`diag-finding-tip-toggle ${isExpanded ? "open" : ""}`}
+                                        onClick={() => setExpandedScpTip(isExpanded ? null : code)}
+                                      >
+                                        <span><i className="fa-solid fa-graduation-cap" style={{ marginRight: "0.35rem" }}></i>What to look for on the ECG</span>
+                                        <i className="fa-solid fa-chevron-down"></i>
+                                      </button>
+
+                                      {isExpanded && (
+                                        <div className="diag-finding-tip-body">
+                                          {info.tip}
+                                        </div>
+                                      )}
                                     </div>
                                   );
                                 })}
                               </div>
-                            </div>
-                          )}
+                            )}
 
-                          {/* Infarction Stadium Details */}
-                          {(selectedRecord.infarction_stadium1 || selectedRecord.infarction_stadium2) && (
-                            <div className="diag-infarction-card">
-                              <div className="diag-infarction-header">
-                                <i className="fa-solid fa-layer-group"></i> Myocardial Infarction Stadium
-                              </div>
-                              {selectedRecord.infarction_stadium1 && (
-                                <div className="diag-infarction-row">
-                                  <span className="diag-infarction-label">Primary:</span>
-                                  <span className="diag-infarction-value" style={{ color: "var(--wrong)", border: "1px solid rgba(218,54,51,0.3)", background: "rgba(218,54,51,0.12)" }}>{selectedRecord.infarction_stadium1}</span>
+                            {/* ── 3. Heart Axis ── */}
+                            <div className="diag-axis-card">
+                              <div className="diag-axis-icon"><i className="fa-solid fa-compass"></i></div>
+                              <div className="diag-axis-content">
+                                <div className="diag-axis-label" style={{ color: axisInfo.color }}>
+                                  <i className="fa-solid fa-arrows-to-dot" style={{ marginRight: "0.4rem", fontSize: "0.7rem" }}></i>
+                                  Heart Axis: {axisInfo.label}
                                 </div>
-                              )}
-                              {selectedRecord.infarction_stadium2 && (
-                                <div className="diag-infarction-row">
-                                  <span className="diag-infarction-label">Secondary:</span>
-                                  <span className="diag-infarction-value" style={{ color: "var(--accent)", border: "1px solid rgba(240,165,0,0.3)", background: "var(--accent-glow)" }}>{selectedRecord.infarction_stadium2}</span>
+                                <div className="diag-axis-desc">{axisInfo.desc}</div>
+                              </div>
+                              {selectedRecord.pacemaker === 1 && (
+                                <div className="diag-pacemaker-badge">
+                                  <i className="fa-solid fa-bolt"></i> Pacemaker
                                 </div>
                               )}
                             </div>
-                          )}
-                        </div>
-                      )}
+
+                            {/* ── 4. Clinical Report with Translation ── */}
+                            {selectedRecord.report && (
+                              <div className="diag-report-section">
+                                <div className="diag-report-header">
+                                  <div className="diag-report-header-title">
+                                    <i className="fa-solid fa-file-medical"></i>
+                                    Original Clinical Notes
+                                  </div>
+                                  {translations.length > 0 && (
+                                    <span className="diag-lang-badge">DE → EN</span>
+                                  )}
+                                </div>
+                                <div className="diag-report-original">
+                                  {selectedRecord.report}
+                                </div>
+
+                                {translations.length > 0 ? (
+                                  <>
+                                    <div className="diag-translation-label">
+                                      <i className="fa-solid fa-language"></i>
+                                      Plain English Translation
+                                    </div>
+                                    <div className="diag-translation-body">
+                                      {translations.map(({ original, translated }, i) => (
+                                        <div key={i} className="diag-translation-item">
+                                          <div className="diag-translation-dot"></div>
+                                          <div className="diag-translation-text">
+                                            <b>{original}</b> → {translated}
+                                          </div>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </>
+                                ) : (
+                                  <div style={{ padding: "0.5rem 0.75rem", fontSize: "0.65rem", color: "var(--text-muted)", fontStyle: "italic" }}>
+                                    <i className="fa-solid fa-circle-info" style={{ marginRight: "0.35rem" }}></i>
+                                    Report is already in English — no translation needed.
+                                  </div>
+                                )}
+                              </div>
+                            )}
+
+                            {/* ── 5. Infarction Stadium ── */}
+                            {(selectedRecord.infarction_stadium1 || selectedRecord.infarction_stadium2) && (
+                              <div className="diag-infarct-timeline">
+                                <div className="diag-infarct-header">
+                                  <i className="fa-solid fa-layer-group"></i>
+                                  Myocardial Infarction Timeline
+                                </div>
+                                {selectedRecord.infarction_stadium1 && (
+                                  <div className="diag-infarct-stage">
+                                    <div className="diag-infarct-stage-title">Primary Stage</div>
+                                    <div className="diag-infarct-stage-raw">{selectedRecord.infarction_stadium1}</div>
+                                    <div className="diag-infarct-stage-desc">
+                                      {getInfarctionStadiumLabel(selectedRecord.infarction_stadium1)}
+                                    </div>
+                                  </div>
+                                )}
+                                {selectedRecord.infarction_stadium2 && (
+                                  <div className="diag-infarct-stage">
+                                    <div className="diag-infarct-stage-title">Secondary Stage</div>
+                                    <div className="diag-infarct-stage-raw" style={{ color: "var(--accent)" }}>
+                                      {selectedRecord.infarction_stadium2}
+                                    </div>
+                                    <div className="diag-infarct-stage-desc">
+                                      {getInfarctionStadiumLabel(selectedRecord.infarction_stadium2)}
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+
+                          </div>
+                        );
+                      })()}
 
                       {/* SUBTAB 2: PEAK DETECTION & ANALYSIS */}
                       {diagSubTab === "peaks" && (
