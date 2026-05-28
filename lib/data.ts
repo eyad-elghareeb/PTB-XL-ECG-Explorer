@@ -109,6 +109,68 @@ export function getStaticDataAvailable(): boolean {
   return fs.existsSync(recordsPath);
 }
 
+// ── Fuzzy Matching Helpers ────────────────────────────────────────────────────
+
+/** Levenshtein edit distance between two strings (bails early if > maxDist) */
+function editDistance(a: string, b: string, maxDist = 3): number {
+  if (Math.abs(a.length - b.length) > maxDist) return maxDist + 1;
+  const dp: number[] = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let prev = dp[0];
+    dp[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const temp = dp[j];
+      dp[j] = a[i - 1] === b[j - 1] ? prev : 1 + Math.min(prev, dp[j], dp[j - 1]);
+      prev = temp;
+    }
+  }
+  return dp[b.length];
+}
+
+/**
+ * Returns true if `word` fuzzy-matches any token in `text`.
+ * Exact substring match is tried first for speed.
+ * For words ≥ 4 chars, tolerates 1 edit; ≥ 6 chars, tolerates 2 edits.
+ */
+export function fuzzyMatchWord(word: string, text: string): boolean {
+  if (!word || !text) return false;
+  if (text.includes(word)) return true;
+  if (word.length < 4) return false;
+  const maxDist = word.length >= 6 ? 2 : 1;
+  const tokens = text.split(/[\s,\-\/\(\)]+/);
+  for (const token of tokens) {
+    if (Math.abs(token.length - word.length) <= maxDist &&
+        editDistance(word, token, maxDist) <= maxDist) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Find SCP codes whose code, description, subclass, or superclass fuzzy-matches
+ * any of the given search words.
+ */
+export function findFuzzyMatchingCodes(words: string[]): Set<string> {
+  const stmts = loadScpStatements();
+  const matched = new Set<string>();
+  for (const stmt of stmts) {
+    const targets = [
+      stmt.code.toLowerCase(),
+      stmt.description.toLowerCase(),
+      stmt.subclass.toLowerCase(),
+      stmt.superclass.toLowerCase(),
+    ];
+    for (const word of words) {
+      if (targets.some((t) => fuzzyMatchWord(word, t))) {
+        matched.add(stmt.code);
+        break;
+      }
+    }
+  }
+  return matched;
+}
+
 // ── Query Helpers ─────────────────────────────────────────────────────────────
 
 export interface QueryResult {
@@ -134,23 +196,8 @@ export function queryRecords(params: {
   if (params.search) {
     const words = params.search.trim().toLowerCase().split(/\s+/).filter(Boolean);
     if (words.length > 0) {
-      const scpStatements = loadScpStatements();
+      const matchingCodes = findFuzzyMatchingCodes(words);
       const searchIndex = loadSearchIndex();
-
-      // Find matching SCP codes
-      const matchingCodes = new Set<string>();
-      for (const word of words) {
-        for (const stmt of scpStatements) {
-          if (
-            stmt.code.toLowerCase().includes(word) ||
-            stmt.description.toLowerCase().includes(word) ||
-            stmt.subclass.toLowerCase().includes(word) ||
-            stmt.superclass.toLowerCase().includes(word)
-          ) {
-            matchingCodes.add(stmt.code);
-          }
-        }
-      }
 
       filtered = filtered.filter((rec) => {
         const searchEntry = searchIndex[rec.ecg_id];
@@ -159,13 +206,14 @@ export function queryRecords(params: {
         const scpCodes = typeof rec.scp_codes === "object" ? Object.keys(rec.scp_codes) : [];
 
         return words.every((word) => {
-          // Check search text
+          // Check search text (exact + fuzzy on tokens)
           if (searchText.includes(word)) return true;
-          // Check SCP codes
+          if (word.length >= 4 && fuzzyMatchWord(word, searchText)) return true;
+          // Check SCP codes (exact)
           for (const code of scpCodes) {
             if (code.toLowerCase().includes(word)) return true;
           }
-          // Check matching SCP codes
+          // Check matching SCP codes (exact + fuzzy)
           for (const matchCode of matchingCodes) {
             if (scpCodes.includes(matchCode)) return true;
           }

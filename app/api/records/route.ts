@@ -1,9 +1,34 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getStaticDataAvailable, queryRecords } from "@/lib/data";
+import { getStaticDataAvailable, queryRecords, fuzzyMatchWord } from "@/lib/data";
 import { getDB, queryAll } from "@/lib/db";
 
 function isVercel(): boolean {
   return process.env.VERCEL === "1" || process.env.VERCEL_ENV !== undefined;
+}
+
+/** Find SCP codes from the live DB that fuzzy-match the given search words */
+function fuzzyMatchScpCodes(db: any, words: string[]): Set<string> {
+  const matched = new Set<string>();
+  try {
+    const all = queryAll(db, "SELECT code, description, subclass, superclass FROM scp_statements", []);
+    for (const row of all as any[]) {
+      const targets = [
+        (row.code || "").toLowerCase(),
+        (row.description || "").toLowerCase(),
+        (row.subclass || "").toLowerCase(),
+        (row.superclass || "").toLowerCase(),
+      ];
+      for (const word of words) {
+        if (targets.some((t) => fuzzyMatchWord(word, t))) {
+          matched.add(row.code);
+          break;
+        }
+      }
+    }
+  } catch (e) {
+    console.error("Failed to fuzzy-match scp_statements:", e);
+  }
+  return matched;
 }
 
 export async function GET(req: NextRequest) {
@@ -35,22 +60,10 @@ export async function GET(req: NextRequest) {
     }
 
     if (search) {
-      const words = search.trim().split(/\s+/).filter(w => w.length > 0);
+      const words = search.trim().toLowerCase().split(/\s+/).filter(w => w.length > 0);
       if (words.length > 0) {
-        const matchingCodesSet = new Set<string>();
-        for (const word of words) {
-          const term = `%${word}%`;
-          try {
-            const codes = queryAll(db,
-              "SELECT code FROM scp_statements WHERE code LIKE ? OR description LIKE ? OR subclass LIKE ? OR superclass LIKE ?",
-              [term, term, term, term]
-            );
-            codes.forEach((row: any) => matchingCodesSet.add(row.code));
-          } catch (e) {
-            console.error("Failed to query scp_statements:", e);
-          }
-        }
-        const matchingCodes = Array.from(matchingCodesSet);
+        // Gather matching SCP codes: exact LIKE + fuzzy edit-distance
+        const matchingCodesSet = fuzzyMatchScpCodes(db, words);
 
         const wordClauses: string[] = [];
         for (const word of words) {
@@ -64,7 +77,7 @@ export async function GET(req: NextRequest) {
           ];
           params.push(term, term, term, term, term);
 
-          matchingCodes.forEach(code => {
+          matchingCodesSet.forEach(code => {
             clauses.push("scp_codes LIKE ?");
             params.push(`%"${code}"%`);
           });

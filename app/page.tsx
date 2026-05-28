@@ -563,6 +563,7 @@ export default function ECGSimulatorPage() {
   const [downloadProgress, setDownloadProgress] = useState<number>(0);
   const [downloadTotal, setDownloadTotal] = useState<number>(0);
   const fetchLock = useRef<boolean>(false);
+  const searchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   async function fetchRecords(searchStr = searchQuery, filterStr = superclassFilter, currentOffset = dbOffset, append = false) {
     try {
@@ -2079,6 +2080,14 @@ export default function ECGSimulatorPage() {
 
   const setViewModeState = (mode: string) => {
     setViewMode(mode);
+    // Auto-navigate away from leads tab when entering 12-lead (leads are irrelevant there)
+    if (mode === "12lead") {
+      setActiveTab((prev) => {
+        if (prev === "leads") return "rhythms";
+        if (prev === "db-leads") return "db-explorer";
+        return prev;
+      });
+    }
     gridCacheValid.current = false;
     stateRef.current.phase = 0.0;
     stateRef.current.scanX = 0.0;
@@ -2993,12 +3002,14 @@ export default function ECGSimulatorPage() {
                 >
                   Records DB
                 </button>
+                {viewMode === "single" && (
                 <button
                   className={`tab-btn ${activeTab === "db-leads" ? "active" : ""}`}
                   onClick={() => setActiveTab("db-leads")}
                 >
                   Leads
                 </button>
+                )}
                 <button
                   className={`tab-btn ${activeTab === "db-diagnostic" ? "active" : ""}`}
                   onClick={() => setActiveTab("db-diagnostic")}
@@ -3022,12 +3033,14 @@ export default function ECGSimulatorPage() {
                 >
                   Rhythms
                 </button>
+                {viewMode === "single" && (
                 <button
                   className={`tab-btn ${activeTab === "leads" ? "active" : ""}`}
                   onClick={() => setActiveTab("leads")}
                 >
                   Leads
                 </button>
+                )}
                 <button
                   className={`tab-btn ${activeTab === "customwave" ? "active" : ""}`}
                   onClick={() => setActiveTab("customwave")}
@@ -3051,21 +3064,6 @@ export default function ECGSimulatorPage() {
                 {/* RECORDS EXPLORER TAB */}
                 <div className={`tab-content ${activeTab === "db-explorer" ? "active" : ""}`} id="tab-db-explorer">
                   <div className="wave-customizer">
-                    <div className="manual-banner" style={{ display: "block" }}>
-                      <div className="manual-banner-text">Database Explorer</div>
-                      <div className="manual-banner-desc">Browse clinical PTB-XL+ records.</div>
-                    </div>
-
-                    <div className="param-grid pb-3 mb-3" style={{ marginBottom: "1.0rem", paddingBottom: "1.0rem" }}>
-                      <div className="toggle-row">
-                        <div>
-                          <div className="tr-label">Sampling Frequency</div>
-                          <div className="tr-desc">High resolution raw signal</div>
-                        </div>
-                        <div className="text-xs font-bold text-accent">500 Hz</div>
-                      </div>
-
-                    </div>
 
                     {/* Search box controls */}
                     <div className="db-search-container">
@@ -3075,8 +3073,14 @@ export default function ECGSimulatorPage() {
                         placeholder="Search by ID, diagnosis (Inferior MI), code (LBBB)..."
                         value={searchQuery}
                         onChange={(e) => {
-                          setSearchQuery(e.target.value);
+                          const val = e.target.value;
+                          setSearchQuery(val);
                           setDbOffset(0);
+                          // Debounced auto-search after 400ms of inactivity
+                          if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+                          searchDebounceRef.current = setTimeout(() => {
+                            fetchRecords(val, superclassFilter, 0);
+                          }, 400);
                         }}
                         onKeyDown={(e) => {
                           if (e.key === "Enter") {
@@ -3228,15 +3232,6 @@ export default function ECGSimulatorPage() {
                         </button>
                       );
                     })}
-                  </div>
-                  <div className="mt-4 param-grid">
-                    <div className="toggle-row">
-                      <div>
-                        <div className="tr-label">Sampling Frequency</div>
-                        <div className="tr-desc">High resolution trace data</div>
-                      </div>
-                      <div className="text-xs font-bold text-accent">500 Hz</div>
-                    </div>
                   </div>
                 </div>
 
@@ -3745,10 +3740,162 @@ export default function ECGSimulatorPage() {
             {/* WAVE BUILDER MANUAL CUSTOMIZER */}
             <div className={`tab-content ${activeTab === "customwave" ? "active" : ""}`} id="tab-customwave">
               <div className="wave-customizer">
+                {/* ── Always-visible basic sim controls ── */}
+                <div className="param-grid border-b border-gray-700 pb-3" style={{ marginBottom: "1.0rem", paddingBottom: "1.0rem" }}>
+                  <div className="slider-group">
+                    <div className="slider-label">
+                      <span>Heart Rate</span>
+                      <span className="slider-val">{heartRate} bpm</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="20"
+                      max="220"
+                      value={heartRate}
+                      onChange={(e) => setHeartRate(parseInt(e.target.value))}
+                    />
+                  </div>
+
+                  <div className="slider-group">
+                    <div className="slider-label">
+                      <span>Waveform Scale (Gain)</span>
+                      <span className="slider-val">{amplitude}x</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="20"
+                      max="200"
+                      value={Math.round(amplitude * 100)}
+                      onChange={(e) => setAmplitude(parseInt(e.target.value) / 100)}
+                    />
+                  </div>
+
+                  <div className="slider-group">
+                    <div className="slider-label">
+                      <span>Sweep Speed</span>
+                      <span className="slider-val">{speed} mm/s</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="10"
+                      max="50"
+                      step="5"
+                      value={speed}
+                      onChange={(e) => {
+                        setSpeed(parseInt(e.target.value));
+                        gridCacheValid.current = false;
+                      }}
+                    />
+                  </div>
+
+                  <div className="slider-group">
+                    <div className="slider-label">
+                      <span>Somatic Noise</span>
+                      <span className="slider-val">{noise}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="50"
+                      value={noise}
+                      onChange={(e) => setNoise(parseInt(e.target.value))}
+                    />
+                  </div>
+
+                  <div className="slider-group">
+                    <div className="slider-label">
+                      <span>Interface Zoom</span>
+                      <span className="slider-val">{zoom.toFixed(2)}x</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="20"
+                      max="500"
+                      step="10"
+                      value={Math.round(zoom * 100)}
+                      onChange={(e) => {
+                        setZoom(parseInt(e.target.value) / 100);
+                        gridCacheValid.current = false;
+                      }}
+                    />
+                  </div>
+
+                  <div className="toggle-row">
+                    <div>
+                      <div className="tr-label">Trace Color Scheme</div>
+                      <div className="tr-desc">Monitor display style</div>
+                    </div>
+                    <select
+                      style={{ background: "var(--surface2)", color: "var(--text-primary)", border: "1px solid var(--border)", borderRadius: "6px", padding: "0.2rem 0.4rem", fontSize: "0.72rem" }}
+                      value={colorScheme}
+                      onChange={(e) => {
+                        setColorScheme(e.target.value);
+                        gridCacheValid.current = false;
+                        showToastMsg("Color scheme: " + e.target.value.toUpperCase());
+                      }}
+                    >
+                      <option value="ge">GE Healthcare (green)</option>
+                      <option value="philips">Philips (amber)</option>
+                      <option value="mortara">Mortara (white)</option>
+                      <option value="nihon">Nihon Kohden (cyan)</option>
+                      <option value="draeger">Dräger (blue)</option>
+                    </select>
+                  </div>
+
+                  <div className="toggle-row">
+                    <div>
+                      <div className="tr-label">Realistic Simulation</div>
+                      <div className="tr-desc">Adds baseline wander &amp; muscle drift</div>
+                    </div>
+                    <label className="toggle-switch">
+                      <input
+                        type="checkbox"
+                        checked={realistic}
+                        onChange={(e) => setRealistic(e.target.checked)}
+                      />
+                      <span className="toggle-slider"></span>
+                    </label>
+                  </div>
+
+                  <div className="toggle-row">
+                    <div>
+                      <div className="tr-label">Grid Overlay</div>
+                      <div className="tr-desc">Show millimeter reference lines</div>
+                    </div>
+                    <label className="toggle-switch">
+                      <input
+                        type="checkbox"
+                        checked={showGrid}
+                        onChange={(e) => {
+                          setShowGrid(e.target.checked);
+                          gridCacheValid.current = false;
+                        }}
+                      />
+                      <span className="toggle-slider"></span>
+                    </label>
+                  </div>
+
+                  <div className="toggle-row">
+                    <div>
+                      <div className="tr-label">QRS Beep Sound</div>
+                      <div className="tr-desc">Oscillator beep tone on R-peak detection</div>
+                    </div>
+                    <label className="toggle-switch">
+                      <input
+                        type="checkbox"
+                        checked={soundOn}
+                        onChange={(e) => setSoundOn(e.target.checked)}
+                      />
+                      <span className="toggle-slider"></span>
+                    </label>
+                  </div>
+                </div>
+
+                {/* ── Manual wave customizer (unlock for full parametric control) ── */}
                 <div className="manual-banner">
                   <div>
-                    <div className="manual-banner-text">Activate Custom Wave Design</div>
-                    <div className="manual-banner-desc">Unlock advanced parameters and manual waveform construction.</div>
+                    <div className="manual-banner-text">Custom Wave Designer</div>
+                    <div className="manual-banner-desc">Unlock advanced parametric waveform construction.</div>
                   </div>
                   <label className="toggle-switch">
                     <input
@@ -3761,135 +3908,6 @@ export default function ECGSimulatorPage() {
                 </div>
 
                 <div id="wave-builder-content" style={{ display: manualMode ? "block" : "none" }}>
-                  {/* Params Section */}
-                  <div className="param-grid border-b border-gray-700 pb-3 mb-3" style={{ marginBottom: "1.5rem", paddingBottom: "1.0rem" }}>
-                    <div className="slider-group">
-                      <div className="slider-label">
-                        <span>Heart Rate</span>
-                        <span className="slider-val">{heartRate} bpm</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="20"
-                        max="220"
-                        value={heartRate}
-                        onChange={(e) => setHeartRate(parseInt(e.target.value))}
-                      />
-                    </div>
-
-                    <div className="slider-group">
-                      <div className="slider-label">
-                        <span>Waveform Scale (Gain)</span>
-                        <span className="slider-val">{amplitude}x</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="20"
-                        max="200"
-                        value={Math.round(amplitude * 100)}
-                        onChange={(e) => setAmplitude(parseInt(e.target.value) / 100)}
-                      />
-                    </div>
-
-                    <div className="slider-group">
-                      <div className="slider-label">
-                        <span>Sweep Speed</span>
-                        <span className="slider-val">{speed} mm/s</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="10"
-                        max="50"
-                        step="5"
-                        value={speed}
-                        onChange={(e) => {
-                          setSpeed(parseInt(e.target.value));
-                          gridCacheValid.current = false;
-                        }}
-                      />
-                    </div>
-
-                    <div className="slider-group">
-                      <div className="slider-label">
-                        <span>Somatic Noise</span>
-                        <span className="slider-val">{noise}%</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="0"
-                        max="50"
-                        value={noise}
-                        onChange={(e) => setNoise(parseInt(e.target.value))}
-                      />
-                    </div>
-
-                    <div className="slider-group">
-                      <div className="slider-label">
-                        <span>Interface Zoom</span>
-                        <span className="slider-val">{zoom.toFixed(2)}x</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="20"
-                        max="500"
-                        step="10"
-                        value={Math.round(zoom * 100)}
-                        onChange={(e) => {
-                          setZoom(parseInt(e.target.value) / 100);
-                          gridCacheValid.current = false;
-                        }}
-                      />
-                    </div>
-
-                    <div className="toggle-row">
-                      <div>
-                        <div className="tr-label">Realistic Simulation</div>
-                        <div className="tr-desc">Adds baseline wander & muscle drift</div>
-                      </div>
-                      <label className="toggle-switch">
-                        <input
-                          type="checkbox"
-                          checked={realistic}
-                          onChange={(e) => setRealistic(e.target.checked)}
-                        />
-                        <span className="toggle-slider"></span>
-                      </label>
-                    </div>
-
-                    <div className="toggle-row">
-                      <div>
-                        <div className="tr-label">Grid Overlay</div>
-                        <div className="tr-desc">Show millimeter reference lines</div>
-                      </div>
-                      <label className="toggle-switch">
-                        <input
-                          type="checkbox"
-                          checked={showGrid}
-                          onChange={(e) => {
-                            setShowGrid(e.target.checked);
-                            gridCacheValid.current = false;
-                          }}
-                        />
-                        <span className="toggle-slider"></span>
-                      </label>
-                    </div>
-
-                    <div className="toggle-row">
-                      <div>
-                        <div className="tr-label">QRS Beep Sound</div>
-                        <div className="tr-desc">Oscillator beep tone on R-peak detection</div>
-                      </div>
-                      <label className="toggle-switch">
-                        <input
-                          type="checkbox"
-                          checked={soundOn}
-                          onChange={(e) => setSoundOn(e.target.checked)}
-                        />
-                        <span className="toggle-slider"></span>
-                      </label>
-                    </div>
-                  </div>
-
                   {/* Calculated Parametrics Monitor Panel */}
                   <div className="manual-params-panel visible mb-4" style={{ marginBottom: "1.5rem" }}>
                     <div className="mpp-title">
