@@ -6,4 +6,7 @@ coverage/
 .env*
 !.env.example
 
+# Build-time generated data (created by scripts/extract-data.js during build)
+public/data/
+
 implementation_plan.md

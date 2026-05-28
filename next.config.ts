@@ -43,9 +43,18 @@ const nextConfig: NextConfig = {
   },
   // Ensure sql.js is not bundled by the server compiler — it needs WASM
   serverExternalPackages: ['sql.js'],
-  // Include the SQLite database file in the serverless function bundle for Vercel
+  // Include the pre-extracted JSON data files in the serverless function bundle for Vercel.
+  // These are generated at build time by scripts/extract-data.js and are much smaller
+  // than shipping the full 15MB SQLite database + WASM runtime.
+  // Note: list specific files since directory globs may not work reliably with outputFileTracingIncludes.
   outputFileTracingIncludes: {
-    '/*': ['./ptbxl.db'],
+    '/*': [
+      './public/data/records.json',
+      './public/data/scp_statements.json',
+      './public/data/classCounts.json',
+      './public/data/searchIndex.json',
+      './public/data/db_info.json',
+    ],
   },
 };
 

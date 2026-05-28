@@ -1,8 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getDB, queryAll, queryOne, queryRun } from "@/lib/db";
+import { getStaticDataAvailable, queryRecords } from "@/lib/data";
+import { getDB, queryAll } from "@/lib/db";
+
+function isVercel(): boolean {
+  return process.env.VERCEL === "1" || process.env.VERCEL_ENV !== undefined;
+}
 
 export async function GET(req: NextRequest) {
-  const db = await getDB();
   const { searchParams } = new URL(req.url);
 
   const superclass = searchParams.get("superclass");
@@ -11,6 +15,15 @@ export async function GET(req: NextRequest) {
   const offset = parseInt(searchParams.get("offset") || "0");
 
   try {
+    // On Vercel: use pre-extracted JSON data (fast, no WASM cold-start)
+    if (isVercel() && getStaticDataAvailable()) {
+      const result = queryRecords({ superclass, search, limit, offset });
+      return NextResponse.json(result);
+    }
+
+    // Local dev fallback: use sql.js with the live SQLite database
+    const db = await getDB();
+
     // Build query with parameters
     let query = "SELECT * FROM records";
     const params: any[] = [];

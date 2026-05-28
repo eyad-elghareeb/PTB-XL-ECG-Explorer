@@ -1,10 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getDB, queryOne, queryRun } from "@/lib/db";
+import { getStaticDataAvailable, queryRecordById } from "@/lib/data";
+import { getDB, queryOne } from "@/lib/db";
 import { parseHeader, parseBinarySignals } from "@/lib/seed";
+
+function isVercel(): boolean {
+  return process.env.VERCEL === "1" || process.env.VERCEL_ENV !== undefined;
+}
 
 export async function GET(req: NextRequest, props: { params: Promise<{ id: string }> }) {
   const params = await props.params;
-  const db = await getDB();
   const idStr = params.id;
   const ecg_id = parseInt(idStr);
 
@@ -13,46 +17,50 @@ export async function GET(req: NextRequest, props: { params: Promise<{ id: strin
   }
 
   try {
-    // 1. Fetch record metadata
-    const record = queryOne(db, "SELECT * FROM records WHERE ecg_id = ?", [ecg_id]);
+    let record: any = null;
+
+    // On Vercel: get metadata from pre-extracted JSON data
+    if (isVercel() && getStaticDataAvailable()) {
+      record = queryRecordById(ecg_id);
+    } else {
+      // Local dev: use sql.js with the live SQLite database
+      const db = await getDB();
+      record = queryOne(db, "SELECT * FROM records WHERE ecg_id = ?", [ecg_id]);
+    }
+
     if (!record) {
       return NextResponse.json({ error: "Record not found" }, { status: 404 });
     }
 
-    // 2. Fetch signal data at standard 500Hz frequency
-    let signalRow = queryOne(db, "SELECT data FROM signals WHERE ecg_id = ? AND frequency = 500", [ecg_id]);
-    
-    let data: any = null;
+    // Fetch signal data on-the-fly from PhysioNet (works for both Vercel and local dev)
+    const physioNetBase = "https://physionet.org/files/ptb-xl/1.0.1/";
+    const filenameHr = record.filename_hr || record.filename_hr;
+    const hrHeaUrl = `${physioNetBase}${filenameHr}.hea`;
+    const hrDatUrl = `${physioNetBase}${filenameHr}.dat`;
 
-    if (signalRow) {
-      data = JSON.parse(signalRow.data);
-    } else {
-      // Fetch on-the-fly from PhysioNet!
-      const physioNetBase = "https://physionet.org/files/ptb-xl/1.0.1/";
-      const hrHeaUrl = `${physioNetBase}${record.filename_hr}.hea`;
-      const hrDatUrl = `${physioNetBase}${record.filename_hr}.dat`;
+    const [heaRes, datRes] = await Promise.all([
+      fetch(hrHeaUrl),
+      fetch(hrDatUrl)
+    ]);
 
-      const [heaRes, datRes] = await Promise.all([
-        fetch(hrHeaUrl),
-        fetch(hrDatUrl)
-      ]);
+    if (!heaRes.ok || !datRes.ok) {
+      console.error(`PhysioNet download failure for ECG ID ${ecg_id}: HEA: ${heaRes.status}, DAT: ${datRes.status}`);
+      return NextResponse.json({
+        error: "Waveform data not found on PhysioNet"
+      }, { status: 404 });
+    }
 
-      if (!heaRes.ok || !datRes.ok) {
-        console.error(`PhysioNet download failure for ECG ID ${ecg_id}: HEA: ${heaRes.status}, DAT: ${datRes.status}`);
-        return NextResponse.json({
-          error: "Waveform data not found on PhysioNet"
-        }, { status: 404 });
-      }
+    const heaText = await heaRes.text();
+    const datBufArr = await datRes.arrayBuffer();
+    const datBuf = Buffer.from(datBufArr);
 
-      const heaText = await heaRes.text();
-      const datBufArr = await datRes.arrayBuffer();
-      const datBuf = Buffer.from(datBufArr);
+    const headerInfo = parseHeader(heaText);
+    const data = parseBinarySignals(datBuf, headerInfo);
 
-      const headerInfo = parseHeader(heaText);
-      data = parseBinarySignals(datBuf, headerInfo);
-
-      // Attempt to cache in local database (works in dev, may fail on Vercel read-only fs)
+    // In local dev, try to cache in the database for faster subsequent loads
+    if (!isVercel()) {
       try {
+        const db = await getDB();
         const insertSignal = db.prepare(`
           INSERT OR REPLACE INTO signals (ecg_id, frequency, data)
           VALUES (?, 500, ?)
@@ -61,8 +69,14 @@ export async function GET(req: NextRequest, props: { params: Promise<{ id: strin
         insertSignal.step();
         insertSignal.free();
       } catch (dbErr) {
-        // Read-only database or write failure, ignore
+        // Write failure, ignore
       }
+    }
+
+    // Normalize scp_codes: might already be an object (from data.ts) or a JSON string (from db.ts)
+    let scpCodes = record.scp_codes;
+    if (typeof scpCodes === "string") {
+      try { scpCodes = JSON.parse(scpCodes); } catch { /* keep as string */ }
     }
 
     return NextResponse.json({
@@ -71,7 +85,7 @@ export async function GET(req: NextRequest, props: { params: Promise<{ id: strin
       age: record.age,
       sex: record.sex,
       superclass: record.superclass,
-      scp_codes: JSON.parse(record.scp_codes),
+      scp_codes: scpCodes,
       height: record.height,
       weight: record.weight,
       report: record.report,

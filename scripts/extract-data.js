@@ -94,6 +94,17 @@ async function main() {
   fs.writeFileSync(path.join(outputDir, "classCounts.json"), JSON.stringify(classCounts));
   console.log(`   ✅ Class counts saved`);
 
+  // 5. Write database metadata info
+  console.log("   Writing db_info.json...");
+  const dbInfo = {
+    totalRecords: records.length,
+    totalScpStatements: scpStatements.length,
+    classCounts,
+    extractedAt: new Date().toISOString(),
+  };
+  fs.writeFileSync(path.join(outputDir, "db_info.json"), JSON.stringify(dbInfo));
+  console.log(`   ✅ db_info.json saved`);
+
   db.close();
   
   const totalSize = fs.statSync(path.join(outputDir, "records.json")).size / 1024 / 1024;
