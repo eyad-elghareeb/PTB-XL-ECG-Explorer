@@ -1,4 +1,4 @@
-import { getDB } from "./db";
+import { getDB, queryAll, queryOne, queryRun, queryTransaction } from "./db";
 
 interface LeadHeader {
   filename: string;
@@ -96,7 +96,7 @@ export interface PullConfig {
 }
 
 export async function seedDatabase(pullConfig: PullConfig, onProgress?: (progress: SeedProgress) => void) {
-  const db = getDB();
+  const db = await getDB();
   const physioNetBase = "https://physionet.org/files/ptb-xl/1.0.1/";
 
   try {
@@ -107,11 +107,9 @@ export async function seedDatabase(pullConfig: PullConfig, onProgress?: (progres
       if (onProgress) {
         onProgress({ status: "processing_metadata", message: "Clearing existing records for fresh import..." });
       }
-      db.exec(`
-        DELETE FROM records;
-        DELETE FROM signals;
-        DELETE FROM scp_statements;
-      `);
+      db.run("DELETE FROM records");
+      db.run("DELETE FROM signals");
+      db.run("DELETE FROM scp_statements");
     }
 
     // -------------------------------------------------------------
@@ -141,7 +139,7 @@ export async function seedDatabase(pullConfig: PullConfig, onProgress?: (progres
       VALUES (?, ?, ?, ?)
     `);
 
-    db.transaction(() => {
+    queryTransaction(db, () => {
       for (let i = 1; i < scpLines.length; i++) {
         const cols = parseCSVLine(scpLines[i]);
         if (cols.length < 2) continue;
@@ -149,9 +147,13 @@ export async function seedDatabase(pullConfig: PullConfig, onProgress?: (progres
         const desc = cols[descIdx] || "";
         const subclass = cols[subclassIdx] || "";
         const superclass = cols[superclassIdx] || "";
-        insertScp.run(code, desc, superclass, subclass);
+        insertScp.bind([code, desc, superclass, subclass]);
+        insertScp.step();
+        insertScp.reset();
       }
-    })();
+    });
+
+    insertScp.free();
 
     // -------------------------------------------------------------
     // Step 2: Seed PTB-XL Metadata and CSV
@@ -326,11 +328,11 @@ export async function seedDatabase(pullConfig: PullConfig, onProgress?: (progres
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
-    db.transaction(() => {
+    queryTransaction(db, () => {
       for (const ecgId of allRecordIds) {
         const meta = recordRows[ecgId];
         if (!meta) continue;
-        insertRecord.run(
+        insertRecord.bind([
           meta.ecgId,
           meta.patientId,
           meta.age,
@@ -368,9 +370,13 @@ export async function seedDatabase(pullConfig: PullConfig, onProgress?: (progres
           meta.validatedBy,
           meta.infarctionStadium1,
           meta.infarctionStadium2
-        );
+        ]);
+        insertRecord.step();
+        insertRecord.reset();
       }
-    })();
+    });
+
+    insertRecord.free();
 
     // -------------------------------------------------------------
     // Step 4: Handle Online Mode (Metadata Only) vs Offline Mode
@@ -465,7 +471,9 @@ export async function seedDatabase(pullConfig: PullConfig, onProgress?: (progres
           const headerInfo = parseHeader(heaText);
           const signals500 = parseBinarySignals(datBuf, headerInfo);
 
-          insertSignal.run(ecgId, JSON.stringify(signals500));
+          insertSignal.bind([ecgId, JSON.stringify(signals500)]);
+          insertSignal.step();
+          insertSignal.reset();
         }
 
         completed++;
@@ -474,6 +482,8 @@ export async function seedDatabase(pullConfig: PullConfig, onProgress?: (progres
         // Continue to other records so we don't break the full chain
       }
     }
+
+    insertSignal.free();
 
     if (onProgress) {
       onProgress({ status: "complete", message: "PTB-XL ECG Seed Database Initialized successfully!", count: completed, total: selectedIds.length });

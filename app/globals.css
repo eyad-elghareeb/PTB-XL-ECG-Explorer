@@ -1459,6 +1459,41 @@ body.resizing {
   .control-panel { height: 58%; }
   .topbar { padding: 0.4rem 0.6rem; gap: 0.35rem; }
   .topbar-btn { width: 32px; height: 32px; font-size: 0.85rem; }
+  .topbar-title { font-size: 0.85rem; }
+  .rhythm-badge { font-size: 0.6rem; max-width: 50%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hr-value { font-size: 1.5rem; }
+  .lead-info { font-size: 0.6rem; }
+  .view-indicator { font-size: 0.55rem; padding: 2px 6px; white-space: normal; }
+  .param-grid { grid-template-columns: 1fr; }
+  .rhythm-category-content { grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); }
+  .lead-tabs { grid-template-columns: repeat(auto-fill, minmax(48px, 1fr)); }
+  .diag-peaks-grid { grid-template-columns: 1fr 1fr; }
+  .diag-meta-grid { grid-template-columns: 1fr; }
+  .control-panel { width: 100% !important; }
+  .pdf-preview { max-height: 98vh; }
+  .pdf-meta { grid-template-columns: 1fr 1fr; }
+  .tab-btn { padding: 0.6rem 0.5rem; font-size: 0.7rem; }
+  .db-filter-chips { gap: 0.2rem; }
+  .db-filter-chip { font-size: 0.58rem; padding: 0.15rem 0.4rem; }
+}
+@media (max-width: 400px) {
+  .ecg-display { min-height: 160px; }
+  .control-panel { height: 62%; }
+  .topbar { padding: 0.3rem 0.4rem; gap: 0.2rem; }
+  .topbar-btn { width: 28px; height: 28px; font-size: 0.75rem; }
+  .topbar-title { font-size: 0.75rem; }
+  .view-toggle-btn { padding: 0.3rem 0.4rem; font-size: 0.6rem; }
+  .hr-value { font-size: 1.2rem; }
+  .rhythm-badge { font-size: 0.55rem; max-width: 40%; }
+  .hr-icon { font-size: 0.9rem; }
+  .lead-label { font-size: 0.75rem; }
+  .lead-tab { font-size: 0.62rem; padding: 0.35rem 0.15rem; }
+  .tab-btn { padding: 0.5rem 0.35rem; font-size: 0.65rem; }
+  .tab-content { padding: 0.5rem 0.6rem; }
+  .db-record-card { padding: 0.4rem 0.5rem; }
+  .db-record-id { font-size: 0.7rem; }
+  .db-search-input { font-size: 0.65rem; }
+  .pdf-meta { grid-template-columns: 1fr; }
 }
 @media print {
   .topbar, .control-panel, .pdf-overlay, .sidebar-resizer { display: none !important; }

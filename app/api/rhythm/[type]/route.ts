@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getDB } from "@/lib/db";
+import { getDB, queryAll } from "@/lib/db";
 
 export async function GET(req: NextRequest, props: { params: Promise<{ type: string }> }) {
   const params = await props.params;
-  const db = getDB();
+  const db = await getDB();
   const rawType = params.type.toUpperCase();
 
   // Map user-friendly category handles to database superclasses
@@ -39,11 +39,11 @@ export async function GET(req: NextRequest, props: { params: Promise<{ type: str
   }
 
   try {
-    const records = db.prepare(`
+    const records = queryAll(db, `
       SELECT * FROM records 
       WHERE superclass = ? 
       ORDER BY ecg_id ASC
-    `).all(superclass);
+    `, [superclass]);
 
     return NextResponse.json({
       type: superclass,

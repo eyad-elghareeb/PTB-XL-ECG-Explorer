@@ -346,6 +346,9 @@ export default function ECGSimulatorPage() {
   const [pullMode, setPullMode] = useState<string>("metadata_only");
   const [pullCount, setPullCount] = useState<number>(21837);
 
+  // ── Dev environment detection (hide DB Setup tab on Vercel/production) ──
+  const isDevEnvironment = typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
+
   // ── Tab state ──
   const [activeTab, setActiveTab] = useState<string>("db-explorer");
   const [diagSubTab, setDiagSubTab] = useState<"overview" | "peaks" | "length">("overview");
@@ -2991,12 +2994,14 @@ export default function ECGSimulatorPage() {
                 >
                   Diagnostics
                 </button>
-                <button
-                  className={`tab-btn ${activeTab === "db-setup" ? "active" : ""}`}
-                  onClick={() => setActiveTab("db-setup")}
-                >
-                  DB Setup
-                </button>
+                {isDevEnvironment && (
+                  <button
+                    className={`tab-btn ${activeTab === "db-setup" ? "active" : ""}`}
+                    onClick={() => setActiveTab("db-setup")}
+                  >
+                    DB Setup
+                  </button>
+                )}
               </>
             ) : (
               <>

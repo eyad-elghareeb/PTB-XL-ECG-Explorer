@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getDB } from "@/lib/db";
+import { getDB, queryAll, queryOne, queryRun } from "@/lib/db";
 
 export async function GET(req: NextRequest) {
-  const db = getDB();
+  const db = await getDB();
   const { searchParams } = new URL(req.url);
 
   const superclass = searchParams.get("superclass");
@@ -11,6 +11,7 @@ export async function GET(req: NextRequest) {
   const offset = parseInt(searchParams.get("offset") || "0");
 
   try {
+    // Build query with parameters
     let query = "SELECT * FROM records";
     const params: any[] = [];
     const whereClauses: string[] = [];
@@ -27,9 +28,11 @@ export async function GET(req: NextRequest) {
         for (const word of words) {
           const term = `%${word}%`;
           try {
-            const stmt = db.prepare("SELECT code FROM scp_statements WHERE code LIKE ? OR description LIKE ? OR subclass LIKE ? OR superclass LIKE ?");
-            const codes = stmt.all(term, term, term, term).map((row: any) => row.code);
-            codes.forEach((c: string) => matchingCodesSet.add(c));
+            const codes = queryAll(db,
+              "SELECT code FROM scp_statements WHERE code LIKE ? OR description LIKE ? OR subclass LIKE ? OR superclass LIKE ?",
+              [term, term, term, term]
+            );
+            codes.forEach((row: any) => matchingCodesSet.add(row.code));
           } catch (e) {
             console.error("Failed to query scp_statements:", e);
           }
@@ -67,14 +70,14 @@ export async function GET(req: NextRequest) {
     query += " ORDER BY ecg_id ASC LIMIT ? OFFSET ?";
     params.push(limit, offset);
 
-    const records = db.prepare(query).all(...params);
+    const records = queryAll(db, query, params);
 
     // Get separate breakdown of counts per superclass
-    const counts = db.prepare(`
+    const counts = queryAll(db, `
       SELECT superclass, COUNT(*) as count 
       FROM records 
       GROUP BY superclass
-    `).all();
+    `);
 
     // Map counts array to an object e.g. { NORM: 8, MI: 8, ... }
     const classCounts: Record<string, number> = {};

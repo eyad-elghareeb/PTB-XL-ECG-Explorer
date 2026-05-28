@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getDB } from "@/lib/db";
+import { getDB, queryOne, queryRun } from "@/lib/db";
 import { parseHeader, parseBinarySignals } from "@/lib/seed";
 
 export async function GET(req: NextRequest, props: { params: Promise<{ id: string }> }) {
   const params = await props.params;
-  const db = getDB();
+  const db = await getDB();
   const idStr = params.id;
   const ecg_id = parseInt(idStr);
 
@@ -14,13 +14,13 @@ export async function GET(req: NextRequest, props: { params: Promise<{ id: strin
 
   try {
     // 1. Fetch record metadata
-    const record = db.prepare("SELECT * FROM records WHERE ecg_id = ?").get(ecg_id);
+    const record = queryOne(db, "SELECT * FROM records WHERE ecg_id = ?", [ecg_id]);
     if (!record) {
       return NextResponse.json({ error: "Record not found" }, { status: 404 });
     }
 
     // 2. Fetch signal data at standard 500Hz frequency
-    let signalRow = db.prepare("SELECT data FROM signals WHERE ecg_id = ? AND frequency = 500").get(ecg_id);
+    let signalRow = queryOne(db, "SELECT data FROM signals WHERE ecg_id = ? AND frequency = 500", [ecg_id]);
     
     let data: any = null;
 
@@ -51,13 +51,15 @@ export async function GET(req: NextRequest, props: { params: Promise<{ id: strin
       const headerInfo = parseHeader(heaText);
       data = parseBinarySignals(datBuf, headerInfo);
 
-      // Attempt to cache in local database (will fail silently if database is read-only)
+      // Attempt to cache in local database (works in dev, may fail on Vercel read-only fs)
       try {
         const insertSignal = db.prepare(`
           INSERT OR REPLACE INTO signals (ecg_id, frequency, data)
           VALUES (?, 500, ?)
         `);
-        insertSignal.run(ecg_id, JSON.stringify(data));
+        insertSignal.bind([ecg_id, JSON.stringify(data)]);
+        insertSignal.step();
+        insertSignal.free();
       } catch (dbErr) {
         // Read-only database or write failure, ignore
       }

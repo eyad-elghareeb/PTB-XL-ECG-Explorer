@@ -18,7 +18,7 @@ export async function GET(req: NextRequest) {
     });
   }
 
-  const seeded = isDatabaseSeeded();
+  const seeded = await isDatabaseSeeded();
   
   if (seeded) {
     return NextResponse.json({
@@ -49,7 +49,7 @@ export async function POST(req: NextRequest) {
     // default to partial
   }
 
-  const seeded = isDatabaseSeeded();
+  const seeded = await isDatabaseSeeded();
   if (seeded && !overwrite && pullConfig.mode !== "full_force") {
     return NextResponse.json({
       seeded: true,
