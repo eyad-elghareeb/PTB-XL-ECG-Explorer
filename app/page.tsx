@@ -3297,7 +3297,7 @@ export default function ECGSimulatorPage() {
                     )}
 
                     {/* Records List - continuous scroll */}
-                    <div className="flex flex-col gap-1.5 min-h-0 pr-1 overflow-y-auto flex-1" style={{ height: "100%", maxHeight: "calc(100vh)" }}
+                    <div className="flex flex-col gap-1.5 min-h-0 pr-1 overflow-y-auto flex-1" style={{ height: "100%", maxHeight: "calc(100vh - 300px)" }}
                       onScroll={(e) => {
                         const el = e.currentTarget;
                         if (el.scrollHeight - el.scrollTop - el.clientHeight < 100 && !fetchLock.current && dbRecords.length >= dbLimit) {
