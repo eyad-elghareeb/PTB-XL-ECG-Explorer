@@ -20,6 +20,7 @@ import {
   sampleLeadLUT,
   addTraceNoise
 } from "../lib/ecg-math";
+import { validateRhythmAllLeads } from "../lib/ecg-validate";
 
 function getImpureTimestamp(): string {
   if (typeof window !== "undefined") {
@@ -3727,6 +3728,11 @@ export default function ECGSimulatorPage() {
     () => validateRhythmProfile(currentRhythm, effectIntensity),
     [currentRhythm, effectIntensity]
   );
+  const leadValidation = useMemo(
+    () => validateRhythmAllLeads(currentRhythm, effectIntensity),
+    [currentRhythm, effectIntensity]
+  );
+  const hasLeadRules = leadValidation.checkedLeads > 0;
 
   return (
     <div className="ecg-body-wrap" suppressHydrationWarning>
@@ -4744,6 +4750,58 @@ export default function ECGSimulatorPage() {
                     <span className="stemi-terr-reciprocal">
                       {INTENSITY_STAGES[currentRhythm]?.reciprocalLeads?.join(", ")}
                     </span>
+                  </div>
+                )}
+
+                {/* 12-LEAD MORPHOLOGY VALIDATION GRID */}
+                {hasLeadRules && (
+                  <div className="lead-valid-section">
+                    <div className="lead-valid-header">
+                      <span>
+                        <i className="fa-solid fa-grid-4"></i>
+                        12-Lead Morphology
+                      </span>
+                      <span className={leadValidation.allPassed ? "lv-status pass" : "lv-status warn"}>
+                        {leadValidation.passedLeads}/{leadValidation.checkedLeads} checked
+                      </span>
+                    </div>
+                    <div className="lead-valid-grid">
+                      {leadValidation.results.map((r) => {
+                        const isChecked = r.tag !== "—";
+                        const cellClass = !isChecked
+                          ? "lv-cell neutral"
+                          : r.passed
+                          ? "lv-cell pass"
+                          : "lv-cell fail";
+                        return (
+                          <div key={r.lead} className={cellClass} title={r.detail}>
+                            <span className="lv-lead">{r.lead}</span>
+                            <span className="lv-tag">{r.tag}</span>
+                            {isChecked && (
+                              <i
+                                className={
+                                  r.passed
+                                    ? "fa-solid fa-circle-check lv-icon"
+                                    : "fa-solid fa-circle-xmark lv-icon"
+                                }
+                              />
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                    {!leadValidation.allPassed && (
+                      <div className="lead-valid-failures">
+                        {leadValidation.results
+                          .filter((r) => !r.passed && r.tag !== "—")
+                          .map((r) => (
+                            <div className="lv-failure-row" key={r.lead}>
+                              <span className="lv-fail-lead">{r.lead}</span>
+                              <span className="lv-fail-detail">{r.detail}</span>
+                            </div>
+                          ))}
+                      </div>
+                    )}
                   </div>
                 )}
 
