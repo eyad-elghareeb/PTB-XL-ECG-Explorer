@@ -21,9 +21,43 @@ export async function GET(req: NextRequest) {
     }
 
     if (search) {
-      whereClauses.push("(ecg_id LIKE ? OR patient_id LIKE ? OR scp_codes LIKE ?)");
-      const term = `%${search}%`;
-      params.push(term, term, term);
+      const words = search.trim().split(/\s+/).filter(w => w.length > 0);
+      if (words.length > 0) {
+        const matchingCodesSet = new Set<string>();
+        for (const word of words) {
+          const term = `%${word}%`;
+          try {
+            const stmt = db.prepare("SELECT code FROM scp_statements WHERE code LIKE ? OR description LIKE ? OR subclass LIKE ? OR superclass LIKE ?");
+            const codes = stmt.all(term, term, term, term).map((row: any) => row.code);
+            codes.forEach((c: string) => matchingCodesSet.add(c));
+          } catch (e) {
+            console.error("Failed to query scp_statements:", e);
+          }
+        }
+        const matchingCodes = Array.from(matchingCodesSet);
+
+        const wordClauses: string[] = [];
+        for (const word of words) {
+          const term = `%${word}%`;
+          const clauses = [
+            "ecg_id LIKE ?",
+            "patient_id LIKE ?",
+            "report LIKE ?",
+            "infarction_stadium1 LIKE ?",
+            "infarction_stadium2 LIKE ?"
+          ];
+          params.push(term, term, term, term, term);
+
+          matchingCodes.forEach(code => {
+            clauses.push("scp_codes LIKE ?");
+            params.push(`%"${code}"%`);
+          });
+
+          wordClauses.push("(" + clauses.join(" OR ") + ")");
+        }
+
+        whereClauses.push("(" + wordClauses.join(" AND ") + ")");
+      }
     }
 
     if (whereClauses.length > 0) {

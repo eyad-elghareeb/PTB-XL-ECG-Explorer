@@ -27,50 +27,7 @@ function getImpureTimestamp(): string {
   return "0";
 }
 
-// ── Savitzky-Golay coefficient tables ──
-// Precomputed quadratic (order=2) smoothing coefficients for odd window sizes
-// Each entry: { halfWindow: number, norm: number, coeffs: number[] }
-const SG_TABLE: { half: number; norm: number; coeffs: number[] }[] = [
-  { half: 2, norm: 35,   coeffs: [-3, 12, 17, 12, -3] },                          // window=5
-  { half: 3, norm: 21,   coeffs: [-2, 3, 6, 7, 6, 3, -2] },                       // window=7
-  { half: 4, norm: 231,  coeffs: [-21, 14, 39, 54, 59, 54, 39, 14, -21] },        // window=9
-  { half: 5, norm: 429,  coeffs: [-36, 9, 44, 69, 84, 89, 84, 69, 44, 9, -36] },  // window=11
-];
-
-function savgolFilter(data: number[], windowPoints: 5 | 7 | 9 | 11 = 5): number[] {
-  const n = data.length;
-  if (n <= windowPoints) return data.slice();  // too short, return copy
-
-  const entry = SG_TABLE.find(e => e.half * 2 + 1 === windowPoints)!;
-  const { half, norm, coeffs } = entry;
-  const out = new Array(n);
-
-  // ── Reflect-pad the input at both boundaries ──
-  // Pre-allocate a padded array: [reflected left tail | data | reflected right tail]
-  const padLen = half;
-  const padded = new Array(n + 2 * padLen);
-  for (let i = 0; i < padLen; i++) {
-    padded[i] = data[padLen - 1 - i];                 // left reflection
-    padded[padLen + n + i] = data[n - 2 - i];          // right reflection
-  }
-  for (let i = 0; i < n; i++) {
-    padded[padLen + i] = data[i];
-  }
-
-  // ── Apply convolution ──
-  const offset = padLen; // index in `padded` corresponding to data[0]
-  for (let i = 0; i < n; i++) {
-    let sum = 0;
-    for (let k = -half; k <= half; k++) {
-      sum += coeffs[k + half] * padded[offset + i + k];
-    }
-    out[i] = sum / norm;
-  }
-
-  return out;
-}
-
-function getRecordSignalForLead(signals: any, leadName: string, applyFilter: boolean = false): number[] | null {
+function getRecordSignalForLead(signals: any, leadName: string): number[] | null {
   if (!signals || !leadName) return null;
   
   let targetArr: number[] | null = null;
@@ -99,59 +56,66 @@ function getRecordSignalForLead(signals: any, leadName: string, applyFilter: boo
     }
   }
   
-  if (!targetArr) return null;
-  
-  if (applyFilter) {
-    // Use 9-point SG filter for clinical ECGs — spans ~18ms at 500Hz.
-    // Larger window provides visible smoothing while preserving diagnostic features.
-    return savgolFilter(targetArr, 9);
-  }
   return targetArr;
 }
 
-const SCP_DESCRIPTIONS: Record<string, string> = {
-  NORM: "Normal ECG",
-  AMI: "Anterior Myocardial Infarction",
-  IPMI: "Inferoposterolateral Myocardial Infarction",
-  ASMI: "Anterosubendocardial Myocardial Infarction",
-  IMI: "Inferior Myocardial Infarction",
-  LMI: "Lateral Myocardial Infarction",
-  ALMI: "Anterolateral Myocardial Infarction",
-  INJAS: "Injury Anteroseptal",
-  ISC_: "Ischemia",
-  ISCAN: "Ischemia Anterior",
-  ISCI: "Ischemia Inferior",
-  ISCL: "Ischemia Lateral",
-  ISCAS: "Ischemia Anteroseptal",
-  ISCALL: "Ischemia Anterolateral",
-  IVCD: "Incomplete Ventricular Conduction Delay",
-  LAFB: "Left Anterior Fascicular Block",
-  LBBB: "Left Bundle Branch Block",
-  RBBB: "Right Bundle Branch Block",
-  IRBBB: "Incomplete Right Bundle Branch Block",
-  "1AVB": "First-degree AV Block",
-  CLBBB: "Complete Left Bundle Branch Block",
-  CRBBB: "Complete Right Bundle Branch Block",
-  PAC: "Premature Atrial Contraction",
-  PVC: "Premature Ventricular Contraction",
-  LVH: "Left Ventricular Hypertrophy",
-  RVH: "Right Ventricular Hypertrophy",
-  LAE: "Left Atrial Enlargement",
-  RAE: "Right Atrial Enlargement",
-  STTC: "ST/T Change",
-  STTY: "ST-T nonspecific changes",
-  STE_: "ST Elevation",
-  STD_: "ST Depression",
-  TAB_: "T wave abnormality",
-  TINV: "T wave inversion",
-  LVOLT: "Low Voltage",
-  SVTAC: "Supraventricular Tachycardia",
-  AFIB: "Atrial Fibrillation",
-  AFLT: "Atrial Flutter",
-  SARRH: "Sinus Arrhythmia",
-  SBRAD: "Sinus Bradycardia",
-  STACH: "Sinus Tachycardia"
+// ── Rich SCP Code Reference (student-friendly) ────────────────────────────────
+interface ScpInfo {
+  name: string;         // Full human-readable medical name
+  simple: string;       // Plain-English explanation for beginners
+  severity: "normal" | "mild" | "moderate" | "severe" | "critical";
+  icon: string;         // FontAwesome icon class
+  tip: string;          // ECG teaching tip: what to look for on the tracing
+}
+
+const SCP_INFO: Record<string, ScpInfo> = {
+  NORM:   { name: "Normal ECG",                              simple: "All measurements are within normal limits — no significant cardiac abnormality detected.",                                                    severity: "normal",   icon: "fa-solid fa-circle-check",              tip: "Regular rhythm, upright P before each QRS, PR interval 120–200ms, narrow QRS <120ms, normal T waves in expected leads." },
+  AMI:    { name: "Anterior Wall Heart Attack",              simple: "Damage to the front wall of the heart — typically caused by a blocked LAD (left anterior descending) artery.",                              severity: "critical", icon: "fa-solid fa-heart-crack",               tip: "Look for: ST elevation or pathologic Q waves in leads V1–V4." },
+  IPMI:   { name: "Infero-Posterior-Lateral Heart Attack",   simple: "A large heart attack affecting the bottom, back, and left-side walls simultaneously — indicates a wide territory of damage.",               severity: "critical", icon: "fa-solid fa-heart-crack",               tip: "Look for: Q waves / ST changes in II, III, aVF and lateral leads; tall R wave in V1–V2 (posterior mirror image)." },
+  ASMI:   { name: "Subendocardial Antero-Septal MI",        simple: "A partial-thickness heart attack in the front-septal wall — only the inner layer is injured, not the full muscle thickness.",               severity: "severe",   icon: "fa-solid fa-heart-crack",               tip: "Look for: ST depression (not elevation) in V1–V4 — this indicates subendocardial injury." },
+  IMI:    { name: "Inferior Wall Heart Attack",              simple: "Damage to the bottom wall of the heart — typically caused by a blocked right coronary artery (RCA).",                                         severity: "critical", icon: "fa-solid fa-heart-crack",               tip: "Look for: ST elevation or pathologic Q waves in leads II, III, and aVF." },
+  LMI:    { name: "Lateral Wall Heart Attack",               simple: "Damage to the left side wall of the heart — often from a blocked left circumflex artery (LCx).",                                             severity: "critical", icon: "fa-solid fa-heart-crack",               tip: "Look for: ST changes or pathologic Q waves in leads I, aVL, V5, and V6." },
+  ALMI:   { name: "Antero-Lateral Heart Attack",             simple: "A large heart attack affecting both the front and left-side walls simultaneously — a serious finding.",                                        severity: "critical", icon: "fa-solid fa-heart-crack",               tip: "Look for: ST changes across V1–V6, I, and aVL simultaneously." },
+  INJAS:  { name: "Active Anteroseptal Injury",              simple: "Active injury to the front-septal wall — the heart muscle is currently being damaged. This is a medical emergency.",                         severity: "critical", icon: "fa-solid fa-triangle-exclamation",       tip: "Look for: ST elevation in V1–V4 without Q waves yet — this is an early-stage STEMI (hyperacute phase)." },
+  ISC_:   { name: "Ischemia (Reduced Blood Flow)",           simple: "An area of the heart isn't getting enough blood — it is under stress but not permanently damaged yet.",                                        severity: "moderate", icon: "fa-solid fa-droplet-slash",             tip: "Look for: ST depression or T-wave inversion in any leads — these are signs of reversible ischemia." },
+  ISCAN:  { name: "Anterior Ischemia",                       simple: "Reduced blood flow to the front wall of the heart without a complete blockage.",                                                               severity: "moderate", icon: "fa-solid fa-droplet-slash",             tip: "Look for: ST depression or T-wave changes in leads V1–V4." },
+  ISCI:   { name: "Inferior Ischemia",                       simple: "Reduced blood flow to the bottom wall of the heart.",                                                                                           severity: "moderate", icon: "fa-solid fa-droplet-slash",             tip: "Look for: ST depression or T-wave changes in leads II, III, and aVF." },
+  ISCL:   { name: "Lateral Ischemia",                        simple: "Reduced blood flow to the left side wall of the heart.",                                                                                         severity: "moderate", icon: "fa-solid fa-droplet-slash",             tip: "Look for: ST/T changes in leads I, aVL, V5, and V6." },
+  ISCAS:  { name: "Anteroseptal Ischemia",                   simple: "Reduced blood flow to the front-septal region of the heart.",                                                                                   severity: "moderate", icon: "fa-solid fa-droplet-slash",             tip: "Look for: ST depression or T-wave changes in leads V1–V3." },
+  ISCALL: { name: "Anterolateral Ischemia",                  simple: "Reduced blood flow affecting both the front and left-side walls — a wider territory is at risk.",                                              severity: "severe",   icon: "fa-solid fa-droplet-slash",             tip: "Look for: ST/T changes across leads V1–V6, I, and aVL." },
+  IVCD:   { name: "Ventricular Conduction Delay",            simple: "The electrical signal through the lower chambers is slightly slowed — mildly abnormal, often not immediately serious.",                         severity: "mild",     icon: "fa-solid fa-bolt-lightning",            tip: "Look for: QRS slightly widened (100–120ms) but not meeting full bundle branch block criteria." },
+  LAFB:   { name: "Left Anterior Fascicular Block",          simple: "One branch of the left side's electrical wiring is blocked — causes the heart's electrical axis to shift leftward.",                          severity: "mild",     icon: "fa-solid fa-code-branch",               tip: "Look for: Left axis deviation (−45° to −90°), small Q in I/aVL, small R in II/III/aVF." },
+  LBBB:   { name: "Left Bundle Branch Block (LBBB)",         simple: "The left electrical pathway is blocked — the left ventricle activates abnormally late. Can mask other ECG findings.",                         severity: "moderate", icon: "fa-solid fa-code-branch",               tip: "Look for: Wide QRS >120ms, broad notched 'M-shaped' R in I/V5/V6, deep S in V1, no septal Q waves." },
+  RBBB:   { name: "Right Bundle Branch Block (RBBB)",        simple: "The right electrical pathway is blocked — the right ventricle activates late. Often benign and may be a normal variant.",                    severity: "mild",     icon: "fa-solid fa-code-branch",               tip: "Look for: Wide QRS >120ms, 'rabbit ears' RSR' pattern in V1, wide slurred S wave in lead I and V6." },
+  IRBBB:  { name: "Incomplete Right Bundle Branch Block",    simple: "A partial block on the right electrical pathway — mildly delayed, often a normal variant in young athletes.",                                  severity: "mild",     icon: "fa-solid fa-code-branch",               tip: "Look for: QRS 100–120ms, rSR' pattern in V1 without fully meeting complete RBBB criteria." },
+  "1AVB": { name: "1st Degree AV Block",                    simple: "The electrical signal from the upper to lower chambers is delayed. Usually benign, but can progress to higher-degree blocks.",              severity: "mild",     icon: "fa-solid fa-hourglass-half",            tip: "Look for: PR interval >200ms (>5 small boxes on the ECG strip), every P wave still followed by a QRS." },
+  CLBBB:  { name: "Complete LBBB",                           simple: "Complete blockage of the left electrical pathway — significantly abnormal and masks ST-T changes from ischemia.",                             severity: "severe",   icon: "fa-solid fa-code-branch",               tip: "Look for: QRS >120ms, broad notched R in I/aVL/V5/V6, absent septal Q waves, ST-T discordance (opposite direction to QRS)." },
+  CRBBB:  { name: "Complete RBBB",                           simple: "Complete blockage of the right electrical pathway — more clinically significant than incomplete RBBB.",                                        severity: "moderate", icon: "fa-solid fa-code-branch",               tip: "Look for: QRS >120ms, prominent RSR' in V1 ('rabbit ears'), deep slurred S wave in leads I, aVL, V5, V6." },
+  PAC:    { name: "Premature Atrial Beat",                   simple: "An extra early beat originating from the upper chambers (atria) — very common and usually harmless.",                                         severity: "mild",     icon: "fa-solid fa-bolt",                      tip: "Look for: An early, differently-shaped P wave followed by a normal-looking QRS, then often a brief pause." },
+  PVC:    { name: "Premature Ventricular Beat",              simple: "An extra early beat from the lower chambers — common, often benign, but needs evaluation if very frequent.",                                  severity: "mild",     icon: "fa-solid fa-bolt",                      tip: "Look for: A wide, bizarre-looking QRS without a preceding P wave, followed by a compensatory pause." },
+  LVH:    { name: "Left Ventricle Enlargement",              simple: "The main pumping chamber is thicker/larger than normal — commonly caused by long-standing high blood pressure or heavy exercise training.",   severity: "moderate", icon: "fa-solid fa-weight-hanging",            tip: "Look for: Very tall R in V5/V6 + deep S in V1/V2 (Sokolov-Lyon index >35mm), left axis deviation, strain pattern." },
+  RVH:    { name: "Right Ventricle Enlargement",             simple: "The right pumping chamber is enlarged — can be from chronic lung disease, pulmonary hypertension, or congenital heart disease.",            severity: "moderate", icon: "fa-solid fa-weight-hanging",            tip: "Look for: Dominant R wave in V1 (R>S), right axis deviation (+90° to +180°), deep S in V5/V6." },
+  LAE:    { name: "Left Atrium Enlargement",                 simple: "The left upper chamber is enlarged — often associated with mitral valve disease or chronic high blood pressure.",                            severity: "mild",     icon: "fa-solid fa-arrows-left-right-to-line", tip: "Look for: Broad, notched P wave in lead II ('P mitrale'), or deep negative P terminal force in V1 (>1mm wide and deep)." },
+  RAE:    { name: "Right Atrium Enlargement",                simple: "The right upper chamber is enlarged — often from chronic lung disease (COPD) or tricuspid valve disease.",                                   severity: "mild",     icon: "fa-solid fa-arrows-left-right-to-line", tip: "Look for: Tall, peaked P wave >2.5mm in leads II, III, aVF ('P pulmonale')." },
+  STTC:   { name: "ST-Segment & T-Wave Change",              simple: "Abnormal changes in the ST segment or T waves — a broad category including ischemia, electrolyte disorders, or medication effects.",         severity: "moderate", icon: "fa-solid fa-wave-square",               tip: "Look for: ST deviation (elevation or depression) or abnormal T-wave shape in any lead — correlate with clinical context." },
+  STTY:   { name: "Nonspecific ST-T Changes",                simple: "Subtle abnormalities in the ST segment or T waves that don't fit a specific pattern — clinical correlation is needed.",                      severity: "mild",     icon: "fa-solid fa-wave-square",               tip: "Look for: Flat or mildly inverted T waves, slight ST changes without a clear ischemic or drug-effect pattern." },
+  STE_:   { name: "ST Elevation",                            simple: "The ST segment is elevated above the baseline — a key sign of possible heart attack (STEMI) or other cardiac emergency.",                    severity: "critical", icon: "fa-solid fa-arrow-trend-up",            tip: "Look for: ST segment ≥1mm above baseline in limb leads, or ≥2mm in precordial leads — measured at the J-point." },
+  STD_:   { name: "ST Depression",                           simple: "The ST segment is below the baseline — can indicate ischemia (reduced blood flow) or subendocardial injury.",                               severity: "severe",   icon: "fa-solid fa-arrow-trend-down",          tip: "Look for: ST segment ≥0.5mm below baseline, especially horizontally flat or downsloping in multiple leads." },
+  TAB_:   { name: "T Wave Abnormality",                      simple: "The T wave (repolarization wave) is abnormally shaped — can indicate ischemia, electrolyte issues, or medication effects.",                  severity: "moderate", icon: "fa-solid fa-wave-square",               tip: "Look for: T waves that are too tall (peaked), flat, biphasic, or inverted in leads where they're normally upright." },
+  TINV:   { name: "T Wave Inversion",                        simple: "The T wave is flipped downward — can indicate ischemia, bundle branch blocks, ventricular hypertrophy, or some medications.",               severity: "moderate", icon: "fa-solid fa-rotate-180",                tip: "Look for: T waves pointing downward in leads where they should be upright (normally upright in I, II, V3–V6)." },
+  LVOLT:  { name: "Low QRS Voltage",                         simple: "The QRS complexes are smaller than expected — can indicate fluid around the heart (effusion), emphysema, or myocardial disease.",          severity: "mild",     icon: "fa-solid fa-signal",                    tip: "Look for: QRS amplitude <5mm in ALL limb leads, OR <10mm in ALL precordial leads." },
+  SVTAC:  { name: "Supraventricular Tachycardia (SVT)",      simple: "A fast heart rate (>100 bpm) starting above the ventricles — can cause palpitations, dizziness, or chest discomfort.",                     severity: "moderate", icon: "fa-solid fa-bolt-lightning",            tip: "Look for: Narrow QRS tachycardia at 150–250 bpm; P waves may be hidden inside or retrograde after the QRS." },
+  AFIB:   { name: "Atrial Fibrillation (AFib)",              simple: "The upper chambers quiver chaotically instead of contracting properly — major risk factor for stroke due to clot formation.",             severity: "severe",   icon: "fa-solid fa-wave-square",               tip: "Look for: Completely irregular R-R intervals, absence of discrete P waves, wavy fibrillatory baseline." },
+  AFLT:   { name: "Atrial Flutter",                          simple: "The upper chambers beat very rapidly (~300/min) in a regular pattern — closely related to atrial fibrillation.",                            severity: "moderate", icon: "fa-solid fa-water",                     tip: "Look for: Regular 'sawtooth' flutter waves in II/III/aVF at ~300/min; ventricular rate often 150 bpm with 2:1 block." },
+  SARRH:  { name: "Sinus Arrhythmia",                        simple: "The heart rate varies slightly with breathing (faster on inhale, slower on exhale) — very common and normal, especially in the young.",    severity: "normal",   icon: "fa-solid fa-lungs",                     tip: "Look for: Normal P-QRS-T morphology, but R-R interval varies >160ms cyclically in sync with respiration." },
+  SBRAD:  { name: "Sinus Bradycardia",                       simple: "Heart rate below 60 bpm from the normal sinus node — common in athletes and during sleep. Investigate if the patient has symptoms.",      severity: "mild",     icon: "fa-solid fa-circle-info",               tip: "Look for: Normal P-QRS-T morphology, regular rhythm, rate <60 bpm." },
+  STACH:  { name: "Sinus Tachycardia",                       simple: "Heart rate above 100 bpm from the normal sinus node — usually a response to stress, fever, dehydration, pain, or exercise.",             severity: "mild",     icon: "fa-solid fa-bolt-lightning",            tip: "Look for: Normal P-QRS-T morphology, regular rhythm, rate 100–160 bpm — look for an identifiable physiological cause." },
 };
+
+// Backward-compatible alias
+const SCP_DESCRIPTIONS: Record<string, string> = Object.fromEntries(
+  Object.entries(SCP_INFO).map(([k, v]) => [k, v.name])
+);
 
 function estimateHeartRate(signalArray: number[], freq: number = 100): number {
   if (!signalArray || signalArray.length === 0) return 72;
@@ -178,7 +142,7 @@ function estimateHeartRate(signalArray: number[], freq: number = 100): number {
 }
 
 function analyzeECGPeaks(signals: any, leadName: string, freq: number = 500) {
-  const signalArray = getRecordSignalForLead(signals, leadName, false);
+  const signalArray = getRecordSignalForLead(signals, leadName);
   if (!signalArray || signalArray.length === 0) {
     return null;
   }
@@ -318,6 +282,62 @@ function analyzeECGPeaks(signals: any, leadName: string, freq: number = 500) {
   };
 }
 
+function getScpCategory(code: string): string {
+  const mi = ["AMI", "IPMI", "ASMI", "IMI", "LMI", "ALMI", "INJAS"];
+  const cd = ["LAFB", "LBBB", "RBBB", "IRBBB", "1AVB", "CLBBB", "CRBBB", "IVCD"];
+  const hyp = ["LVH", "RVH", "LAE", "RAE"];
+  const sttc = ["STTC", "STTY", "STE_", "STD_", "TAB_", "TINV", "LVOLT"];
+  if (code === "NORM") return "norm";
+  if (mi.includes(code)) return "mi";
+  if (cd.includes(code)) return "cd";
+  if (hyp.includes(code)) return "hyp";
+  if (sttc.includes(code)) return "sttc";
+  return "other";
+}
+
+// ── Human-readable superclass descriptions ────────────────────────────────────
+const SUPERCLASS_INFO: Record<string, { label: string; simple: string; icon: string }> = {
+  NORM: { label: "Normal ECG",               simple: "All electrical measurements are within normal limits. No significant cardiac abnormality was detected.",                                                                    icon: "fa-solid fa-circle-check" },
+  MI:   { label: "Myocardial Infarction",    simple: "Evidence of a heart attack — part of the heart muscle has been damaged due to blocked blood supply to the coronary arteries.",                                             icon: "fa-solid fa-heart-crack" },
+  CD:   { label: "Conduction Disorder",      simple: "A problem with the heart's electrical wiring — signals travel abnormally between the upper and lower chambers.",                                                           icon: "fa-solid fa-code-branch" },
+  HYP:  { label: "Hypertrophy / Enlargement",simple: "One or more heart chambers are enlarged or thickened — commonly caused by chronic pressure overload from hypertension or valvular disease.",                               icon: "fa-solid fa-weight-hanging" },
+  STTC: { label: "ST-T Wave Changes",        simple: "Abnormalities in the ST segment and/or T waves — a broad category that may indicate ischemia, electrolyte disturbances, or medication effects.",                          icon: "fa-solid fa-wave-square" },
+};
+
+// ── Heart rate clinical category ──────────────────────────────────────────────
+function getHRInterpretation(bpm: number): { label: string; desc: string; color: string; icon: string } {
+  if (bpm < 40)   return { label: "Severe Bradycardia",  desc: "Very slow rate (<40 bpm) — requires urgent evaluation. May need pacemaker therapy.",                  color: "var(--wrong)",   icon: "fa-solid fa-circle-exclamation" };
+  if (bpm < 60)   return { label: "Bradycardia",         desc: "Slower than normal (<60 bpm). Common in athletes and during sleep — investigate if symptomatic.",       color: "var(--accent)", icon: "fa-solid fa-circle-info" };
+  if (bpm <= 100) return { label: "Normal Sinus Rate",   desc: "Heart rate is within the normal resting range of 60–100 bpm.",                                          color: "var(--correct)", icon: "fa-solid fa-circle-check" };
+  if (bpm <= 150) return { label: "Tachycardia",         desc: "Faster than normal (>100 bpm). Could be stress, fever, dehydration, or an arrhythmia — investigate.",  color: "var(--accent)", icon: "fa-solid fa-bolt-lightning" };
+  return             { label: "Severe Tachycardia",    desc: "Very fast rate (>150 bpm) — needs urgent evaluation for a pathological arrhythmia.",                   color: "var(--wrong)",   icon: "fa-solid fa-bolt" };
+}
+
+// ── Heart axis plain-language interpretation ──────────────────────────────────
+function getHeartAxisInterpretation(axis: string | undefined): { label: string; desc: string; color: string } {
+  if (!axis) return { label: "Not Recorded", desc: "No axis data is available for this record.", color: "var(--text-muted)" };
+  const u = axis.toUpperCase();
+  if (u.includes("NORM"))                        return { label: "Normal Axis (0° to +90°)",       desc: "The heart's electrical axis points in the expected direction — no deviation detected.",                                             color: "var(--correct)" };
+  if (u.includes("LAD") || u.includes("LEFT"))   return { label: "Left Axis Deviation",             desc: "Axis shifted left (−30° to −90°). Seen in LBBB, LAFB, left ventricular hypertrophy, or inferior MI.",                            color: "var(--accent)" };
+  if (u.includes("RAD") || u.includes("RIGHT"))  return { label: "Right Axis Deviation",            desc: "Axis shifted right (+90° to +180°). Seen in right ventricular hypertrophy, LPFB, or lateral MI.",                                color: "var(--accent)" };
+  if (u.includes("EXTR") || u.includes("INDET")) return { label: "Extreme / Indeterminate Axis",   desc: "Markedly abnormal axis (−90° to ±180°). Seen in ventricular rhythms or severe conduction disease.",                               color: "var(--wrong)" };
+  return { label: axis, desc: "Axis information recorded — see clinical report for full context.", color: "var(--text-secondary)" };
+}
+
+// ── Infarction stadium plain-language label ───────────────────────────────────
+function getInfarctionStadiumLabel(stadium: string): string {
+  const s = stadium.toLowerCase();
+  if (/\bstadium\s*i\b/.test(s) && !/ii|iii|iv/.test(s))
+    return "Acute phase — ST elevation is present. The heart muscle is actively being injured right now. This is a medical emergency.";
+  if (/\bstadium\s*ii\b/.test(s) && !/iii|iv/.test(s))
+    return "Subacute phase — ST changes are resolving and Q waves are forming. Damage occurred recently (hours to days ago).";
+  if (/\bstadium\s*iii\b/.test(s) && !/iv/.test(s))
+    return "Chronic phase — Q waves remain, ST has normalized. This represents a healed (old) heart attack scar.";
+  if (/\bstadium\s*iv\b/.test(s))
+    return "Very old infarction — scarring is complete. May have permanent electrical changes on the ECG.";
+  return "Infarction stage recorded — correlate with the clinical timeline for full interpretation.";
+}
+
 export default function ECGSimulatorPage() {
   // ── Mode selection (clinical db vs mathematical simulator) ──
   const [mode, setMode] = useState<string>("database"); // "database" or "simulation"
@@ -325,11 +345,11 @@ export default function ECGSimulatorPage() {
   // ── Database pulling config ──
   const [pullMode, setPullMode] = useState<string>("metadata_only");
   const [pullCount, setPullCount] = useState<number>(21837);
-  const [filterSignal, setFilterSignal] = useState<boolean>(false);
 
   // ── Tab state ──
   const [activeTab, setActiveTab] = useState<string>("db-explorer");
   const [diagSubTab, setDiagSubTab] = useState<"overview" | "peaks" | "length">("overview");
+  const [expandedScpTip, setExpandedScpTip] = useState<string | null>(null);
 
   // ── Database records state ──
   const [dbSeeded, setDbSeeded] = useState<boolean>(false);
@@ -451,7 +471,6 @@ export default function ECGSimulatorPage() {
     mode: "database",
     signals: null as any | null,
     frequency: 500,
-    filterSignal: false,
     timeElapsed: 0.0,
     // 12-lead scrolling offset for database mode
     scrollOffset: 0.0,
@@ -485,7 +504,6 @@ export default function ECGSimulatorPage() {
     stateRef.current.mode = mode;
     stateRef.current.signals = recordSignals;
     stateRef.current.frequency = selectedFreq;
-    stateRef.current.filterSignal = filterSignal;
     stateRef.current.activeTab = activeTab;
     stateRef.current.diagSubTab = diagSubTab;
   }, [
@@ -510,7 +528,6 @@ export default function ECGSimulatorPage() {
     mode,
     recordSignals,
     selectedFreq,
-    filterSignal,
     activeTab,
     diagSubTab
   ]);
@@ -605,6 +622,7 @@ export default function ECGSimulatorPage() {
   useEffect(() => {
     if (mode === "database" && recordSignals) {
       const analysis = analyzeECGPeaks(recordSignals, currentLead, selectedFreq);
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setPeaksAnalysis(analysis);
       stateRef.current.peaksAnalysis = analysis;
       if (analysis) {
@@ -770,10 +788,10 @@ export default function ECGSimulatorPage() {
   const getThemeColors = (dark: boolean, strip: boolean, scheme: string) => {
     if (strip) {
       return {
-        bg: "#FFE4B5",
-        trace: "#111111",
-        gridMinor: "rgba(255,140,0,0.25)",
-        gridMajor: "rgba(255,100,0,0.50)",
+        bg: "#FFF5F5",
+        trace: "#0f0f12",
+        gridMinor: "rgba(230, 50, 50, 0.20)",
+        gridMajor: "rgba(230, 50, 50, 0.50)",
         glow: "transparent",
         label: "#111111",
         lineWidth: 1.8
@@ -1197,7 +1215,7 @@ export default function ECGSimulatorPage() {
         ctx.lineCap = "round";
         
         if (state.mode === "database") {
-          const dbSignalArray = getRecordSignalForLead(state.signals, state.currentLead, state.filterSignal);
+          const dbSignalArray = getRecordSignalForLead(state.signals, state.currentLead);
           if (dbSignalArray) {
             ctx.beginPath();
             let first = true;
@@ -1431,7 +1449,7 @@ export default function ECGSimulatorPage() {
               ctx.stroke();
               ctx.setLineDash([]);
 
-              const leadSignal = getRecordSignalForLead(state.signals, lead, state.filterSignal);
+              const leadSignal = getRecordSignalForLead(state.signals, lead);
               if (leadSignal) {
                 ctx.beginPath();
                 let first = true;
@@ -1526,7 +1544,7 @@ export default function ECGSimulatorPage() {
           ctx.rect(0, gridHeight + 1, W, rhythmHeight - 1);
           ctx.clip();
 
-          const iiSignal = getRecordSignalForLead(state.signals, "II", state.filterSignal);
+          const iiSignal = getRecordSignalForLead(state.signals, "II");
           if (iiSignal) {
             ctx.beginPath();
             let firstR = true;
@@ -2082,7 +2100,7 @@ export default function ECGSimulatorPage() {
     gridCacheValid.current = false;
     stateRef.current.phase = 0.0;
     stateRef.current.scanX = 0.0;
-    showToastMsg(!stripMode ? "Orange Strip Layout Activated" : "Classic Medical Monitor Active");
+    showToastMsg(!stripMode ? "Grid Paper Layout Activated" : "Classic Medical Monitor Active");
   };
 
   const resetSettings = () => {
@@ -2302,7 +2320,7 @@ export default function ECGSimulatorPage() {
           const cx = marginL + col * colW;
           const cy = headerH + row * rowH;
 
-          pdfCtx.fillStyle = "#FFF8EE";
+          pdfCtx.fillStyle = "#FFF5F5";
           pdfCtx.fillRect(cx, cy, colW, rowH);
 
           // Grid lines drawing
@@ -2314,7 +2332,7 @@ export default function ECGSimulatorPage() {
           pdfCtx.rect(cx, cy, colW, rowH);
           pdfCtx.clip();
 
-          pdfCtx.strokeStyle = "rgba(255,140,0,0.22)";
+          pdfCtx.strokeStyle = "rgba(230,50,50,0.20)";
           pdfCtx.lineWidth = 0.6;
           pdfCtx.beginPath();
           for (let gx = cx; gx <= cx + colW; gx += minorStep) {
@@ -2325,7 +2343,7 @@ export default function ECGSimulatorPage() {
           }
           pdfCtx.stroke();
 
-          pdfCtx.strokeStyle = "rgba(255,100,0,0.42)";
+          pdfCtx.strokeStyle = "rgba(230,50,50,0.50)";
           pdfCtx.lineWidth = 1.1;
           pdfCtx.beginPath();
           for (let gx = cx; gx <= cx + colW; gx += majorStep) {
@@ -2366,7 +2384,7 @@ export default function ECGSimulatorPage() {
           pdfCtx.beginPath();
 
           let first = true;
-          const leadSignalArray = mode === "database" ? getRecordSignalForLead(recordSignals, lead, filterSignal) : null;
+          const leadSignalArray = mode === "database" ? getRecordSignalForLead(recordSignals, lead) : null;
           if (mode === "database" && recordSignals && leadSignalArray) {
             const signalArray = leadSignalArray;
             const tStart = col * 2.5;
@@ -2438,7 +2456,7 @@ export default function ECGSimulatorPage() {
       const rsY = headerH + gridH + 1 * mm2px;
       const rsX = marginL;
       const rsW = contentW;
-      pdfCtx.fillStyle = "#FFF8EE";
+      pdfCtx.fillStyle = "#FFF5F5";
       pdfCtx.fillRect(rsX, rsY, rsW, rhythmH);
 
       // Grid strip
@@ -2449,7 +2467,7 @@ export default function ECGSimulatorPage() {
 
       const minorStep = mm2px;
       const majorStep = mm2px * 5;
-      pdfCtx.strokeStyle = "rgba(255,140,0,0.22)";
+      pdfCtx.strokeStyle = "rgba(230,50,50,0.20)";
       pdfCtx.lineWidth = 0.6;
       pdfCtx.beginPath();
       for (let gx = rsX; gx <= rsX + rsW; gx += minorStep) {
@@ -2460,7 +2478,7 @@ export default function ECGSimulatorPage() {
       }
       pdfCtx.stroke();
 
-      pdfCtx.strokeStyle = "rgba(255,100,0,0.42)";
+      pdfCtx.strokeStyle = "rgba(230,50,50,0.50)";
       pdfCtx.lineWidth = 1.1;
       pdfCtx.beginPath();
       for (let gx = rsX; gx <= rsX + rsW; gx += majorStep) {
@@ -2483,7 +2501,7 @@ export default function ECGSimulatorPage() {
       pdfCtx.lineWidth = Math.max(1.5, mm2px * 0.19);
       pdfCtx.beginPath();
       let firstR = true;
-      const iiSignalArray = mode === "database" ? getRecordSignalForLead(recordSignals, "II", filterSignal) : null;
+      const iiSignalArray = mode === "database" ? getRecordSignalForLead(recordSignals, "II") : null;
       if (mode === "database" && recordSignals && iiSignalArray) {
         const signalArray = iiSignalArray;
         for (let i = 0; i < signalArray.length; i++) {
@@ -2575,7 +2593,7 @@ export default function ECGSimulatorPage() {
       for (let s = 0; s < 3; s++) {
         const sy = stripTop + s * (stripH + stripGap);
 
-        pdfCtx.fillStyle = "#FFF8EE";
+        pdfCtx.fillStyle = "#FFF5F5";
         pdfCtx.fillRect(marginL, sy, contentW, stripH);
 
         // draw grid
@@ -2587,7 +2605,7 @@ export default function ECGSimulatorPage() {
         const minorStep = mm2px;
         const majorStep = mm2px * 5;
 
-        pdfCtx.strokeStyle = "rgba(255,140,0,0.22)";
+        pdfCtx.strokeStyle = "rgba(230, 50, 50, 0.20)";
         pdfCtx.lineWidth = 0.6;
         pdfCtx.beginPath();
         for (let gx = marginL; gx <= marginL + contentW; gx += minorStep) {
@@ -2598,7 +2616,7 @@ export default function ECGSimulatorPage() {
         }
         pdfCtx.stroke();
 
-        pdfCtx.strokeStyle = "rgba(255,100,0,0.42)";
+        pdfCtx.strokeStyle = "rgba(230, 50, 50, 0.50)";
         pdfCtx.lineWidth = 1.1;
         pdfCtx.beginPath();
         for (let gx = marginL; gx <= marginL + contentW; gx += majorStep) {
@@ -2625,7 +2643,7 @@ export default function ECGSimulatorPage() {
         pdfCtx.beginPath();
 
         let first = true;
-        const currentLeadSignalArray = mode === "database" ? getRecordSignalForLead(recordSignals, currentLead, filterSignal) : null;
+        const currentLeadSignalArray = mode === "database" ? getRecordSignalForLead(recordSignals, currentLead) : null;
         if (mode === "database" && recordSignals && currentLeadSignalArray) {
           const signalArray = currentLeadSignalArray;
           const startSample = Math.floor((s / 3) * signalArray.length);
@@ -2811,10 +2829,6 @@ export default function ECGSimulatorPage() {
 
       {/* TOPBAR NAVIGATION BAR */}
       <div className="topbar">
-        <Link href="/" className="hub-back-btn">
-          <i className="fa-solid fa-arrow-left"></i>
-          Back to Hub
-        </Link>
         <div className="topbar-title">
           <span className="ecg-icon">
             <i className="fa-solid fa-heart-pulse"></i>
@@ -2886,7 +2900,7 @@ export default function ECGSimulatorPage() {
           <button
             className={`topbar-btn ${stripMode ? "active-toggle" : ""}`}
             onClick={toggleStripModeState}
-            title="Orange millimetre paper theme Toggle"
+            title="Grid paper theme Toggle"
           >
             <i className="fa-solid fa-grip-lines"></i>
           </button>
@@ -3035,20 +3049,6 @@ export default function ECGSimulatorPage() {
                         <div className="text-xs font-bold text-accent">500 Hz</div>
                       </div>
 
-                      <div className="toggle-row">
-                        <div>
-                          <div className="tr-label">Smooth Filter</div>
-                          <div className="tr-desc">Savitzky-Golay smoothing preserving peaks</div>
-                        </div>
-                        <label className="toggle-switch">
-                          <input
-                            type="checkbox"
-                            checked={filterSignal}
-                            onChange={(e) => setFilterSignal(e.target.checked)}
-                          />
-                          <span className="toggle-slider"></span>
-                        </label>
-                      </div>
                     </div>
 
                     {/* Search box controls */}
@@ -3056,7 +3056,7 @@ export default function ECGSimulatorPage() {
                       <input
                         type="text"
                         className="db-search-input"
-                        placeholder="Search ID, NORM, MI, CD..."
+                        placeholder="Search by ID, diagnosis (Inferior MI), code (LBBB)..."
                         value={searchQuery}
                         onChange={(e) => {
                           setSearchQuery(e.target.value);
@@ -3078,6 +3078,40 @@ export default function ECGSimulatorPage() {
                       >
                         <i className="fa-solid fa-magnifying-glass"></i>
                       </button>
+                    </div>
+
+                    {/* Superclass Filter Chips */}
+                    <div className="db-filter-chips">
+                      {[
+                        { key: "ALL", label: "All", chipClass: "" },
+                        { key: "NORM", label: "NORM", chipClass: "chip-norm" },
+                        { key: "MI",   label: "MI",   chipClass: "chip-mi" },
+                        { key: "CD",   label: "CD",   chipClass: "chip-cd" },
+                        { key: "HYP",  label: "HYP",  chipClass: "chip-hyp" },
+                        { key: "STTC", label: "STTC", chipClass: "chip-sttc" },
+                      ].map(({ key, label, chipClass }) => (
+                        <button
+                          key={key}
+                          className={`db-filter-chip ${chipClass} ${superclassFilter === key ? "active" : ""}`}
+                          onClick={() => {
+                            setSuperclassFilter(key);
+                            setDbOffset(0);
+                            fetchRecords(searchQuery, key, 0);
+                          }}
+                        >
+                          {label}
+                          {key !== "ALL" && dbClassCounts[key] != null && (
+                            <span style={{ marginLeft: "0.3rem", opacity: 0.7, fontWeight: 400 }}>
+                              {dbClassCounts[key]}
+                            </span>
+                          )}
+                          {key === "ALL" && (
+                            <span style={{ marginLeft: "0.3rem", opacity: 0.7, fontWeight: 400 }}>
+                              {Object.values(dbClassCounts).reduce((a, b) => a + b, 0) || ""}
+                            </span>
+                          )}
+                        </button>
+                      ))}
                     </div>
 
                     {/* Loading indicator */}
@@ -3106,7 +3140,7 @@ export default function ECGSimulatorPage() {
                       )}
                       {!recordsLoading && dbRecords.length === 0 ? (
                         <div className="db-empty-state">
-                          No matching records found. Try "NORM" or "MI".
+                          No matching records found. Try searching &quot;Inferior MI&quot;, &quot;LBBB&quot;, or use the category chips above.
                         </div>
                       ) : (
                         dbRecords.map((record) => {
@@ -3182,20 +3216,6 @@ export default function ECGSimulatorPage() {
                   <div className="mt-4 param-grid">
                     <div className="toggle-row">
                       <div>
-                        <div className="tr-label">Smooth Filter</div>
-                        <div className="tr-desc">Savitzky-Golay smoothing preserving peaks</div>
-                      </div>
-                      <label className="toggle-switch">
-                        <input
-                          type="checkbox"
-                          checked={filterSignal}
-                          onChange={(e) => setFilterSignal(e.target.checked)}
-                        />
-                        <span className="toggle-slider"></span>
-                      </label>
-                    </div>
-                    <div className="toggle-row">
-                      <div>
                         <div className="tr-label">Sampling Frequency</div>
                         <div className="tr-desc">High resolution trace data</div>
                       </div>
@@ -3253,7 +3273,7 @@ export default function ECGSimulatorPage() {
                               <i className="fa-solid fa-clipboard-question"></i> Clinical Report Summary
                             </div>
                             <div className="diag-report-card-body">
-                              "{selectedRecord.report || "No summary report text is cataloged in the database for this record."}"
+                              &quot;{selectedRecord.report || "No summary report text is cataloged in the database for this record."}&quot;
                             </div>
                           </div>
 
@@ -3267,14 +3287,20 @@ export default function ECGSimulatorPage() {
                                 {Object.entries(JSON.parse(selectedRecord.scp_codes)).map(([code, value]) => {
                                   const desc = SCP_DESCRIPTIONS[code] || "Associated clinical condition";
                                   const prob = typeof value === "number" ? Math.round(value) : 100;
+                                  const cat = getScpCategory(code);
+                                  const catLabel = cat === "norm" ? "Normal" : cat === "mi" ? "Infarction" : cat === "cd" ? "Conduction" : cat === "hyp" ? "Hypertrophy" : cat === "sttc" ? "ST/T Change" : "Other";
                                   return (
-                                    <div key={code} className="diag-scp-item">
+                                    <div key={code} className={`diag-scp-item ${cat}`}>
                                       <div className="diag-scp-item-header">
-                                        <span><span className="diag-scp-code">{code}</span> <span className="diag-scp-desc">- {desc}</span></span>
+                                        <span>
+                                          <span className="diag-scp-code" style={{ marginRight: "0.4rem" }}>{code}</span>
+                                          <span className={`diag-banner-tag ${cat}`} style={{ fontSize: "0.5rem", padding: "0.05rem 0.25rem", marginRight: "0.4rem", verticalAlign: "middle" }}>{catLabel}</span>
+                                          <span className="diag-scp-desc">- {desc}</span>
+                                        </span>
                                         <span className="diag-scp-prob">{prob}%</span>
                                       </div>
                                       <div className="diag-scp-bar">
-                                        <div className="diag-scp-bar-fill" style={{ width: `${prob}%` }}></div>
+                                        <div className={`diag-scp-bar-fill ${cat}`} style={{ width: `${prob}%` }}></div>
                                       </div>
                                     </div>
                                   );
