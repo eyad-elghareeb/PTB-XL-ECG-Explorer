@@ -2,8 +2,32 @@ import initSqlJs, { Database as SqlJsDatabase, SqlJsStatic } from "sql.js";
 import fs from "fs";
 import path from "path";
 
-// Locate the SQLite database file in the root configuration
-const DB_PATH = path.resolve(process.cwd(), "ptbxl.db");
+// Try multiple possible paths for the database file across different environments
+// In dev: cwd returns project root
+// On Vercel: cwd may return the root or a nested .next directory
+function findDatabasePath(): string | null {
+  const candidates = [
+    path.resolve(process.cwd(), "ptbxl.db"),
+    path.resolve(process.cwd(), "..", "ptbxl.db"),
+    path.resolve(process.cwd(), "..", "..", "ptbxl.db"),
+    // Vercel serverless functions with outputFileTracingIncludes
+    // The database is placed relative to the serverless function bundle
+    path.resolve(process.cwd(), ".next", "server", "app", "api", "records", "ptbxl.db"),
+    path.resolve(process.cwd(), ".next", "server", "app", "api", "ecg", "[id]", "ptbxl.db"),
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) {
+        console.log("Found database at:", candidate);
+        return candidate;
+      }
+    } catch {
+      // continue searching
+    }
+  }
+  return null;
+}
 
 let dbInstance: SqlJsDatabase | null = null;
 let initPromise: Promise<SqlJsDatabase> | null = null;
@@ -21,12 +45,13 @@ export async function getDB(): Promise<SqlJsDatabase> {
   initPromise = (async () => {
     SQL = await initSqlJs();
 
-    // Check if the database file exists
-    if (fs.existsSync(DB_PATH)) {
-      const buffer = fs.readFileSync(DB_PATH);
+    const dbPath = findDatabasePath();
+    if (dbPath) {
+      const buffer = fs.readFileSync(dbPath);
       dbInstance = new SQL.Database(buffer);
     } else {
-      // Create a fresh in-memory database
+      // Create a fresh in-memory database (will have no records)
+      console.warn("Database file not found at any expected path. Creating empty in-memory database.");
       dbInstance = new SQL.Database();
     }
 

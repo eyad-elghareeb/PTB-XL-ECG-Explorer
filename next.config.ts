@@ -43,6 +43,10 @@ const nextConfig: NextConfig = {
   },
   // Ensure sql.js is not bundled by the server compiler — it needs WASM
   serverExternalPackages: ['sql.js'],
+  // Include the SQLite database file in the serverless function bundle for Vercel
+  outputFileTracingIncludes: {
+    '/*': ['./ptbxl.db'],
+  },
 };
 
 export default nextConfig;

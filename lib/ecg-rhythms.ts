@@ -167,6 +167,15 @@ export interface IntensityConfig {
 }
 
 export const INTENSITY_STAGES: Record<string, IntensityConfig> = {
+  // Default fallback for rhythms without pathological progression
+  _default: {
+    stages: [
+      { name: 'Standard', range: [0, 100], desc: 'Rhythm displayed at standard settings — no pathological progression available.' }
+    ],
+    defaultIntensity: 0,
+    hrMod: (i) => 72,
+    params: () => ({ pAmp: 0.12, pDur: 0.10, prInt: 0.19, qrsAmp: 1.0, qrsDur: 0.06, stElev: 0, stDur: 0.12, stSlope: 0, tAmp: 0.22, tDur: 0.19, tShape: 1, jNotch: 0, uAmp: 0, uDur: 0.10 })
+  },
   nsr: {
     stages: [
       { name: 'Baseline', range: [0, 100], desc: 'Normal sinus rhythm at all intensity levels — no pathological progression.' }

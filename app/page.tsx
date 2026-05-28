@@ -349,6 +349,10 @@ export default function ECGSimulatorPage() {
   // ── Dev environment detection (hide DB Setup tab on Vercel/production) ──
   const isDevEnvironment = typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
 
+  // Safe accessor for INTENSITY_STAGES — falls back to _default for rhythms without pathological progression
+  const getIntensityConfig = (rhythmId: string) => INTENSITY_STAGES[rhythmId] || INTENSITY_STAGES._default;
+  const hasIntensityConfig = (rhythmId: string) => !!(INTENSITY_STAGES[rhythmId] && INTENSITY_STAGES[rhythmId].stages.length > 0 && rhythmId !== "_default");
+
   // ── Tab state ──
   const [activeTab, setActiveTab] = useState<string>("db-explorer");
   const [diagSubTab, setDiagSubTab] = useState<"overview" | "peaks" | "length">("overview");
