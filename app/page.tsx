@@ -59,7 +59,7 @@ function getRecordSignalForLead(signals: any, leadName: string): number[] | null
   return targetArr;
 }
 
-// ── Rich SCP Code Reference (student-friendly) ────────────────────────────────
+// ── Rich SCP Code Reference (PhysioNet 1.0.1 aligned) ─────────────────────────
 interface ScpInfo {
   name: string;         // Full human-readable medical name
   simple: string;       // Plain-English explanation for beginners
@@ -68,48 +68,606 @@ interface ScpInfo {
   tip: string;          // ECG teaching tip: what to look for on the tracing
 }
 
+function scpInfo(
+  name: string,
+  simple: string,
+  severity: ScpInfo["severity"],
+  icon: string,
+  tip: string
+): ScpInfo {
+  return { name, simple, severity, icon, tip };
+}
+
 const SCP_INFO: Record<string, ScpInfo> = {
-  NORM:   { name: "Normal ECG",                              simple: "All measurements are within normal limits — no significant cardiac abnormality detected.",                                                    severity: "normal",   icon: "fa-solid fa-circle-check",              tip: "Regular rhythm, upright P before each QRS, PR interval 120–200ms, narrow QRS <120ms, normal T waves in expected leads." },
-  AMI:    { name: "Anterior Wall Heart Attack",              simple: "Damage to the front wall of the heart — typically caused by a blocked LAD (left anterior descending) artery.",                              severity: "critical", icon: "fa-solid fa-heart-crack",               tip: "Look for: ST elevation or pathologic Q waves in leads V1–V4." },
-  IPMI:   { name: "Infero-Posterior-Lateral Heart Attack",   simple: "A large heart attack affecting the bottom, back, and left-side walls simultaneously — indicates a wide territory of damage.",               severity: "critical", icon: "fa-solid fa-heart-crack",               tip: "Look for: Q waves / ST changes in II, III, aVF and lateral leads; tall R wave in V1–V2 (posterior mirror image)." },
-  ASMI:   { name: "Subendocardial Antero-Septal MI",        simple: "A partial-thickness heart attack in the front-septal wall — only the inner layer is injured, not the full muscle thickness.",               severity: "severe",   icon: "fa-solid fa-heart-crack",               tip: "Look for: ST depression (not elevation) in V1–V4 — this indicates subendocardial injury." },
-  IMI:    { name: "Inferior Wall Heart Attack",              simple: "Damage to the bottom wall of the heart — typically caused by a blocked right coronary artery (RCA).",                                         severity: "critical", icon: "fa-solid fa-heart-crack",               tip: "Look for: ST elevation or pathologic Q waves in leads II, III, and aVF." },
-  LMI:    { name: "Lateral Wall Heart Attack",               simple: "Damage to the left side wall of the heart — often from a blocked left circumflex artery (LCx).",                                             severity: "critical", icon: "fa-solid fa-heart-crack",               tip: "Look for: ST changes or pathologic Q waves in leads I, aVL, V5, and V6." },
-  ALMI:   { name: "Antero-Lateral Heart Attack",             simple: "A large heart attack affecting both the front and left-side walls simultaneously — a serious finding.",                                        severity: "critical", icon: "fa-solid fa-heart-crack",               tip: "Look for: ST changes across V1–V6, I, and aVL simultaneously." },
-  INJAS:  { name: "Active Anteroseptal Injury",              simple: "Active injury to the front-septal wall — the heart muscle is currently being damaged. This is a medical emergency.",                         severity: "critical", icon: "fa-solid fa-triangle-exclamation",       tip: "Look for: ST elevation in V1–V4 without Q waves yet — this is an early-stage STEMI (hyperacute phase)." },
-  ISC_:   { name: "Ischemia (Reduced Blood Flow)",           simple: "An area of the heart isn't getting enough blood — it is under stress but not permanently damaged yet.",                                        severity: "moderate", icon: "fa-solid fa-droplet-slash",             tip: "Look for: ST depression or T-wave inversion in any leads — these are signs of reversible ischemia." },
-  ISCAN:  { name: "Anterior Ischemia",                       simple: "Reduced blood flow to the front wall of the heart without a complete blockage.",                                                               severity: "moderate", icon: "fa-solid fa-droplet-slash",             tip: "Look for: ST depression or T-wave changes in leads V1–V4." },
-  ISCI:   { name: "Inferior Ischemia",                       simple: "Reduced blood flow to the bottom wall of the heart.",                                                                                           severity: "moderate", icon: "fa-solid fa-droplet-slash",             tip: "Look for: ST depression or T-wave changes in leads II, III, and aVF." },
-  ISCL:   { name: "Lateral Ischemia",                        simple: "Reduced blood flow to the left side wall of the heart.",                                                                                         severity: "moderate", icon: "fa-solid fa-droplet-slash",             tip: "Look for: ST/T changes in leads I, aVL, V5, and V6." },
-  ISCAS:  { name: "Anteroseptal Ischemia",                   simple: "Reduced blood flow to the front-septal region of the heart.",                                                                                   severity: "moderate", icon: "fa-solid fa-droplet-slash",             tip: "Look for: ST depression or T-wave changes in leads V1–V3." },
-  ISCALL: { name: "Anterolateral Ischemia",                  simple: "Reduced blood flow affecting both the front and left-side walls — a wider territory is at risk.",                                              severity: "severe",   icon: "fa-solid fa-droplet-slash",             tip: "Look for: ST/T changes across leads V1–V6, I, and aVL." },
-  IVCD:   { name: "Ventricular Conduction Delay",            simple: "The electrical signal through the lower chambers is slightly slowed — mildly abnormal, often not immediately serious.",                         severity: "mild",     icon: "fa-solid fa-bolt-lightning",            tip: "Look for: QRS slightly widened (100–120ms) but not meeting full bundle branch block criteria." },
-  LAFB:   { name: "Left Anterior Fascicular Block",          simple: "One branch of the left side's electrical wiring is blocked — causes the heart's electrical axis to shift leftward.",                          severity: "mild",     icon: "fa-solid fa-code-branch",               tip: "Look for: Left axis deviation (−45° to −90°), small Q in I/aVL, small R in II/III/aVF." },
-  LBBB:   { name: "Left Bundle Branch Block (LBBB)",         simple: "The left electrical pathway is blocked — the left ventricle activates abnormally late. Can mask other ECG findings.",                         severity: "moderate", icon: "fa-solid fa-code-branch",               tip: "Look for: Wide QRS >120ms, broad notched 'M-shaped' R in I/V5/V6, deep S in V1, no septal Q waves." },
-  RBBB:   { name: "Right Bundle Branch Block (RBBB)",        simple: "The right electrical pathway is blocked — the right ventricle activates late. Often benign and may be a normal variant.",                    severity: "mild",     icon: "fa-solid fa-code-branch",               tip: "Look for: Wide QRS >120ms, 'rabbit ears' RSR' pattern in V1, wide slurred S wave in lead I and V6." },
-  IRBBB:  { name: "Incomplete Right Bundle Branch Block",    simple: "A partial block on the right electrical pathway — mildly delayed, often a normal variant in young athletes.",                                  severity: "mild",     icon: "fa-solid fa-code-branch",               tip: "Look for: QRS 100–120ms, rSR' pattern in V1 without fully meeting complete RBBB criteria." },
-  "1AVB": { name: "1st Degree AV Block",                    simple: "The electrical signal from the upper to lower chambers is delayed. Usually benign, but can progress to higher-degree blocks.",              severity: "mild",     icon: "fa-solid fa-hourglass-half",            tip: "Look for: PR interval >200ms (>5 small boxes on the ECG strip), every P wave still followed by a QRS." },
-  CLBBB:  { name: "Complete LBBB",                           simple: "Complete blockage of the left electrical pathway — significantly abnormal and masks ST-T changes from ischemia.",                             severity: "severe",   icon: "fa-solid fa-code-branch",               tip: "Look for: QRS >120ms, broad notched R in I/aVL/V5/V6, absent septal Q waves, ST-T discordance (opposite direction to QRS)." },
-  CRBBB:  { name: "Complete RBBB",                           simple: "Complete blockage of the right electrical pathway — more clinically significant than incomplete RBBB.",                                        severity: "moderate", icon: "fa-solid fa-code-branch",               tip: "Look for: QRS >120ms, prominent RSR' in V1 ('rabbit ears'), deep slurred S wave in leads I, aVL, V5, V6." },
-  PAC:    { name: "Premature Atrial Beat",                   simple: "An extra early beat originating from the upper chambers (atria) — very common and usually harmless.",                                         severity: "mild",     icon: "fa-solid fa-bolt",                      tip: "Look for: An early, differently-shaped P wave followed by a normal-looking QRS, then often a brief pause." },
-  PVC:    { name: "Premature Ventricular Beat",              simple: "An extra early beat from the lower chambers — common, often benign, but needs evaluation if very frequent.",                                  severity: "mild",     icon: "fa-solid fa-bolt",                      tip: "Look for: A wide, bizarre-looking QRS without a preceding P wave, followed by a compensatory pause." },
-  LVH:    { name: "Left Ventricle Enlargement",              simple: "The main pumping chamber is thicker/larger than normal — commonly caused by long-standing high blood pressure or heavy exercise training.",   severity: "moderate", icon: "fa-solid fa-weight-hanging",            tip: "Look for: Very tall R in V5/V6 + deep S in V1/V2 (Sokolov-Lyon index >35mm), left axis deviation, strain pattern." },
-  RVH:    { name: "Right Ventricle Enlargement",             simple: "The right pumping chamber is enlarged — can be from chronic lung disease, pulmonary hypertension, or congenital heart disease.",            severity: "moderate", icon: "fa-solid fa-weight-hanging",            tip: "Look for: Dominant R wave in V1 (R>S), right axis deviation (+90° to +180°), deep S in V5/V6." },
-  LAE:    { name: "Left Atrium Enlargement",                 simple: "The left upper chamber is enlarged — often associated with mitral valve disease or chronic high blood pressure.",                            severity: "mild",     icon: "fa-solid fa-arrows-left-right-to-line", tip: "Look for: Broad, notched P wave in lead II ('P mitrale'), or deep negative P terminal force in V1 (>1mm wide and deep)." },
-  RAE:    { name: "Right Atrium Enlargement",                simple: "The right upper chamber is enlarged — often from chronic lung disease (COPD) or tricuspid valve disease.",                                   severity: "mild",     icon: "fa-solid fa-arrows-left-right-to-line", tip: "Look for: Tall, peaked P wave >2.5mm in leads II, III, aVF ('P pulmonale')." },
-  STTC:   { name: "ST-Segment & T-Wave Change",              simple: "Abnormal changes in the ST segment or T waves — a broad category including ischemia, electrolyte disorders, or medication effects.",         severity: "moderate", icon: "fa-solid fa-wave-square",               tip: "Look for: ST deviation (elevation or depression) or abnormal T-wave shape in any lead — correlate with clinical context." },
-  STTY:   { name: "Nonspecific ST-T Changes",                simple: "Subtle abnormalities in the ST segment or T waves that don't fit a specific pattern — clinical correlation is needed.",                      severity: "mild",     icon: "fa-solid fa-wave-square",               tip: "Look for: Flat or mildly inverted T waves, slight ST changes without a clear ischemic or drug-effect pattern." },
-  STE_:   { name: "ST Elevation",                            simple: "The ST segment is elevated above the baseline — a key sign of possible heart attack (STEMI) or other cardiac emergency.",                    severity: "critical", icon: "fa-solid fa-arrow-trend-up",            tip: "Look for: ST segment ≥1mm above baseline in limb leads, or ≥2mm in precordial leads — measured at the J-point." },
-  STD_:   { name: "ST Depression",                           simple: "The ST segment is below the baseline — can indicate ischemia (reduced blood flow) or subendocardial injury.",                               severity: "severe",   icon: "fa-solid fa-arrow-trend-down",          tip: "Look for: ST segment ≥0.5mm below baseline, especially horizontally flat or downsloping in multiple leads." },
-  TAB_:   { name: "T Wave Abnormality",                      simple: "The T wave (repolarization wave) is abnormally shaped — can indicate ischemia, electrolyte issues, or medication effects.",                  severity: "moderate", icon: "fa-solid fa-wave-square",               tip: "Look for: T waves that are too tall (peaked), flat, biphasic, or inverted in leads where they're normally upright." },
-  TINV:   { name: "T Wave Inversion",                        simple: "The T wave is flipped downward — can indicate ischemia, bundle branch blocks, ventricular hypertrophy, or some medications.",               severity: "moderate", icon: "fa-solid fa-rotate-180",                tip: "Look for: T waves pointing downward in leads where they should be upright (normally upright in I, II, V3–V6)." },
-  LVOLT:  { name: "Low QRS Voltage",                         simple: "The QRS complexes are smaller than expected — can indicate fluid around the heart (effusion), emphysema, or myocardial disease.",          severity: "mild",     icon: "fa-solid fa-signal",                    tip: "Look for: QRS amplitude <5mm in ALL limb leads, OR <10mm in ALL precordial leads." },
-  SVTAC:  { name: "Supraventricular Tachycardia (SVT)",      simple: "A fast heart rate (>100 bpm) starting above the ventricles — can cause palpitations, dizziness, or chest discomfort.",                     severity: "moderate", icon: "fa-solid fa-bolt-lightning",            tip: "Look for: Narrow QRS tachycardia at 150–250 bpm; P waves may be hidden inside or retrograde after the QRS." },
-  AFIB:   { name: "Atrial Fibrillation (AFib)",              simple: "The upper chambers quiver chaotically instead of contracting properly — major risk factor for stroke due to clot formation.",             severity: "severe",   icon: "fa-solid fa-wave-square",               tip: "Look for: Completely irregular R-R intervals, absence of discrete P waves, wavy fibrillatory baseline." },
-  AFLT:   { name: "Atrial Flutter",                          simple: "The upper chambers beat very rapidly (~300/min) in a regular pattern — closely related to atrial fibrillation.",                            severity: "moderate", icon: "fa-solid fa-water",                     tip: "Look for: Regular 'sawtooth' flutter waves in II/III/aVF at ~300/min; ventricular rate often 150 bpm with 2:1 block." },
-  SARRH:  { name: "Sinus Arrhythmia",                        simple: "The heart rate varies slightly with breathing (faster on inhale, slower on exhale) — very common and normal, especially in the young.",    severity: "normal",   icon: "fa-solid fa-lungs",                     tip: "Look for: Normal P-QRS-T morphology, but R-R interval varies >160ms cyclically in sync with respiration." },
-  SBRAD:  { name: "Sinus Bradycardia",                       simple: "Heart rate below 60 bpm from the normal sinus node — common in athletes and during sleep. Investigate if the patient has symptoms.",      severity: "mild",     icon: "fa-solid fa-circle-info",               tip: "Look for: Normal P-QRS-T morphology, regular rhythm, rate <60 bpm." },
-  STACH:  { name: "Sinus Tachycardia",                       simple: "Heart rate above 100 bpm from the normal sinus node — usually a response to stress, fever, dehydration, pain, or exercise.",             severity: "mild",     icon: "fa-solid fa-bolt-lightning",            tip: "Look for: Normal P-QRS-T morphology, regular rhythm, rate 100–160 bpm — look for an identifiable physiological cause." },
+  NORM: scpInfo(
+    "Normal ECG",
+    "All measurements are within normal limits.",
+    "normal",
+    "fa-solid fa-circle-check",
+    "Regular rhythm, upright P before each QRS, PR interval 120–200ms, narrow QRS <120ms, normal T waves."
+  ),
+  MI: scpInfo(
+    "Myocardial Infarction",
+    "Umbrella class for infarction patterns in the PTB-XL code set.",
+    "critical",
+    "fa-solid fa-heart-crack",
+    "Usually appears as infarction-pattern codes such as IMI, AMI, LMI, or PMI."
+  ),
+  CD: scpInfo(
+    "Conduction Disturbance",
+    "Umbrella class for AV, bundle-branch, and fascicular conduction problems.",
+    "moderate",
+    "fa-solid fa-code-branch",
+    "Look for PR prolongation, bundle branch patterns, or axis shifts."
+  ),
+  HYP: scpInfo(
+    "Hypertrophy",
+    "Umbrella class for chamber hypertrophy or overload patterns.",
+    "moderate",
+    "fa-solid fa-weight-hanging",
+    "Look for voltage criteria, axis deviation, or atrial enlargement patterns."
+  ),
+  STTC: scpInfo(
+    "ST-T Changes",
+    "Umbrella class for repolarization abnormalities and nonspecific ST-T patterns.",
+    "moderate",
+    "fa-solid fa-wave-square",
+    "Look for ST elevation/depression, T-wave inversion, low amplitude T waves, or digitalis-effect patterns."
+  ),
+  NDT: scpInfo(
+    "Non-diagnostic T Abnormalities",
+    "T-wave changes that are too nonspecific to classify further.",
+    "mild",
+    "fa-solid fa-wave-square",
+    "Look for nonspecific T-wave flattening, inversion, or minor repolarization shifts."
+  ),
+  NST_: scpInfo(
+    "Non-specific ST Changes",
+    "ST changes that do not fit a specific ischemic pattern.",
+    "mild",
+    "fa-solid fa-wave-square",
+    "Look for mild ST deviation without a classic localization pattern."
+  ),
+  DIG: scpInfo(
+    "Digitalis-Effect",
+    "Classic repolarization changes associated with digoxin exposure.",
+    "moderate",
+    "fa-solid fa-prescription-bottle-medical",
+    "Look for the characteristic scooped ST segment and associated ST-T changes."
+  ),
+  LNGQT: scpInfo(
+    "Long QT-Interval",
+    "Delayed repolarization that can increase arrhythmia risk.",
+    "severe",
+    "fa-solid fa-hourglass-half",
+    "Measure the QT interval carefully, especially at slower rates."
+  ),
+  IMI: scpInfo(
+    "Inferior Myocardial Infarction",
+    "Infarction pattern localized to the inferior wall.",
+    "critical",
+    "fa-solid fa-heart-crack",
+    "Look for Q waves or ST-T changes in II, III, and aVF."
+  ),
+  ASMI: scpInfo(
+    "Anteroseptal Myocardial Infarction",
+    "Infarction pattern localized to the anteroseptal region.",
+    "critical",
+    "fa-solid fa-heart-crack",
+    "Look for Q waves or ST-T changes in V1–V4."
+  ),
+  LVH: scpInfo(
+    "Left Ventricular Hypertrophy",
+    "Left ventricular hypertrophy pattern.",
+    "moderate",
+    "fa-solid fa-weight-hanging",
+    "Look for tall lateral R waves, deep septal S waves, and possible strain changes."
+  ),
+  LAFB: scpInfo(
+    "Left Anterior Fascicular Block",
+    "Left anterior fascicular conduction block.",
+    "mild",
+    "fa-solid fa-code-branch",
+    "Look for left axis deviation with the typical qR / rS pattern."
+  ),
+  ISC_: scpInfo(
+    "Non-specific Ischemic",
+    "Broad ischemic ST-T abnormality without a more specific localization.",
+    "moderate",
+    "fa-solid fa-droplet-slash",
+    "Look for ST depression or T-wave inversion that does not localize cleanly."
+  ),
+  IRBBB: scpInfo(
+    "Incomplete Right Bundle Branch Block",
+    "Partial right bundle branch delay.",
+    "mild",
+    "fa-solid fa-code-branch",
+    "Look for an rSR' pattern in V1 with QRS still under the complete block threshold."
+  ),
+  "1AVB": scpInfo(
+    "First Degree AV Block",
+    "PR prolongation with every P wave still conducted.",
+    "mild",
+    "fa-solid fa-hourglass-half",
+    "Look for PR interval >200ms with preserved 1:1 AV conduction."
+  ),
+  IVCD: scpInfo(
+    "Non-specific Intraventricular Conduction Disturbance",
+    "Widened QRS conduction delay that does not meet a specific bundle-branch block pattern.",
+    "moderate",
+    "fa-solid fa-bolt-lightning",
+    "Look for a widened QRS without classic LBBB or RBBB morphology."
+  ),
+  ISCAL: scpInfo(
+    "Ischemic in Anterolateral Leads",
+    "Ischemic ST-T changes involving the anterolateral leads.",
+    "moderate",
+    "fa-solid fa-droplet-slash",
+    "Look for ST/T abnormalities in V1–V6, I, or aVL."
+  ),
+  CRBBB: scpInfo(
+    "Complete Right Bundle Branch Block",
+    "Complete right bundle branch block pattern.",
+    "moderate",
+    "fa-solid fa-code-branch",
+    "Look for QRS widening and an RSR' pattern in V1."
+  ),
+  CLBBB: scpInfo(
+    "Complete Left Bundle Branch Block",
+    "Complete left bundle branch block pattern.",
+    "severe",
+    "fa-solid fa-code-branch",
+    "Look for a wide QRS with broad notched R waves in lateral leads and discordant ST-T changes."
+  ),
+  ILMI: scpInfo(
+    "Inferolateral Myocardial Infarction",
+    "Infarction pattern involving the inferior and lateral walls.",
+    "critical",
+    "fa-solid fa-heart-crack",
+    "Look for Q waves or ST-T changes in inferior plus lateral leads."
+  ),
+  "LAO/LAE": scpInfo(
+    "Left Atrial Overload/Enlargement",
+    "Left atrial enlargement or overload pattern.",
+    "mild",
+    "fa-solid fa-arrows-left-right-to-line",
+    "Look for broad or notched P waves in lead II and left atrial abnormality in V1."
+  ),
+  AMI: scpInfo(
+    "Anterior Myocardial Infarction",
+    "Infarction pattern localized to the anterior wall.",
+    "critical",
+    "fa-solid fa-heart-crack",
+    "Look for Q waves or ST-T changes in the anterior chest leads."
+  ),
+  ALMI: scpInfo(
+    "Anterolateral Myocardial Infarction",
+    "Infarction pattern involving the anterior and lateral walls.",
+    "critical",
+    "fa-solid fa-heart-crack",
+    "Look for combined anterior and lateral infarction changes."
+  ),
+  ISCIN: scpInfo(
+    "Ischemic in Inferior Leads",
+    "Ischemic ST-T changes involving the inferior leads.",
+    "moderate",
+    "fa-solid fa-droplet-slash",
+    "Look for ST depression, T-wave inversion, or other ischemic changes in II, III, and aVF."
+  ),
+  INJAS: scpInfo(
+    "Subendocardial Injury in Anteroseptal Leads",
+    "Subendocardial injury pattern in the anteroseptal region.",
+    "severe",
+    "fa-solid fa-triangle-exclamation",
+    "Look for ST depression or injury-type changes in V1–V4."
+  ),
+  LMI: scpInfo(
+    "Lateral Myocardial Infarction",
+    "Infarction pattern localized to the lateral wall.",
+    "critical",
+    "fa-solid fa-heart-crack",
+    "Look for Q waves or ST-T changes in I, aVL, V5, and V6."
+  ),
+  ISCIL: scpInfo(
+    "Ischemic in Inferolateral Leads",
+    "Ischemic ST-T changes involving inferior and lateral leads.",
+    "moderate",
+    "fa-solid fa-droplet-slash",
+    "Look for combined inferior and lateral repolarization abnormalities."
+  ),
+  LPFB: scpInfo(
+    "Left Posterior Fascicular Block",
+    "Left posterior fascicular conduction block.",
+    "mild",
+    "fa-solid fa-code-branch",
+    "Look for right axis deviation with the typical fascicular block pattern."
+  ),
+  ISCAS: scpInfo(
+    "Ischemic in Anteroseptal Leads",
+    "Ischemic ST-T changes involving the anteroseptal leads.",
+    "moderate",
+    "fa-solid fa-droplet-slash",
+    "Look for ST/T changes in V1–V3."
+  ),
+  INJAL: scpInfo(
+    "Subendocardial Injury in Anterolateral Leads",
+    "Subendocardial injury pattern in the anterolateral region.",
+    "severe",
+    "fa-solid fa-triangle-exclamation",
+    "Look for ST depression or injury-type changes in anterior plus lateral leads."
+  ),
+  ISCLA: scpInfo(
+    "Ischemic in Lateral Leads",
+    "Ischemic ST-T changes involving the lateral leads.",
+    "moderate",
+    "fa-solid fa-droplet-slash",
+    "Look for ST/T changes in I, aVL, V5, and V6."
+  ),
+  RVH: scpInfo(
+    "Right Ventricular Hypertrophy",
+    "Right ventricular hypertrophy pattern.",
+    "moderate",
+    "fa-solid fa-weight-hanging",
+    "Look for dominant R in V1 and right axis deviation."
+  ),
+  ANEUR: scpInfo(
+    "ST-T Changes Compatible With Ventricular Aneurysm",
+    "Repolarization pattern that can be seen with ventricular aneurysm.",
+    "severe",
+    "fa-solid fa-heart-circle-exclamation",
+    "Look for persistent ST-T abnormalities after an infarction pattern."
+  ),
+  "RAO/RAE": scpInfo(
+    "Right Atrial Overload/Enlargement",
+    "Right atrial enlargement or overload pattern.",
+    "mild",
+    "fa-solid fa-arrows-left-right-to-line",
+    "Look for tall peaked P waves, especially in II, III, and aVF."
+  ),
+  EL: scpInfo(
+    "Electrolytic Disturbance or Drug",
+    "ST-T changes that may reflect electrolyte imbalance or medication effects.",
+    "moderate",
+    "fa-solid fa-flask-vial",
+    "Look for diffuse repolarization changes in the right clinical context."
+  ),
+  WPW: scpInfo(
+    "Wolf-Parkinson-White Syndrome",
+    "Pre-excitation pattern caused by an accessory pathway.",
+    "moderate",
+    "fa-solid fa-bolt",
+    "Look for a short PR interval, delta wave, and widened QRS."
+  ),
+  ILBBB: scpInfo(
+    "Incomplete Left Bundle Branch Block",
+    "Partial left bundle branch block pattern.",
+    "moderate",
+    "fa-solid fa-code-branch",
+    "Look for a wider QRS with left bundle-type morphology, but not fully complete."
+  ),
+  IPLMI: scpInfo(
+    "Inferoposterolateral Myocardial Infarction",
+    "Infarction pattern involving inferior, posterior, and lateral territory.",
+    "critical",
+    "fa-solid fa-heart-crack",
+    "Look for combined inferior and lateral infarction clues with posterior mirror findings."
+  ),
+  ISCAN: scpInfo(
+    "Ischemic in Anterior Leads",
+    "Ischemic ST-T changes involving the anterior leads.",
+    "moderate",
+    "fa-solid fa-droplet-slash",
+    "Look for ST/T abnormalities in V1–V4."
+  ),
+  IPMI: scpInfo(
+    "Inferoposterior Myocardial Infarction",
+    "Infarction pattern involving inferior and posterior territory.",
+    "critical",
+    "fa-solid fa-heart-crack",
+    "Look for inferior infarct signs plus posterior mirror findings in V1–V2."
+  ),
+  SEHYP: scpInfo(
+    "Septal Hypertrophy",
+    "Septal hypertrophy pattern.",
+    "moderate",
+    "fa-solid fa-weight-hanging",
+    "Look for septal voltage or morphology consistent with hypertrophy."
+  ),
+  INJIN: scpInfo(
+    "Subendocardial Injury in Inferior Leads",
+    "Subendocardial injury pattern in the inferior leads.",
+    "severe",
+    "fa-solid fa-triangle-exclamation",
+    "Look for ST depression or injury-type changes in II, III, and aVF."
+  ),
+  INJLA: scpInfo(
+    "Subendocardial Injury in Lateral Leads",
+    "Subendocardial injury pattern in the lateral leads.",
+    "severe",
+    "fa-solid fa-triangle-exclamation",
+    "Look for ST depression or injury-type changes in I, aVL, V5, and V6."
+  ),
+  PMI: scpInfo(
+    "Posterior Myocardial Infarction",
+    "Infarction pattern localized to the posterior wall.",
+    "critical",
+    "fa-solid fa-heart-crack",
+    "Look for tall R waves and ST changes in V1–V2 as a posterior mirror image."
+  ),
+  "3AVB": scpInfo(
+    "Third Degree AV Block",
+    "Complete AV dissociation.",
+    "critical",
+    "fa-solid fa-triangle-exclamation",
+    "Look for P waves and QRS complexes that march independently."
+  ),
+  INJIL: scpInfo(
+    "Subendocardial Injury in Inferolateral Leads",
+    "Subendocardial injury pattern in the inferolateral region.",
+    "severe",
+    "fa-solid fa-triangle-exclamation",
+    "Look for ST depression or injury-type changes in inferior plus lateral leads."
+  ),
+  "2AVB": scpInfo(
+    "Second Degree AV Block",
+    "Intermittent failure of AV conduction.",
+    "severe",
+    "fa-solid fa-hourglass-half",
+    "Look for dropped QRS complexes with some P waves not conducted."
+  ),
+  ABQRS: scpInfo(
+    "Abnormal QRS",
+    "General abnormal QRS morphology.",
+    "moderate",
+    "fa-solid fa-wave-square",
+    "Look for QRS morphology that does not fit a normal pattern."
+  ),
+  PVC: scpInfo(
+    "Ventricular Premature Complex",
+    "An early beat originating from the ventricles.",
+    "mild",
+    "fa-solid fa-bolt",
+    "Look for a wide premature QRS without a preceding P wave."
+  ),
+  STD_: scpInfo(
+    "Non-specific ST Depression",
+    "ST depression that is not specific for one cause or territory.",
+    "severe",
+    "fa-solid fa-arrow-trend-down",
+    "Look for horizontal or downsloping ST depression, especially in multiple leads."
+  ),
+  VCLVH: scpInfo(
+    "Voltage Criteria (QRS) for Left Ventricular Hypertrophy",
+    "QRS voltage pattern that meets LVH criteria.",
+    "moderate",
+    "fa-solid fa-weight-hanging",
+    "Look for large QRS amplitudes meeting common LVH voltage thresholds."
+  ),
+  QWAVE: scpInfo(
+    "Q Waves Present",
+    "Pathologic or notable Q waves are present.",
+    "moderate",
+    "fa-solid fa-wave-square",
+    "Look for abnormal Q waves in the expected infarct territory."
+  ),
+  LOWT: scpInfo(
+    "Low Amplitude T-Waves",
+    "T waves with unusually low amplitude.",
+    "mild",
+    "fa-solid fa-wave-square",
+    "Look for flattened, low-voltage T waves."
+  ),
+  NT_: scpInfo(
+    "Non-specific T-Wave Changes",
+    "T-wave abnormalities that do not fit a specific pattern.",
+    "mild",
+    "fa-solid fa-wave-square",
+    "Look for flattening, inversion, or minor shape changes."
+  ),
+  PAC: scpInfo(
+    "Atrial Premature Complex",
+    "An early beat originating from the atria.",
+    "mild",
+    "fa-solid fa-bolt",
+    "Look for an early, differently shaped P wave followed by a narrow QRS."
+  ),
+  LPR: scpInfo(
+    "Prolonged PR Interval",
+    "PR interval prolongation without dropping beats.",
+    "mild",
+    "fa-solid fa-hourglass-half",
+    "Look for PR interval >200ms with 1:1 conduction."
+  ),
+  INVT: scpInfo(
+    "Inverted T-Waves",
+    "T waves that are flipped downward.",
+    "moderate",
+    "fa-solid fa-rotate-180",
+    "Look for T waves pointing downward in leads where they are normally upright."
+  ),
+  LVOLT: scpInfo(
+    "Low QRS Voltages in the Frontal and Horizontal Leads",
+    "Low-amplitude QRS complexes in both limb and precordial leads.",
+    "mild",
+    "fa-solid fa-signal",
+    "Look for QRS amplitude below the usual low-voltage thresholds."
+  ),
+  HVOLT: scpInfo(
+    "High QRS Voltage",
+    "QRS complexes with unusually high amplitude.",
+    "mild",
+    "fa-solid fa-signal",
+    "Look for unusually tall QRS complexes, often with LVH-type patterns."
+  ),
+  TAB_: scpInfo(
+    "T-Wave Abnormality",
+    "General T-wave abnormality.",
+    "moderate",
+    "fa-solid fa-wave-square",
+    "Look for abnormal T-wave shape, amplitude, or polarity."
+  ),
+  STE_: scpInfo(
+    "Non-specific ST Elevation",
+    "ST elevation that is not tied to a specific diagnostic pattern.",
+    "critical",
+    "fa-solid fa-arrow-trend-up",
+    "Look for ST elevation and correlate with territory and clinical context."
+  ),
+  "PRC(S)": scpInfo(
+    "Premature Complex(es)",
+    "Premature ectopic complexes of one or more types.",
+    "mild",
+    "fa-solid fa-bolt",
+    "Look for early beats that interrupt the expected rhythm."
+  ),
+  SR: scpInfo(
+    "Sinus Rhythm",
+    "Normal sinus rhythm.",
+    "normal",
+    "fa-solid fa-circle-check",
+    "Look for a P wave before every QRS with a regular rhythm."
+  ),
+  AFIB: scpInfo(
+    "Atrial Fibrillation",
+    "Chaotic atrial rhythm with irregular ventricular response.",
+    "severe",
+    "fa-solid fa-wave-square",
+    "Look for irregularly irregular R-R intervals and absent discrete P waves."
+  ),
+  STACH: scpInfo(
+    "Sinus Tachycardia",
+    "Fast sinus rhythm.",
+    "mild",
+    "fa-solid fa-bolt-lightning",
+    "Look for a regular sinus rhythm with rate above 100 bpm."
+  ),
+  SARRH: scpInfo(
+    "Sinus Arrhythmia",
+    "Respiratory variation in sinus rhythm.",
+    "normal",
+    "fa-solid fa-lungs",
+    "Look for normal sinus morphology with cyclic R-R variation."
+  ),
+  SBRAD: scpInfo(
+    "Sinus Bradycardia",
+    "Slow sinus rhythm.",
+    "mild",
+    "fa-solid fa-circle-info",
+    "Look for normal sinus morphology with rate below 60 bpm."
+  ),
+  PACE: scpInfo(
+    "Normal Functioning Artificial Pacemaker",
+    "A paced rhythm from a functioning artificial pacemaker.",
+    "moderate",
+    "fa-solid fa-microchip",
+    "Look for pacing spikes followed by captured depolarization."
+  ),
+  SVARR: scpInfo(
+    "Supraventricular Arrhythmia",
+    "Arrhythmia originating above the ventricles.",
+    "moderate",
+    "fa-solid fa-wave-square",
+    "Look for atrial-origin rhythm disturbances or supraventricular ectopy."
+  ),
+  BIGU: scpInfo(
+    "Bigeminal Pattern (Unknown Origin, SV or Ventricular)",
+    "Bigeminy with uncertain supraventricular or ventricular origin.",
+    "moderate",
+    "fa-solid fa-repeat",
+    "Look for every other beat occurring prematurely."
+  ),
+  AFLT: scpInfo(
+    "Atrial Flutter",
+    "Rapid organized atrial rhythm.",
+    "moderate",
+    "fa-solid fa-water",
+    "Look for sawtooth flutter waves, often most obvious in inferior leads."
+  ),
+  SVTAC: scpInfo(
+    "Supraventricular Tachycardia",
+    "Fast tachycardia originating above the ventricles.",
+    "moderate",
+    "fa-solid fa-bolt-lightning",
+    "Look for a narrow-complex tachycardia with hidden or retrograde P waves."
+  ),
+  PSVT: scpInfo(
+    "Paroxysmal Supraventricular Tachycardia",
+    "Intermittent supraventricular tachycardia episodes.",
+    "moderate",
+    "fa-solid fa-bolt-lightning",
+    "Look for sudden-onset narrow-complex tachycardia."
+  ),
+  TRIGU: scpInfo(
+    "Trigeminal Pattern (Unknown Origin, SV or Ventricular)",
+    "Trigeminy with uncertain supraventricular or ventricular origin.",
+    "moderate",
+    "fa-solid fa-repeat",
+    "Look for a premature beat every third beat."
+  ),
+  // Legacy aliases for older local data or earlier UI labels.
+  LBBB: scpInfo(
+    "Complete Left Bundle Branch Block",
+    "Legacy alias for CLBBB.",
+    "severe",
+    "fa-solid fa-code-branch",
+    "Look for a complete left bundle branch block pattern."
+  ),
+  RBBB: scpInfo(
+    "Complete Right Bundle Branch Block",
+    "Legacy alias for CRBBB.",
+    "moderate",
+    "fa-solid fa-code-branch",
+    "Look for a complete right bundle branch block pattern."
+  ),
+  LAE: scpInfo(
+    "Left Atrial Overload/Enlargement",
+    "Legacy alias for LAO/LAE.",
+    "mild",
+    "fa-solid fa-arrows-left-right-to-line",
+    "Look for left atrial enlargement clues in the P wave."
+  ),
+  RAE: scpInfo(
+    "Right Atrial Overload/Enlargement",
+    "Legacy alias for RAO/RAE.",
+    "mild",
+    "fa-solid fa-arrows-left-right-to-line",
+    "Look for right atrial enlargement clues in the P wave."
+  ),
+  ISCI: scpInfo(
+    "Ischemic in Inferior Leads",
+    "Legacy alias for ISCIN.",
+    "moderate",
+    "fa-solid fa-droplet-slash",
+    "Look for inferior-lead ischemic ST-T changes."
+  ),
+  ISCL: scpInfo(
+    "Ischemic in Lateral Leads",
+    "Legacy alias for ISCLA.",
+    "moderate",
+    "fa-solid fa-droplet-slash",
+    "Look for lateral-lead ischemic ST-T changes."
+  ),
+  ISCALL: scpInfo(
+    "Ischemic in Anterolateral Leads",
+    "Legacy alias for ISCAL.",
+    "moderate",
+    "fa-solid fa-droplet-slash",
+    "Look for anterolateral ischemic ST-T changes."
+  ),
+  STTY: scpInfo(
+    "Non-specific ST Changes",
+    "Legacy alias for NST_.",
+    "mild",
+    "fa-solid fa-wave-square",
+    "Look for nonspecific ST deviation or minor repolarization change."
+  ),
+  TINV: scpInfo(
+    "Inverted T-Waves",
+    "Legacy alias for INVT.",
+    "moderate",
+    "fa-solid fa-rotate-180",
+    "Look for downward T waves in leads where they are normally upright."
+  )
 };
 
 // Backward-compatible alias
@@ -437,10 +995,22 @@ function analyzeECGPeaks(signals: any, leadName: string, freq: number = 500) {
 }
 
 function getScpCategory(code: string): string {
-  const mi = ["AMI", "IPMI", "ASMI", "IMI", "LMI", "ALMI", "INJAS"];
-  const cd = ["LAFB", "LBBB", "RBBB", "IRBBB", "1AVB", "CLBBB", "CRBBB", "IVCD"];
-  const hyp = ["LVH", "RVH", "LAE", "RAE"];
-  const sttc = ["STTC", "STTY", "STE_", "STD_", "TAB_", "TINV", "LVOLT"];
+  const mi = [
+    "AMI", "ASMI", "ALMI", "IMI", "ILMI", "IPLMI", "IPMI", "LMI", "PMI",
+    "INJAS", "INJAL", "INJIN", "INJIL", "INJLA",
+    "ISCAL", "ISCAN", "ISCAS", "ISCIN", "ISCIL", "ISCLA", "ISC_",
+  ];
+  const cd = [
+    "LAFB", "LPFB", "LBBB", "RBBB", "IRBBB", "ILBBB", "1AVB", "2AVB", "3AVB",
+    "CLBBB", "CRBBB", "IVCD", "WPW", "LPR",
+  ];
+  const hyp = [
+    "LVH", "RVH", "LAE", "RAE", "LAO/LAE", "RAO/RAE", "SEHYP", "VCLVH",
+  ];
+  const sttc = [
+    "STTC", "STTY", "NDT", "NST_", "DIG", "LNGQT", "STE_", "STD_", "TAB_",
+    "NT_", "TINV", "INVT", "LVOLT", "HVOLT", "QWAVE", "LOWT", "EL", "ANEUR",
+  ];
   if (code === "NORM") return "norm";
   if (mi.includes(code)) return "mi";
   if (cd.includes(code)) return "cd";
