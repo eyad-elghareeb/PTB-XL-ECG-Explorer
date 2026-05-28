@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
+    "extract-data": "node scripts/extract-data.js",
+    "build": "npm run extract-data && next build",
     "start": "next start",
     "lint": "eslint ."
   },
