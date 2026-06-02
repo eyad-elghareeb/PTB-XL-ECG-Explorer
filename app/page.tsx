@@ -78,23 +78,11 @@ function clampSignalValue(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
-function catmullRom(p0: number, p1: number, p2: number, p3: number, t: number): number {
-  const t2 = t * t;
-  const t3 = t2 * t;
-  return 0.5 * (
-    (2 * p1) +
-    (-p0 + p2) * t +
-    (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
-    (-p0 + 3 * p1 - 3 * p2 + p3) * t3
-  );
-}
-
 function sampleDbSignal(
   signal: number[],
   absoluteTimeSec: number,
   frequency: number,
-  loop: DbLoopWindow,
-  smoothing: boolean
+  loop: DbLoopWindow
 ): { value: number; sampleIndex: number; wrappedTimeSec: number } {
   const len = signal.length;
   if (len === 0) return { value: 0, sampleIndex: 0, wrappedTimeSec: 0 };
@@ -110,26 +98,10 @@ function sampleDbSignal(
   const frac = floatIndex - Math.floor(floatIndex);
   const idx2 = (idx1 + 1) % len;
 
-  if (!smoothing) {
-    const val1 = clampSignalValue(signal[idx1]);
-    const val2 = clampSignalValue(signal[idx2]);
-    return {
-      value: val1 * (1 - frac) + val2 * frac,
-      sampleIndex: idx1,
-      wrappedTimeSec
-    };
-  }
-
-  const idx0 = (idx1 - 1 + len) % len;
-  const idx3 = (idx1 + 2) % len;
+  const val1 = clampSignalValue(signal[idx1]);
+  const val2 = clampSignalValue(signal[idx2]);
   return {
-    value: catmullRom(
-      clampSignalValue(signal[idx0]),
-      clampSignalValue(signal[idx1]),
-      clampSignalValue(signal[idx2]),
-      clampSignalValue(signal[idx3]),
-      frac
-    ),
+    value: val1 * (1 - frac) + val2 * frac,
     sampleIndex: idx1,
     wrappedTimeSec
   };
@@ -247,6 +219,13 @@ const SCP_INFO: Record<string, ScpInfo> = {
     "moderate",
     "fa-solid fa-wave-square",
     "Look for ST elevation/depression, T-wave inversion, low amplitude T waves, or digitalis-effect patterns."
+  ),
+  PER: scpInfo(
+    "Pericarditis",
+    "Pericardial inflammation producing diffuse ST elevation and PR depression.",
+    "severe",
+    "fa-solid fa-heart-pulse",
+    "Look for diffuse concave ST elevation across multiple leads with reciprocal PR depression in aVR/V1."
   ),
   NDT: scpInfo(
     "Non-diagnostic T Abnormalities",
@@ -1134,7 +1113,6 @@ export default function ECGSimulatorPage() {
   const [recordsLoading, setRecordsLoading] = useState<boolean>(false);
   const [signalsLoading, setSignalsLoading] = useState<boolean>(false);
   const [selectedFreq, setSelectedFreq] = useState<number>(500);
-  const [dbVisualSmoothing, setDbVisualSmoothing] = useState<boolean>(true);
   const [dbLoopWindow, setDbLoopWindow] = useState<DbLoopWindow>({
     startSec: 0,
     durationSec: DEFAULT_DB_SIGNAL_DURATION_SEC,
@@ -1262,7 +1240,6 @@ export default function ECGSimulatorPage() {
     mode: "database",
     signals: null as any | null,
     frequency: 500,
-    dbVisualSmoothing: true,
     dbLoopWindow: {
       startSec: 0,
       durationSec: DEFAULT_DB_SIGNAL_DURATION_SEC,
@@ -1306,7 +1283,6 @@ export default function ECGSimulatorPage() {
     stateRef.current.mode = mode;
     stateRef.current.signals = recordSignals;
     stateRef.current.frequency = selectedFreq;
-    stateRef.current.dbVisualSmoothing = dbVisualSmoothing;
     stateRef.current.dbLoopWindow = dbLoopWindow;
     stateRef.current.activeTab = activeTab;
     stateRef.current.diagSubTab = diagSubTab;
@@ -1332,7 +1308,6 @@ export default function ECGSimulatorPage() {
     mode,
     recordSignals,
     selectedFreq,
-    dbVisualSmoothing,
     dbLoopWindow,
     activeTab,
     diagSubTab
@@ -2128,8 +2103,7 @@ export default function ECGSimulatorPage() {
                 dbSignalArray,
                 t + (state.scrollOffset || 0),
                 signalFreq,
-                state.dbLoopWindow,
-                state.dbVisualSmoothing
+                state.dbLoopWindow
               );
               const idx0 = sample.sampleIndex;
               let val = sample.value * state.amplitude;
@@ -2213,8 +2187,7 @@ export default function ECGSimulatorPage() {
                 dbSignalArray,
                 state.scrollOffset || 0,
                 signalFreq,
-                state.dbLoopWindow,
-                false
+                state.dbLoopWindow
               ).value;
               const threshold = 0.55;
               if (currentSampleVal > threshold && !state.rPeakDetected) {
@@ -2363,8 +2336,7 @@ export default function ECGSimulatorPage() {
                     leadSignal,
                     t + (state.scrollOffset || 0),
                     signalFreq,
-                    state.dbLoopWindow,
-                    state.dbVisualSmoothing
+                    state.dbLoopWindow
                   );
                   const idx0 = sample.sampleIndex;
                   let val = sample.value * state.amplitude;
@@ -2457,8 +2429,7 @@ export default function ECGSimulatorPage() {
                 iiSignal,
                 t + (state.scrollOffset || 0),
                 signalFreq,
-                state.dbLoopWindow,
-                state.dbVisualSmoothing
+                state.dbLoopWindow
               );
               const idx0 = sample.sampleIndex;
               let val = sample.value * state.amplitude;
@@ -3960,30 +3931,12 @@ export default function ECGSimulatorPage() {
                 <div className={`tab-content ${activeTab === "db-explorer" ? "active" : ""}`} id="tab-db-explorer">
                   <div className="wave-customizer">
 
-                    <div className="toggle-row">
-                      <div>
-                        <div className="tr-label">DB Visual Smoothing</div>
-                        <div className="tr-desc">
-                          {dbVisualSmoothing ? "Cubic display interpolation is on" : "Raw linear interpolation is shown"}
-                          {recordSignals ? ` · Loop: ${dbLoopWindow.source === "rpeak" ? "beat-aligned" : "full record"}` : ""}
-                        </div>
-                      </div>
-                      <label className="toggle-switch">
-                        <input
-                          type="checkbox"
-                          checked={dbVisualSmoothing}
-                          onChange={(e) => setDbVisualSmoothing(e.target.checked)}
-                        />
-                        <span className="toggle-slider"></span>
-                      </label>
-                    </div>
-
                     {/* Search box controls */}
                     <div className="db-search-container">
                       <input
                         type="text"
                         className="db-search-input"
-                        placeholder="Search by ID, diagnosis (Inferior MI), code (LBBB)..."
+                        placeholder="Search by ID, diagnosis (Inferior MI, Pericarditis), code (LBBB)..."
                         value={searchQuery}
                         onChange={(e) => {
                           const val = e.target.value;

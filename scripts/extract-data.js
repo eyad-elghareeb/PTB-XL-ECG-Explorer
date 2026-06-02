@@ -74,11 +74,24 @@ async function main() {
     const stadium1 = (rec["infarction_stadium1"] || "").toLowerCase();
     const stadium2 = (rec["infarction_stadium2"] || "").toLowerCase();
     const superclass = (rec["superclass"] || "").toLowerCase();
+    const heartAxis = (rec["heart_axis"] || "").toLowerCase();
+    let scpCodeKeys = "";
+    const rawScp = rec["scp_codes"];
+    if (typeof rawScp === "object" && rawScp !== null) {
+      scpCodeKeys = Object.keys(rawScp).join(" ").toLowerCase();
+    } else if (typeof rawScp === "string") {
+      try {
+        const parsed = JSON.parse(rawScp);
+        if (typeof parsed === "object" && parsed !== null) {
+          scpCodeKeys = Object.keys(parsed).join(" ").toLowerCase();
+        }
+      } catch {}
+    }
     searchIndex[ecgId] = {
       ecg_id: ecgId,
       patient_id: rec["patient_id"],
       superclass: superclass,
-      searchText: `${ecgId} ${rec["patient_id"]} ${report} ${stadium1} ${stadium2}`,
+      searchText: `${ecgId} ${rec["patient_id"]} ${report} ${stadium1} ${stadium2} ${superclass} ${heartAxis} ${scpCodeKeys}`,
     };
   }
   fs.writeFileSync(path.join(outputDir, "searchIndex.json"), JSON.stringify(searchIndex));

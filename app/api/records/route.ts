@@ -73,9 +73,12 @@ export async function GET(req: NextRequest) {
             "patient_id LIKE ?",
             "report LIKE ?",
             "infarction_stadium1 LIKE ?",
-            "infarction_stadium2 LIKE ?"
+            "infarction_stadium2 LIKE ?",
+            "superclass LIKE ?",
+            "heart_axis LIKE ?",
+            "scp_codes LIKE ?"
           ];
-          params.push(term, term, term, term, term);
+          params.push(term, term, term, term, term, term, term, term);
 
           matchingCodesSet.forEach(code => {
             clauses.push("scp_codes LIKE ?");
