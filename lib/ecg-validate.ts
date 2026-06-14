@@ -1,17 +1,27 @@
 // ════════════════════════════════════════════════════════════════
-// PER-LEAD 12-LEAD SIMULATOR VALIDATION
-// Samples the synthesized waveform for each of the 12 leads and
-// verifies morphology against clinical expectations per rhythm.
+// ecg-validate.ts — Measurement-based 12-lead diagnostic validator
+//
+// For each rhythm, samples the synthesized cycle for every lead and
+// measures intervals / amplitudes / ST / axis against published
+// diagnostic criteria. A rhythm is "validated" only when its measured
+// morphology matches what a clinician would expect at that intensity.
+//
+// Public API (preserved for app/page.tsx):
+//   - validateRhythmAllLeads(rhythmId, intensity): LeadValidationSummary
 // ════════════════════════════════════════════════════════════════
 
-import { generateLeadWaveformUnscaled } from "./ecg-math";
-import { LEADS, INTENSITY_STAGES, rhythmRates } from "./ecg-rhythms";
+import { renderLeadCycleForBeat } from './ecg-math';
+import {
+  measureCycle, netQrsArea, computeFrontalAxis, sokolovLyonMm,
+  resampleToMsPerSample, CycleMeasurement,
+} from './ecg-measure';
+import { LEADS, INTENSITY_STAGES, rhythmRates } from './ecg-rhythms';
 
 export interface LeadValidationResult {
   lead: string;
   passed: boolean;
-  tag: string;       // Short annotation e.g. "ST↑", "Tall R", "Inverted T"
-  detail: string;    // Longer explanation
+  tag: string;
+  detail: string;
 }
 
 export interface LeadValidationSummary {
@@ -21,921 +31,1032 @@ export interface LeadValidationSummary {
   results: LeadValidationResult[];
 }
 
-// ── Waveform Feature Extraction ───────────────────────────────────────────────
+const SAMPLE_RATE = 500; // Hz — matches ecg-math.renderCycle
 
-interface WaveformMetrics {
-  maxVal: number;    // Peak positive (R wave)
-  minVal: number;    // Peak negative (S/QS)
-  stVal: number;     // Mean ST segment (35–50% of cycle)
-  tVal: number;      // Mean T-wave region (55–80% of cycle)
-  pVal: number;      // Mean P-wave region (0–15% of cycle)
-  rRange: number;    // maxVal - minVal — overall amplitude
+// ─── Lead cycle measurement cache (per call) ────────────────────
+
+function measureLead(rhythmId: string, lead: string, intensity: number): CycleMeasurement {
+  const config = INTENSITY_STAGES[rhythmId];
+  const bpm = config?.hrMod ? Math.max(20, Math.round(config.hrMod(intensity))) : (rhythmRates[rhythmId] || 72);
+  const clampedBpm = Math.max(20, Math.min(240, bpm));
+  const cycle = renderLeadCycleForBeat(rhythmId, lead, intensity, clampedBpm, 0);
+  const rrMs = 60000 / clampedBpm;
+  return measureCycle(cycle, SAMPLE_RATE, rrMs);
 }
 
-function sampleWaveformMetrics(
-  rhythm: string,
-  lead: string,
-  intensity: number,
-  bpm: number
-): WaveformMetrics {
-  const N = 256;
-  let maxVal = -Infinity;
-  let minVal = Infinity;
-  let stSum = 0, stCount = 0;
-  let tSum = 0, tCount = 0;
-  let pSum = 0, pCount = 0;
+// ─── Per-rhythm criteria ────────────────────────────────────────
+// Each rule returns null (skip — intensity below threshold) or a result.
 
-  const waveParams = {}; // not used in auto (non-manual) mode
+type Rule = (m: CycleMeasurement, ctx: Ctx) => { passed: boolean; tag: string; detail: string } | null;
 
-  for (let i = 0; i < N; i++) {
-    const phase = i / N;
-    const val = generateLeadWaveformUnscaled(
-      rhythm, lead, bpm, intensity, phase, 0, waveParams, false
-    );
-    if (!Number.isFinite(val)) continue;
-    if (val > maxVal) maxVal = val;
-    if (val < minVal) minVal = val;
-
-    if (phase < 0.15)                        { pSum += val; pCount++; }
-    if (phase >= 0.35 && phase < 0.50)       { stSum += val; stCount++; }
-    if (phase >= 0.55 && phase < 0.80)       { tSum += val; tCount++; }
-  }
-
-  const safeMax = Number.isFinite(maxVal) ? maxVal : 0;
-  const safeMin = Number.isFinite(minVal) ? minVal : 0;
-
-  return {
-    maxVal: safeMax,
-    minVal: safeMin,
-    stVal:  stCount > 0 ? stSum / stCount : 0,
-    tVal:   tCount > 0  ? tSum  / tCount  : 0,
-    pVal:   pCount > 0  ? pSum  / pCount  : 0,
-    rRange: safeMax - safeMin,
-  };
+interface Ctx {
+  rhythmId: string;
+  intensity: number;
+  lead: string;
+  /** Cross-lead lookups for criteria that need multiple leads. */
+  all: () => Record<string, CycleMeasurement>;
 }
 
-// ── Per-Rhythm Lead Expectation Rules ─────────────────────────────────────────
-// Each rule receives the WaveformMetrics for a specific lead and returns a
-// { passed, tag, detail } tuple.  Rules return null when the lead is not
-// clinically relevant for this rhythm (skipped, not failed).
+interface LeadRuleMap { [lead: string]: Rule[]; }
 
-type CheckFn = (m: WaveformMetrics, intensity: number) => { passed: boolean; tag: string; detail: string } | null;
+const ST_ELEV_LIMB_MV = 0.10;     // 1 mm in limb leads
+const ST_ELEV_PRECORD_MV = 0.15;  // 1.5 mm in precordial leads (men)
+const ST_DEP_MV = -0.10;          // 1 mm depression
+const NEG_T_MV = -0.10;
+const POS_T_MV = 0.05;
+const WIDE_QRS_MS = 120;
+const SHORT_PR_MS = 120;
 
-interface RhythmLeadRules {
-  [lead: string]: CheckFn;
+const LATERAL = ['I', 'aVL', 'V5', 'V6'];
+const INFERIOR = ['II', 'III', 'aVF'];
+const PRECORDIAL = ['V1', 'V2', 'V3', 'V4', 'V5', 'V6'];
+
+function isPrecordial(lead: string) { return lead.startsWith('V'); }
+
+function stElevThresholdMv(lead: string): number {
+  return isPrecordial(lead) ? ST_ELEV_PRECORD_MV : ST_ELEV_LIMB_MV;
 }
 
-// Helpers
-const ST_ELEV_THRESHOLD   = 0.08;  // mV — meaningful ST elevation
-const ST_DEP_THRESHOLD    = -0.06; // mV — meaningful ST depression
-const TALL_R_THRESHOLD    = 0.80;  // mV — dominant R wave
-const DEEP_S_THRESHOLD    = -0.50; // mV — deep S wave
-const NEG_T_THRESHOLD     = -0.04; // mV — inverted T
-const WIDE_QRS_THRESHOLD  = 0.18;  // amplitude range proxy for wide/abnormal QRS
+// ─── Rule builders ──────────────────────────────────────────────
 
-function stElevCheck(m: WaveformMetrics): { passed: boolean; tag: string; detail: string } {
-  const passed = m.stVal > ST_ELEV_THRESHOLD;
+const requireStElev: Rule = (m, ctx) => {
+  const thr = stElevThresholdMv(ctx.lead);
+  const passed = m.stElevationJ60Mv >= thr;
   return {
     passed,
-    tag: passed ? "ST↑" : "ST flat",
+    tag: passed ? 'ST↑' : 'ST flat',
     detail: passed
-      ? `ST elevation confirmed (mean ST ${m.stVal.toFixed(2)} mV)`
-      : `Expected ST elevation (got ${m.stVal.toFixed(2)} mV)`,
+      ? `${ctx.lead}: ST elevation ${(m.stElevationJ60Mv * 10).toFixed(1)} mm (≥ ${(thr * 10).toFixed(1)} mm)`
+      : `${ctx.lead}: ST ${(m.stElevationJ60Mv * 10).toFixed(1)} mm, expected ≥ ${(thr * 10).toFixed(1)} mm`,
   };
-}
+};
 
-function stDepCheck(m: WaveformMetrics): { passed: boolean; tag: string; detail: string } {
-  const passed = m.stVal < ST_DEP_THRESHOLD;
+const requireStDep: Rule = (m, ctx) => {
+  const passed = m.stElevationJ60Mv <= ST_DEP_MV;
   return {
     passed,
-    tag: passed ? "ST↓" : "ST flat",
+    tag: passed ? 'ST↓' : 'ST flat',
     detail: passed
-      ? `Reciprocal ST depression confirmed (${m.stVal.toFixed(2)} mV)`
-      : `Expected ST depression (got ${m.stVal.toFixed(2)} mV)`,
+      ? `${ctx.lead}: reciprocal ST depression ${(-m.stElevationJ60Mv * 10).toFixed(1)} mm`
+      : `${ctx.lead}: ST ${(m.stElevationJ60Mv * 10).toFixed(1)} mm, expected ≤ ${(ST_DEP_MV * 10).toFixed(1)} mm`,
   };
-}
+};
 
-function negTCheck(m: WaveformMetrics): { passed: boolean; tag: string; detail: string } {
-  const passed = m.tVal < NEG_T_THRESHOLD;
+const requireNegT: Rule = (m, ctx) => {
+  const passed = m.tAmplitudeMv <= NEG_T_MV;
   return {
     passed,
-    tag: passed ? "T↓" : "T upright",
+    tag: passed ? 'T↓' : 'T upright',
     detail: passed
-      ? `T-wave inversion confirmed (mean ${m.tVal.toFixed(2)} mV)`
-      : `Expected inverted T (got ${m.tVal.toFixed(2)} mV)`,
+      ? `${ctx.lead}: T inversion ${(m.tAmplitudeMv * 10).toFixed(1)} mm`
+      : `${ctx.lead}: T ${(m.tAmplitudeMv * 10).toFixed(1)} mm, expected inversion`,
   };
-}
+};
 
-function posTCheck(m: WaveformMetrics): { passed: boolean; tag: string; detail: string } {
-  const passed = m.tVal > 0.03;
+const requirePosT: Rule = (m, ctx) => {
+  const passed = m.tAmplitudeMv >= POS_T_MV;
   return {
     passed,
-    tag: passed ? "T+" : "T flat",
+    tag: passed ? 'T+' : 'T flat',
     detail: passed
-      ? `Positive T wave confirmed (mean ${m.tVal.toFixed(2)} mV)`
-      : `Expected positive T (got ${m.tVal.toFixed(2)} mV)`,
+      ? `${ctx.lead}: upright T ${(m.tAmplitudeMv * 10).toFixed(1)} mm`
+      : `${ctx.lead}: T ${(m.tAmplitudeMv * 10).toFixed(1)} mm, expected upright`,
   };
-}
+};
 
-// ── Rhythm-Specific Rule Tables ───────────────────────────────────────────────
+const requireWideQrs: Rule = (m, ctx) => {
+  const passed = m.qrsDurationMs >= WIDE_QRS_MS;
+  return {
+    passed,
+    tag: passed ? 'Wide QRS' : 'Narrow QRS',
+    detail: passed
+      ? `${ctx.lead}: QRS ${m.qrsDurationMs} ms (≥ ${WIDE_QRS_MS} ms — BBB) `
+      : `${ctx.lead}: QRS ${m.qrsDurationMs} ms, expected ≥ ${WIDE_QRS_MS} ms`,
+  };
+};
 
-const RHYTHM_LEAD_RULES: Record<string, RhythmLeadRules> = {
+// ─── Rhythm-specific rule tables ────────────────────────────────
 
-  // ── LBBB ─────────────────────────────────────────────────────
+const RHYTHM_RULES: Record<string, LeadRuleMap> = {
+
+  // ── LBBB ──────────────────────────────────────────────────────
   lbbb: {
-    V1: (m) => {
-      // QS or rS — dominant negative QRS, discordant positive T
-      const passed = m.minVal < DEEP_S_THRESHOLD && m.tVal > 0.02;
-      return {
-        passed,
-        tag: passed ? "QS+T+" : "Check V1",
-        detail: passed
-          ? `V1: deep negative QRS (${m.minVal.toFixed(2)} mV) with concordant T+`
-          : `V1 LBBB pattern weak (min=${m.minVal.toFixed(2)}, T=${m.tVal.toFixed(2)})`,
-      };
-    },
-    V2: (m) => {
-      const passed = m.minVal < DEEP_S_THRESHOLD * 0.7 && m.tVal > 0.01;
-      return {
-        passed,
-        tag: passed ? "rS+T+" : "Check V2",
-        detail: passed
-          ? `V2: rS pattern with discordant T+ (${m.tVal.toFixed(2)} mV)`
-          : `V2 rS pattern weak (min=${m.minVal.toFixed(2)})`,
-      };
-    },
-    I: (m) => {
-      // Broad positive R, discordant T-
-      const passed = m.maxVal > TALL_R_THRESHOLD * 0.6 && m.tVal < NEG_T_THRESHOLD;
-      return {
-        passed,
-        tag: passed ? "Broad R, T-" : "Check I",
-        detail: passed
-          ? `Lead I: broad R (${m.maxVal.toFixed(2)}) with discordant T inversion (${m.tVal.toFixed(2)})`
-          : `Expected broad R + inverted T (R=${m.maxVal.toFixed(2)}, T=${m.tVal.toFixed(2)})`,
-      };
-    },
-    V5: (m) => {
-      const passed = m.maxVal > TALL_R_THRESHOLD * 0.5 && m.tVal < NEG_T_THRESHOLD;
-      return {
-        passed,
-        tag: passed ? "R+, T-" : "Check V5",
-        detail: passed
-          ? `V5: tall R (${m.maxVal.toFixed(2)}) with ST-T discordance`
-          : `V5 LBBB pattern incomplete (R=${m.maxVal.toFixed(2)}, T=${m.tVal.toFixed(2)})`,
-      };
-    },
-    V6: (m) => {
-      const passed = m.maxVal > TALL_R_THRESHOLD * 0.4 && m.tVal < NEG_T_THRESHOLD;
-      return {
-        passed,
-        tag: passed ? "R+, T-" : "Check V6",
-        detail: passed
-          ? `V6: R wave (${m.maxVal.toFixed(2)}) with discordant T inversion`
-          : `V6 lateral pattern weak (R=${m.maxVal.toFixed(2)}, T=${m.tVal.toFixed(2)})`,
-      };
-    },
+    V1: [
+      (m, ctx) => {
+        const deepS = m.sAmplitudeMv <= -0.50;
+        const tPos = m.tAmplitudeMv >= POS_T_MV;
+        const passed = deepS && tPos;
+        return {
+          passed,
+          tag: passed ? 'QS+T+' : 'Check V1',
+          detail: passed
+            ? `V1 LBBB: deep S ${m.sAmplitudeMv.toFixed(2)} mV + discordant T+`
+            : `V1: S=${m.sAmplitudeMv.toFixed(2)} mV, T=${m.tAmplitudeMv.toFixed(2)} mV (expect deep S + upright T)`,
+        };
+      },
+    ],
+    V5: [
+      requireWideQrs,
+      (m, ctx) => {
+        const tallR = m.rAmplitudeMv >= 0.60;
+        const tNeg = m.tAmplitudeMv <= NEG_T_MV;
+        const passed = tallR && tNeg;
+        return {
+          passed,
+          tag: passed ? 'Broad R + T-' : 'Check V5',
+          detail: passed
+            ? `V5 LBBB: broad R ${m.rAmplitudeMv.toFixed(2)} mV + discordant T-`
+            : `V5: R=${m.rAmplitudeMv.toFixed(2)} mV, T=${m.tAmplitudeMv.toFixed(2)} mV`,
+        };
+      },
+    ],
+    V6: [
+      (m, ctx) => {
+        const tallR = m.rAmplitudeMv >= 0.40;
+        const tNeg = m.tAmplitudeMv <= NEG_T_MV;
+        const passed = tallR && tNeg;
+        return {
+          passed,
+          tag: passed ? 'R + T-' : 'Check V6',
+          detail: passed
+            ? `V6 LBBB lateral: R=${m.rAmplitudeMv.toFixed(2)}, T=${m.tAmplitudeMv.toFixed(2)}`
+            : `V6: R=${m.rAmplitudeMv.toFixed(2)}, T=${m.tAmplitudeMv.toFixed(2)}`,
+        };
+      },
+    ],
+    I: [
+      (m, ctx) => {
+        const tallR = m.rAmplitudeMv >= 0.40;
+        const tNeg = m.tAmplitudeMv <= NEG_T_MV;
+        const passed = tallR && tNeg;
+        return {
+          passed,
+          tag: passed ? 'Broad R + T-' : 'Check I',
+          detail: passed
+            ? `I LBBB lateral: broad R=${m.rAmplitudeMv.toFixed(2)} + T-`
+            : `I: R=${m.rAmplitudeMv.toFixed(2)}, T=${m.tAmplitudeMv.toFixed(2)}`,
+        };
+      },
+    ],
   },
 
-  // ── RBBB ─────────────────────────────────────────────────────
+  // ── RBBB ──────────────────────────────────────────────────────
   rbbb: {
-    V1: (m) => {
-      // Terminal R' — peak positive, T inverted
-      const passed = m.maxVal > TALL_R_THRESHOLD * 0.5 && m.tVal < NEG_T_THRESHOLD;
-      return {
-        passed,
-        tag: passed ? "R', T-" : "Check V1",
-        detail: passed
-          ? `V1: terminal R' (${m.maxVal.toFixed(2)} mV) with T inversion`
-          : `V1 rsR' pattern incomplete (R=${m.maxVal.toFixed(2)}, T=${m.tVal.toFixed(2)})`,
-      };
-    },
-    V2: (m) => {
-      const passed = m.maxVal > TALL_R_THRESHOLD * 0.4 && m.tVal < NEG_T_THRESHOLD * 0.5;
-      return {
-        passed,
-        tag: passed ? "R', T-" : "Check V2",
-        detail: passed
-          ? `V2: R' pattern confirmed (${m.maxVal.toFixed(2)} mV)`
-          : `V2 RBBB terminal deflection weak`,
-      };
-    },
-    I: (m) => {
-      // Wide S wave — net negative terminal
-      const passed = m.minVal < DEEP_S_THRESHOLD * 0.5;
-      return {
-        passed,
-        tag: passed ? "Wide S" : "Check I",
-        detail: passed
-          ? `Lead I: wide terminal S wave (${m.minVal.toFixed(2)} mV)`
-          : `Expected deep S in I (got ${m.minVal.toFixed(2)})`,
-      };
-    },
-    V5: (m) => {
-      const passed = m.minVal < DEEP_S_THRESHOLD * 0.4;
-      return {
-        passed,
-        tag: passed ? "Wide S" : "Check V5",
-        detail: passed
-          ? `V5: wide S wave (${m.minVal.toFixed(2)} mV) — RBBB lateral pattern`
-          : `Expected wide S in V5 (got ${m.minVal.toFixed(2)})`,
-      };
-    },
-    V6: (m) => {
-      const passed = m.minVal < DEEP_S_THRESHOLD * 0.35;
-      return {
-        passed,
-        tag: passed ? "Wide S" : "Check V6",
-        detail: passed
-          ? `V6: wide terminal S (${m.minVal.toFixed(2)}) — RBBB lateral pattern`
-          : `Expected wide S in V6 (got ${m.minVal.toFixed(2)})`,
-      };
-    },
+    V1: [
+      requireWideQrs,
+      (m, ctx) => {
+        // rsR' — peak positive should exceed any initial r; we accept a single
+        // dominant positive deflection (the R') as proxy when M-pattern is hard to detect.
+        const domR = m.rAmplitudeMv >= 0.50;
+        const tNeg = m.tAmplitudeMv <= -0.05;
+        const passed = domR && tNeg;
+        return {
+          passed,
+          tag: passed ? "R' + T-" : 'Check V1',
+          detail: passed
+            ? `V1 RBBB: R'=${m.rAmplitudeMv.toFixed(2)} mV + T inversion`
+            : `V1: R=${m.rAmplitudeMv.toFixed(2)}, T=${m.tAmplitudeMv.toFixed(2)}`,
+        };
+      },
+    ],
+    V2: [
+      (m, ctx) => {
+        const domR = m.rAmplitudeMv >= 0.40;
+        const passed = domR;
+        return {
+          passed,
+          tag: passed ? "R' present" : 'Check V2',
+          detail: passed
+            ? `V2 RBBB: R'=${m.rAmplitudeMv.toFixed(2)} mV`
+            : `V2: R=${m.rAmplitudeMv.toFixed(2)} (expected prominent terminal R')`,
+        };
+      },
+    ],
+    I: [
+      (m, ctx) => {
+        const wideS = m.sAmplitudeMv <= -0.20;
+        const passed = wideS;
+        return {
+          passed,
+          tag: passed ? 'Wide S' : 'Check I',
+          detail: passed
+            ? `I RBBB: wide S=${m.sAmplitudeMv.toFixed(2)} mV`
+            : `I: S=${m.sAmplitudeMv.toFixed(2)} (expected wide terminal S)`,
+        };
+      },
+    ],
+    V6: [
+      (m, ctx) => {
+        const wideS = m.sAmplitudeMv <= -0.15;
+        const passed = wideS;
+        return {
+          passed,
+          tag: passed ? 'Wide S' : 'Check V6',
+          detail: passed
+            ? `V6 RBBB: wide S=${m.sAmplitudeMv.toFixed(2)} mV`
+            : `V6: S=${m.sAmplitudeMv.toFixed(2)}`,
+        };
+      },
+    ],
   },
 
-  // ── LVH ──────────────────────────────────────────────────────
+  // ── LVH ───────────────────────────────────────────────────────
   lvh: {
-    I: (m, i) => {
-      const minInt = 0.25;
-      if (i < minInt) return null;
-      const passed = m.maxVal > TALL_R_THRESHOLD && m.stVal < 0 && m.tVal < NEG_T_THRESHOLD;
-      return {
-        passed,
-        tag: passed ? "Tall R+Strain" : "Check I",
-        detail: passed
-          ? `Lead I: tall R (${m.maxVal.toFixed(2)}) + strain (ST ${m.stVal.toFixed(2)}, T ${m.tVal.toFixed(2)})`
-          : `LVH lateral strain pattern incomplete in I`,
-      };
-    },
-    V5: (m, i) => {
-      if (i < 0.2) return null;
-      const passed = m.maxVal > TALL_R_THRESHOLD * 1.1 && m.tVal < NEG_T_THRESHOLD;
-      return {
-        passed,
-        tag: passed ? "HV+Strain" : "Check V5",
-        detail: passed
-          ? `V5: high-voltage R (${m.maxVal.toFixed(2)}) with repolarization strain`
-          : `LVH voltage/strain in V5 not fully expressed (R=${m.maxVal.toFixed(2)})`,
-      };
-    },
-    V6: (m, i) => {
-      if (i < 0.2) return null;
-      const passed = m.maxVal > TALL_R_THRESHOLD * 0.7 && m.tVal < NEG_T_THRESHOLD;
-      return {
-        passed,
-        tag: passed ? "R+, T-" : "Check V6",
-        detail: passed
-          ? `V6: R (${m.maxVal.toFixed(2)}) + strain T inversion`
-          : `V6 LVH strain incomplete`,
-      };
-    },
-    V1: (m) => {
-      const passed = m.minVal < DEEP_S_THRESHOLD;
-      return {
-        passed,
-        tag: passed ? "Deep S" : "Check V1",
-        detail: passed
-          ? `V1: deep S (${m.minVal.toFixed(2)}) — LVH right-precordial criterion`
-          : `V1 deep S not pronounced (${m.minVal.toFixed(2)})`,
-      };
-    },
-    V2: (m) => {
-      const passed = m.minVal < DEEP_S_THRESHOLD * 0.8;
-      return {
-        passed,
-        tag: passed ? "Deep S" : "Check V2",
-        detail: passed
-          ? `V2: deep S wave (${m.minVal.toFixed(2)} mV) consistent with LVH`
-          : `V2 deep S pattern weak`,
-      };
-    },
+    V5: [
+      (m, ctx) => {
+        const all_ = ctx.all();
+        const rv5 = Math.max(0, all_.V5.rAmplitudeMv);
+        const sv1 = Math.max(0, -all_.V1.sAmplitudeMv);
+        const sl = sokolovLyonMm(rv5, -sv1);
+        const passed = sl > 35;
+        return {
+          passed,
+          tag: passed ? 'Sokolov+' : 'Check SL',
+          detail: passed
+            ? `Sokolov-Lyon: SV1+RV5 = ${sl.toFixed(0)} mm (> 35 mm)`
+            : `Sokolov-Lyon = ${sl.toFixed(0)} mm (expected > 35 mm)`,
+        };
+      },
+    ],
+    V6: [
+      (m, ctx) => {
+        const tallR = m.rAmplitudeMv >= 0.90;
+        const tInv = ctx.intensity > 0.35 ? m.tAmplitudeMv <= -0.05 : true;
+        const passed = tallR && tInv;
+        return {
+          passed,
+          tag: passed ? 'HV + strain' : 'Check V6',
+          detail: passed
+            ? `V6 LVH: R=${m.rAmplitudeMv.toFixed(2)} mV${ctx.intensity > 0.35 ? ' + strain' : ''}`
+            : `V6: R=${m.rAmplitudeMv.toFixed(2)} mV`,
+        };
+      },
+    ],
+    I: [
+      (m, ctx) => {
+        const tallR = m.rAmplitudeMv >= 0.70;
+        const passed = tallR;
+        return {
+          passed,
+          tag: passed ? 'Tall R' : 'Check I',
+          detail: passed
+            ? `I LVH: tall R=${m.rAmplitudeMv.toFixed(2)} mV`
+            : `I: R=${m.rAmplitudeMv.toFixed(2)} mV (expected tall)`,
+        };
+      },
+    ],
+    V1: [
+      (m, ctx) => {
+        const deepS = m.sAmplitudeMv <= -0.80;
+        const passed = deepS;
+        return {
+          passed,
+          tag: passed ? 'Deep S' : 'Check V1',
+          detail: passed
+            ? `V1 LVH: deep S=${m.sAmplitudeMv.toFixed(2)} mV`
+            : `V1: S=${m.sAmplitudeMv.toFixed(2)} mV (expected deep)`,
+        };
+      },
+    ],
   },
 
-  // ── RVH ──────────────────────────────────────────────────────
+  // ── RVH ───────────────────────────────────────────────────────
   rvh: {
-    V1: (m, i) => {
-      if (i < 0.2) return null;
-      const passed = m.maxVal > TALL_R_THRESHOLD * 0.7 && m.stVal < 0;
-      return {
-        passed,
-        tag: passed ? "Dom R+Strain" : "Check V1",
-        detail: passed
-          ? `V1: dominant R (${m.maxVal.toFixed(2)}) + RV strain (ST ${m.stVal.toFixed(2)})`
-          : `RVH dominant R in V1 not expressed (R=${m.maxVal.toFixed(2)})`,
-      };
-    },
-    V5: (m, i) => {
-      if (i < 0.2) return null;
-      const passed = m.minVal < DEEP_S_THRESHOLD * 0.5;
-      return {
-        passed,
-        tag: passed ? "Deep S" : "Check V5",
-        detail: passed
-          ? `V5: deep S (${m.minVal.toFixed(2)}) — RVH lateral criterion`
-          : `V5 deep S pattern weak for RVH`,
-      };
-    },
-    V6: (m, i) => {
-      if (i < 0.2) return null;
-      const passed = m.minVal < DEEP_S_THRESHOLD * 0.4;
-      return {
-        passed,
-        tag: passed ? "Deep S" : "Check V6",
-        detail: passed
-          ? `V6: deep S (${m.minVal.toFixed(2)}) — RVH lateral pattern`
-          : `V6 lateral S pattern weak`,
-      };
-    },
+    V1: [
+      (m, ctx) => {
+        // R/S ratio > 1 in V1
+        const ratio = m.rAmplitudeMv / Math.max(0.05, -m.sAmplitudeMv);
+        const passed = ratio >= 1.0 && m.rAmplitudeMv >= 0.30;
+        return {
+          passed,
+          tag: passed ? 'Dom R' : 'Check V1',
+          detail: passed
+            ? `V1 RVH: dominant R=${m.rAmplitudeMv.toFixed(2)}, S=${m.sAmplitudeMv.toFixed(2)} (R/S=${ratio.toFixed(2)})`
+            : `V1: R/S=${ratio.toFixed(2)} (expected > 1)`,
+        };
+      },
+    ],
+    V5: [
+      (m, ctx) => {
+        const deepS = m.sAmplitudeMv <= -0.30;
+        const passed = deepS;
+        return {
+          passed,
+          tag: passed ? 'Deep S' : 'Check V5',
+          detail: passed
+            ? `V5 RVH: deep S=${m.sAmplitudeMv.toFixed(2)} mV`
+            : `V5: S=${m.sAmplitudeMv.toFixed(2)} mV`,
+        };
+      },
+    ],
   },
 
-  // ── Brugada ──────────────────────────────────────────────────
-  brugada: {
-    V1: (m, i) => {
-      if (i < 0.3) return null;
-      const passed = m.stVal > ST_ELEV_THRESHOLD * 0.8 && m.tVal < NEG_T_THRESHOLD;
-      return {
-        passed,
-        tag: passed ? "Coved" : "Check V1",
-        detail: passed
-          ? `V1: coved ST elevation (${m.stVal.toFixed(2)}) + negative T (${m.tVal.toFixed(2)}) — Brugada type 1`
-          : `V1 Brugada coved pattern not fully expressed (ST=${m.stVal.toFixed(2)}, T=${m.tVal.toFixed(2)})`,
-      };
-    },
-    V2: (m, i) => {
-      if (i < 0.25) return null;
-      const passed = m.stVal > ST_ELEV_THRESHOLD * 0.5;
-      return {
-        passed,
-        tag: passed ? "ST↑" : "Check V2",
-        detail: passed
-          ? `V2: ST elevation (${m.stVal.toFixed(2)}) — Brugada right-precordial pattern`
-          : `V2 Brugada ST elevation not confirmed (${m.stVal.toFixed(2)})`,
-      };
-    },
-    // Other leads should be relatively normal
-    II: (m) => {
-      const passed = Math.abs(m.stVal) < ST_ELEV_THRESHOLD;
-      return {
-        passed,
-        tag: passed ? "Normal" : "Abnormal",
-        detail: passed
-          ? `Lead II: no significant ST change (${m.stVal.toFixed(2)}) — Brugada is right-specific`
-          : `Unexpected ST deviation in II — Brugada should be V1/V2 specific`,
-      };
-    },
-  },
-
-  // ── Posterior MI ─────────────────────────────────────────────
-  pwmi: {
-    V1: (m) => {
-      const passed = m.stVal < ST_DEP_THRESHOLD && m.maxVal > TALL_R_THRESHOLD * 0.4 && m.tVal > 0.03;
-      return {
-        passed,
-        tag: passed ? "ST↓, Tall R, T+" : "Check V1",
-        detail: passed
-          ? `V1: posterior MI mirror — ST↓ (${m.stVal.toFixed(2)}), tall R (${m.maxVal.toFixed(2)}), T+ (${m.tVal.toFixed(2)})`
-          : `V1 posterior pattern incomplete (ST=${m.stVal.toFixed(2)}, R=${m.maxVal.toFixed(2)})`,
-      };
-    },
-    V2: (m) => {
-      const passed = m.stVal < ST_DEP_THRESHOLD && m.tVal > 0.02;
-      return {
-        passed,
-        tag: passed ? "ST↓, T+" : "Check V2",
-        detail: passed
-          ? `V2: reciprocal posterior MI (ST ${m.stVal.toFixed(2)}, T ${m.tVal.toFixed(2)})`
-          : `V2 posterior reciprocal pattern weak`,
-      };
-    },
-    V3: (m) => {
-      const passed = m.stVal < 0;
-      return {
-        passed,
-        tag: passed ? "ST↓" : "Check V3",
-        detail: passed
-          ? `V3: some reciprocal ST depression (${m.stVal.toFixed(2)})`
-          : `V3 ST depression absent`,
-      };
-    },
-  },
-
-  // ── Pericarditis ─────────────────────────────────────────────
-  pericarditis: {
-    II: (m, i) => {
-      if (i < 0.2) return null;
-      const passed = m.stVal > ST_ELEV_THRESHOLD;
-      return {
-        passed,
-        tag: passed ? "Diffuse ST↑" : "Check II",
-        detail: passed
-          ? `Lead II: diffuse pericarditis ST elevation (${m.stVal.toFixed(2)} mV)`
-          : `Expected concave ST elevation in II (${m.stVal.toFixed(2)})`,
-      };
-    },
-    V5: (m, i) => {
-      if (i < 0.2) return null;
-      const passed = m.stVal > ST_ELEV_THRESHOLD;
-      return {
-        passed,
-        tag: passed ? "ST↑" : "Check V5",
-        detail: passed
-          ? `V5: pericarditis ST elevation (${m.stVal.toFixed(2)})`
-          : `Expected ST elevation in V5 (got ${m.stVal.toFixed(2)})`,
-      };
-    },
-    V1: (m, i) => {
-      // aVR/V1 classically show reciprocal depression or PR depression
-      if (i < 0.25) return null;
-      const passed = m.stVal < ST_ELEV_THRESHOLD * 0.5;
-      return {
-        passed,
-        tag: passed ? "No ST↑" : "Unexpected ST↑",
-        detail: passed
-          ? `V1: no ST elevation — consistent with pericarditis (V1 typically spared or depressed)`
-          : `V1 unexpectedly shows ST elevation in pericarditis`,
-      };
-    },
-  },
-
-  // ── Wellens ───────────────────────────────────────────────────
-  wellens: {
-    V2: (m, i) => {
-      if (i < 0.2) return null;
-      const passed = m.tVal < NEG_T_THRESHOLD * 0.7;
-      return {
-        passed,
-        tag: passed ? "T inv" : "Check V2",
-        detail: passed
-          ? `V2: T-wave inversion (${m.tVal.toFixed(2)}) — Wellens type B pattern`
-          : `V2 T inversion not sufficient (${m.tVal.toFixed(2)})`,
-      };
-    },
-    V3: (m, i) => {
-      if (i < 0.2) return null;
-      const passed = m.tVal < NEG_T_THRESHOLD;
-      return {
-        passed,
-        tag: passed ? "T inv" : "Check V3",
-        detail: passed
-          ? `V3: T inversion (${m.tVal.toFixed(2)}) — Wellens anterior pattern`
-          : `V3 T inversion weak (${m.tVal.toFixed(2)})`,
-      };
-    },
-    V5: (m) => {
-      // Should remain relatively normal
-      const passed = m.tVal > NEG_T_THRESHOLD;
-      return {
-        passed,
-        tag: passed ? "Normal T" : "T inv",
-        detail: passed
-          ? `V5: T-wave positive — Wellens limited to V2/V3`
-          : `V5 T inversion unexpected for Wellens`,
-      };
-    },
-  },
-
-  // ── De Winter ─────────────────────────────────────────────────
-  dewinter: {
-    V2: (m, i) => {
-      if (i < 0.2) return null;
-      const passed = m.stVal < ST_DEP_THRESHOLD && m.tVal > 0.10;
-      return {
-        passed,
-        tag: passed ? "ST↓, Tall T" : "Check V2",
-        detail: passed
-          ? `V2: De Winter ST depression (${m.stVal.toFixed(2)}) + tall T (${m.tVal.toFixed(2)})`
-          : `V2 De Winter pattern incomplete (ST=${m.stVal.toFixed(2)}, T=${m.tVal.toFixed(2)})`,
-      };
-    },
-    V4: (m, i) => {
-      if (i < 0.2) return null;
-      const passed = m.stVal < 0 && m.tVal > 0.08;
-      return {
-        passed,
-        tag: passed ? "ST↓, T↑" : "Check V4",
-        detail: passed
-          ? `V4: upsloping depression + tall T (T=${m.tVal.toFixed(2)})`
-          : `V4 De Winter pattern incomplete`,
-      };
-    },
-    V6: (m, i) => {
-      if (i < 0.2) return null;
-      const passed = m.stVal < 0 && m.tVal > 0.04;
-      return {
-        passed,
-        tag: passed ? "ST↓" : "Check V6",
-        detail: passed
-          ? `V6: ST depression (${m.stVal.toFixed(2)}) — De Winter LAD occlusion`
-          : `V6 ST depression absent`,
-      };
-    },
-  },
-
-  // ── WPW ──────────────────────────────────────────────────────
+  // ── WPW ───────────────────────────────────────────────────────
   wpw: {
-    I: (m, i) => {
-      if (i < 0.2) return null;
-      // Wide QRS (delta wave slurs onset), discordant T
-      const passed = m.rRange > WIDE_QRS_THRESHOLD && m.tVal < 0;
-      return {
-        passed,
-        tag: passed ? "Delta+T-" : "Check I",
-        detail: passed
-          ? `Lead I: wide QRS with delta slur (range ${m.rRange.toFixed(2)}) + discordant T (${m.tVal.toFixed(2)})`
-          : `WPW delta-wave morphology not prominent in I`,
-      };
-    },
-    V1: (m, i) => {
-      if (i < 0.2) return null;
-      // May show positive delta (type A) or negative (type B) depending on accessory pathway
-      const passed = m.rRange > WIDE_QRS_THRESHOLD * 0.8;
-      return {
-        passed,
-        tag: passed ? "Wide QRS" : "Check V1",
-        detail: passed
-          ? `V1: QRS widened by delta wave (range ${m.rRange.toFixed(2)})`
-          : `V1 WPW QRS widening not expressed`,
-      };
-    },
-  },
-
-  // ── Hyperkalemia ─────────────────────────────────────────────
-  hyperk: {
-    II: (m) => {
-      // Tall narrow T (peaked), possible QRS widening at higher intensity
-      const passed = m.tVal > 0.15 || m.maxVal > TALL_R_THRESHOLD * 0.6;
-      return {
-        passed,
-        tag: passed ? "Peaked T" : "Check II",
-        detail: passed
-          ? `Lead II: peaked T (${m.tVal.toFixed(2)}) — hyperkalemia early sign`
-          : `Hyperkalemia T-wave peaking not expressed in II (T=${m.tVal.toFixed(2)})`,
-      };
-    },
-    V4: (m) => {
-      const passed = m.tVal > 0.12;
-      return {
-        passed,
-        tag: passed ? "Peaked T" : "Check V4",
-        detail: passed
-          ? `V4: peaked T (${m.tVal.toFixed(2)}) — hyperkalemia precordial pattern`
-          : `V4 T peaking weak (${m.tVal.toFixed(2)})`,
-      };
-    },
-    V5: (m) => {
-      const passed = m.tVal > 0.10;
-      return {
-        passed,
-        tag: passed ? "Peaked T" : "Check V5",
-        detail: passed
-          ? `V5: peaked T (${m.tVal.toFixed(2)})`
-          : `V5 T peaking weak`,
-      };
-    },
-  },
-
-  // ── Hypokalemia ──────────────────────────────────────────────
-  hypokalemia: {
-    II: (m, i) => {
-      if (i < 0.15) return null;
-      // Flat T, prominent U (U modelled as late positive wave)
-      const passed = m.tVal < 0.10 && m.stVal < 0;
-      return {
-        passed,
-        tag: passed ? "T flat, ST↓" : "Check II",
-        detail: passed
-          ? `Lead II: T flattening (${m.tVal.toFixed(2)}) + ST depression — hypokalemia`
-          : `Hypokalemia T-flat/ST-dep pattern incomplete in II`,
-      };
-    },
-    V5: (m, i) => {
-      if (i < 0.15) return null;
-      const passed = m.tVal < 0.12 && m.stVal < 0;
-      return {
-        passed,
-        tag: passed ? "T flat" : "Check V5",
-        detail: passed
-          ? `V5: T flattening/inversion (${m.tVal.toFixed(2)}) — hypokalemia`
-          : `V5 hypokalemia T change weak`,
-      };
-    },
-  },
-
-  // ── Hypothermia ───────────────────────────────────────────────
-  hypothermia: {
-    II: (m, i) => {
-      if (i < 0.2) return null;
-      // J-wave (Osborn) — positive notch just after QRS
-      const passed = m.stVal > 0.02;
-      return {
-        passed,
-        tag: passed ? "J-wave" : "Check II",
-        detail: passed
-          ? `Lead II: J-wave/Osborn wave visible (ST region ${m.stVal.toFixed(2)}) — hypothermia`
-          : `J-wave in II not clearly expressed (${m.stVal.toFixed(2)})`,
-      };
-    },
-    V5: (m, i) => {
-      if (i < 0.2) return null;
-      const passed = m.stVal > 0.015;
-      return {
-        passed,
-        tag: passed ? "J-wave" : "Check V5",
-        detail: passed
-          ? `V5: Osborn J-wave (${m.stVal.toFixed(2)}) — hypothermia lateral`
-          : `V5 Osborn wave not confirmed (${m.stVal.toFixed(2)})`,
-      };
-    },
-    V6: (m, i) => {
-      if (i < 0.2) return null;
-      const passed = m.stVal > 0.01;
-      return {
-        passed,
-        tag: passed ? "J-wave" : "Check V6",
-        detail: passed
-          ? `V6: Osborn wave (${m.stVal.toFixed(2)})`
-          : `V6 Osborn wave absent`,
-      };
-    },
-  },
-
-  // ── Digoxin effect ────────────────────────────────────────────
-  digoxin: {
-    I:  (m, i) => {
-      if (i < 0.15) return null;
-      const passed = m.stVal < ST_DEP_THRESHOLD;
-      return {
-        passed,
-        tag: passed ? "Sag ST" : "Check I",
-        detail: passed
-          ? `Lead I: scooped ST depression (${m.stVal.toFixed(2)}) — digoxin effect`
-          : `Digoxin sag not confirmed in I (${m.stVal.toFixed(2)})`,
-      };
-    },
-    II: (m, i) => {
-      if (i < 0.15) return null;
-      const passed = m.stVal < ST_DEP_THRESHOLD;
-      return {
-        passed,
-        tag: passed ? "Sag ST" : "Check II",
-        detail: passed
-          ? `Lead II: ST sagging (${m.stVal.toFixed(2)}) — digoxin pattern`
-          : `Digoxin sag in II not confirmed (${m.stVal.toFixed(2)})`,
-      };
-    },
-    V5: (m, i) => {
-      if (i < 0.15) return null;
-      const passed = m.stVal < ST_DEP_THRESHOLD;
-      return {
-        passed,
-        tag: passed ? "Sag ST" : "Check V5",
-        detail: passed
-          ? `V5: sagging ST depression (${m.stVal.toFixed(2)})`
-          : `Digoxin sag in V5 not confirmed`,
-      };
-    },
-    V6: (m, i) => {
-      if (i < 0.15) return null;
-      const passed = m.stVal < ST_DEP_THRESHOLD;
-      return {
-        passed,
-        tag: passed ? "Sag ST" : "Check V6",
-        detail: passed
-          ? `V6: ST sagging (${m.stVal.toFixed(2)}) — digoxin lateral`
-          : `V6 digoxin sag absent`,
-      };
-    },
-  },
-
-  // ── Pulmonary Embolism ────────────────────────────────────────
-  pe: {
-    I: (m, i) => {
-      if (i < 0.25) return null;
-      // S1 — deep S wave in lead I
-      const passed = m.minVal < DEEP_S_THRESHOLD * 0.5;
-      return {
-        passed,
-        tag: passed ? "S1" : "Check I",
-        detail: passed
-          ? `Lead I: S wave (${m.minVal.toFixed(2)}) — S1Q3T3 pattern in PE`
-          : `Lead I S wave for S1Q3T3 not prominent (${m.minVal.toFixed(2)})`,
-      };
-    },
-    V1: (m, i) => {
-      if (i < 0.2) return null;
-      const passed = m.tVal < NEG_T_THRESHOLD || m.stVal < 0;
-      return {
-        passed,
-        tag: passed ? "RV strain" : "Check V1",
-        detail: passed
-          ? `V1: right heart strain pattern (T=${m.tVal.toFixed(2)}, ST=${m.stVal.toFixed(2)})`
-          : `V1 RV strain not confirmed`,
-      };
-    },
-    V2: (m, i) => {
-      if (i < 0.2) return null;
-      const passed = m.tVal < 0.05;
-      return {
-        passed,
-        tag: passed ? "T flat/inv" : "Check V2",
-        detail: passed
-          ? `V2: T flattening (${m.tVal.toFixed(2)}) — anterior RV strain in PE`
-          : `V2 anterior strain T change not expressed`,
-      };
-    },
+    II: [
+      (m, ctx) => {
+        const shortPR = m.prIntervalMs <= SHORT_PR_MS && m.prIntervalMs > 0;
+        const wideQrs = m.qrsDurationMs >= 100;
+        const passed = shortPR && wideQrs;
+        return {
+          passed,
+          tag: passed ? 'Short PR + δ' : 'Check II',
+          detail: passed
+            ? `II WPW: PR ${m.prIntervalMs} ms + QRS ${m.qrsDurationMs} ms (delta wave)`
+            : `II: PR=${m.prIntervalMs} ms, QRS=${m.qrsDurationMs} ms (expect PR<${SHORT_PR_MS}, QRS>100)`,
+        };
+      },
+    ],
+    V5: [
+      (m, ctx) => {
+        const wideQrs = m.qrsDurationMs >= 100;
+        const passed = wideQrs;
+        return {
+          passed,
+          tag: passed ? 'δ widened' : 'Check V5',
+          detail: passed
+            ? `V5 WPW: QRS ${m.qrsDurationMs} ms (delta-wave widening)`
+            : `V5: QRS=${m.qrsDurationMs} ms`,
+        };
+      },
+    ],
   },
 
   // ── Long QT ───────────────────────────────────────────────────
   longqt: {
-    II: (m, i) => {
-      if (i < 0.2) return null;
-      // Prolonged T — T region should contain larger amplitude across extended phase
-      const passed = m.tVal > 0.08 && m.rRange > 0.5;
-      return {
-        passed,
-        tag: passed ? "Long T" : "Check II",
-        detail: passed
-          ? `Lead II: prolonged T-wave region (T mean ${m.tVal.toFixed(2)}) — Long QT`
-          : `Long QT T prolongation not clearly expressed in II`,
-      };
-    },
-    V5: (m, i) => {
-      if (i < 0.2) return null;
-      const passed = m.tVal > 0.06;
-      return {
-        passed,
-        tag: passed ? "Long T" : "Check V5",
-        detail: passed
-          ? `V5: prolonged T-wave (${m.tVal.toFixed(2)}) — Long QT lateral`
-          : `V5 T-wave prolongation not expressed`,
-      };
-    },
+    II: [
+      (m, ctx) => {
+        const passed = m.qtcMs >= 440;
+        return {
+          passed,
+          tag: passed ? 'QTc↑' : 'Check QTc',
+          detail: passed
+            ? `II: QTc ${m.qtcMs.toFixed(0)} ms (≥ 440 ms — prolonged)`
+            : `II: QTc ${m.qtcMs.toFixed(0)} ms (expected ≥ 440 ms)`,
+        };
+      },
+    ],
+    V5: [
+      (m, ctx) => {
+        const passed = m.qtcMs >= 440;
+        return {
+          passed,
+          tag: passed ? 'QTc↑' : 'Check QTc',
+          detail: passed
+            ? `V5: QTc ${m.qtcMs.toFixed(0)} ms`
+            : `V5: QTc ${m.qtcMs.toFixed(0)} ms (expected ≥ 440 ms)`,
+        };
+      },
+    ],
   },
 
-  // ── Left Atrial Hypertrophy ───────────────────────────────────
-  lah: {
-    II: (m) => {
-      // Broad, bifid P — P amplitude/duration increased
-      const passed = m.pVal > 0.04;
-      return {
-        passed,
-        tag: passed ? "Broad P" : "Check P",
-        detail: passed
-          ? `Lead II: broad bifid P (${m.pVal.toFixed(2)}) — P mitrale`
-          : `P mitrale pattern not confirmed in II (${m.pVal.toFixed(2)})`,
-      };
-    },
-    V1: (m) => {
-      // Terminal negative P component in V1
-      const passed = m.minVal < -0.02;
-      return {
-        passed,
-        tag: passed ? "P neg" : "Check V1",
-        detail: passed
-          ? `V1: terminal negative P deflection (${m.minVal.toFixed(2)}) — LAH`
-          : `V1 terminal P negativity not expressed`,
-      };
-    },
+  // ── Brugada Type 1 (checked only at intensity ≥ 0.5, coved stage) ──
+  brugada: {
+    V1: [
+      (m, ctx) => ctx.intensity < 0.45 ? null : (() => {
+        const stElev = m.stElevationJ60Mv >= 0.20;  // ≥ 2 mm
+        const tNeg = m.tAmplitudeMv <= -0.05;
+        const passed = stElev && tNeg;
+        return {
+          passed,
+          tag: passed ? 'Coved T1' : 'Check V1',
+          detail: passed
+            ? `V1 Brugada T1: coved ST ${(m.stElevationJ60Mv * 10).toFixed(1)} mm + T-`
+            : `V1: ST ${(m.stElevationJ60Mv * 10).toFixed(1)} mm, T=${m.tAmplitudeMv.toFixed(2)} (expect ≥2mm + T-)`,
+        };
+      })(),
+    ],
+    V2: [
+      (m, ctx) => ctx.intensity < 0.45 ? null : (() => {
+        const stElev = m.stElevationJ60Mv >= 0.15;
+        const passed = stElev;
+        return {
+          passed,
+          tag: passed ? 'ST↑ V2' : 'Check V2',
+          detail: passed
+            ? `V2 Brugada: ST ${(m.stElevationJ60Mv * 10).toFixed(1)} mm`
+            : `V2: ST ${(m.stElevationJ60Mv * 10).toFixed(1)} mm (expected elevated)`,
+        };
+      })(),
+    ],
+    II: [
+      (m, ctx) => {
+        // Should be normal
+        const passed = Math.abs(m.stElevationJ60Mv) < 0.10;
+        return {
+          passed,
+          tag: passed ? 'Normal' : 'Abnormal',
+          detail: passed
+            ? `II: no ST change (Brugada is right-specific)`
+            : `II unexpected ST change`,
+        };
+      },
+    ],
   },
 
-  // ── Right Atrial Hypertrophy ──────────────────────────────────
-  rah: {
-    II: (m, i) => {
-      if (i < 0.2) return null;
-      // Tall peaked P — P pulmonale
-      const passed = m.pVal > 0.08;
-      return {
-        passed,
-        tag: passed ? "Tall P" : "Check P",
-        detail: passed
-          ? `Lead II: tall peaked P (${m.pVal.toFixed(2)}) — P pulmonale`
-          : `P pulmonale not fully expressed in II (${m.pVal.toFixed(2)})`,
-      };
-    },
-    V1: (m, i) => {
-      if (i < 0.2) return null;
-      const passed = m.pVal > 0.05;
-      return {
-        passed,
-        tag: passed ? "Tall P" : "Check V1",
-        detail: passed
-          ? `V1: initial tall P positivity (${m.pVal.toFixed(2)}) — RAH`
-          : `V1 RA initial P positivity weak`,
-      };
-    },
+  // ── Hyperkalemia ──────────────────────────────────────────────
+  hyperk: {
+    II: [
+      (m, ctx) => {
+        const peakedT = m.tAmplitudeMv >= 0.50;
+        const passed = peakedT;
+        return {
+          passed,
+          tag: passed ? 'Peaked T' : 'Check T',
+          detail: passed
+            ? `II: peaked T ${(m.tAmplitudeMv * 10).toFixed(1)} mm — hyperkalemia`
+            : `II: T=${m.tAmplitudeMv.toFixed(2)} mV (expected peaked ≥ 0.5 mV)`,
+        };
+      },
+    ],
+    V4: [
+      (m, ctx) => {
+        const peakedT = m.tAmplitudeMv >= 0.50;
+        const passed = peakedT;
+        return {
+          passed,
+          tag: passed ? 'Peaked T' : 'Check T',
+          detail: passed
+            ? `V4: peaked T ${m.tAmplitudeMv.toFixed(2)} mV`
+            : `V4: T=${m.tAmplitudeMv.toFixed(2)} mV`,
+        };
+      },
+    ],
   },
 
-  // ── LAFB ─────────────────────────────────────────────────────
+  // ── Hypokalemia ───────────────────────────────────────────────
+  hypokalemia: {
+    II: [
+      (m, ctx) => {
+        // Clinical hallmark: ST depression + (flat T or T-U fusion where
+        // the dominant late positive wave — usually a U — is small).
+        // We accept either a truly flat T (≤ 0.15 mV) OR a modest
+        // T-U complex amplitude (≤ 0.30 mV) provided ST is depressed.
+        const stDep = m.stElevationJ60Mv <= -0.05;
+        const flatOrFused = m.tAmplitudeMv <= 0.30;
+        const passed = stDep && flatOrFused;
+        return {
+          passed,
+          tag: passed ? 'Flat T + ST↓' : 'Check II',
+          detail: passed
+            ? `II: T/UT ${m.tAmplitudeMv.toFixed(2)} mV + ST depression — hypokalemia`
+            : `II: T=${m.tAmplitudeMv.toFixed(2)}, ST=${m.stElevationJ60Mv.toFixed(2)}`,
+        };
+      },
+    ],
+    V5: [
+      (m, ctx) => {
+        // V5 T or T-U complex should be small (T attenuated, U appears).
+        const passed = m.tAmplitudeMv <= 0.35;
+        return {
+          passed,
+          tag: passed ? 'Flat T/U' : 'Check V5',
+          detail: passed
+            ? `V5: T/UT ${m.tAmplitudeMv.toFixed(2)} mV — hypokalemia pattern`
+            : `V5: T=${m.tAmplitudeMv.toFixed(2)} mV`,
+        };
+      },
+    ],
+  },
+
+  // ── Hypothermia ───────────────────────────────────────────────
+  hypothermia: {
+    II: [
+      (m, ctx) => {
+        // Osborn J wave = ST elevation just after J point
+        const jWave = m.stElevationJ60Mv >= 0.05;
+        const passed = jWave;
+        return {
+          passed,
+          tag: passed ? 'Osborn' : 'Check J',
+          detail: passed
+            ? `II: Osborn J-wave present (ST ${(m.stElevationJ60Mv * 10).toFixed(1)} mm at J+60)`
+            : `II: ST=${m.stElevationJ60Mv.toFixed(2)} mV (expected J-wave elevation)`,
+        };
+      },
+    ],
+    V5: [
+      (m, ctx) => {
+        const jWave = m.stElevationJ60Mv >= 0.04;
+        const passed = jWave;
+        return {
+          passed,
+          tag: passed ? 'Osborn' : 'Check V5',
+          detail: passed
+            ? `V5: Osborn J-wave ${m.stElevationJ60Mv.toFixed(2)} mV`
+            : `V5: ST=${m.stElevationJ60Mv.toFixed(2)} mV`,
+        };
+      },
+    ],
+  },
+
+  // ── Posterior MI ──────────────────────────────────────────────
+  pwmi: {
+    V1: [
+      (m, ctx) => {
+        const stDep = m.stElevationJ60Mv <= -0.05;
+        const tallR = m.rAmplitudeMv >= 0.30;
+        const tPos = m.tAmplitudeMv >= POS_T_MV;
+        const passed = stDep && tallR && tPos;
+        return {
+          passed,
+          tag: passed ? 'ST↓ R↑ T↑' : 'Check V1',
+          detail: passed
+            ? `V1 PWMI mirror: ST↓ ${m.stElevationJ60Mv.toFixed(2)}, R ${m.rAmplitudeMv.toFixed(2)}, T+`
+            : `V1: ST=${m.stElevationJ60Mv.toFixed(2)}, R=${m.rAmplitudeMv.toFixed(2)}, T=${m.tAmplitudeMv.toFixed(2)}`,
+        };
+      },
+    ],
+    V2: [
+      (m, ctx) => {
+        const stDep = m.stElevationJ60Mv <= -0.05;
+        const passed = stDep;
+        return {
+          passed,
+          tag: passed ? 'ST↓' : 'Check V2',
+          detail: passed
+            ? `V2 PWMI: ST depression ${m.stElevationJ60Mv.toFixed(2)} mV`
+            : `V2: ST=${m.stElevationJ60Mv.toFixed(2)} mV`,
+        };
+      },
+    ],
+  },
+
+  // ── Pericarditis ──────────────────────────────────────────────
+  pericarditis: {
+    II: [
+      (m, ctx) => {
+        const stElev = m.stElevationJ60Mv >= 0.08;
+        const passed = stElev;
+        return {
+          passed,
+          tag: passed ? 'Diffuse ST↑' : 'Check II',
+          detail: passed
+            ? `II: diffuse ST elevation ${(m.stElevationJ60Mv * 10).toFixed(1)} mm — pericarditis`
+            : `II: ST=${m.stElevationJ60Mv.toFixed(2)} mV`,
+        };
+      },
+    ],
+    V5: [
+      (m, ctx) => {
+        const stElev = m.stElevationJ60Mv >= 0.08;
+        const passed = stElev;
+        return {
+          passed,
+          tag: passed ? 'ST↑' : 'Check V5',
+          detail: passed
+            ? `V5: ST elevation ${(m.stElevationJ60Mv * 10).toFixed(1)} mm`
+            : `V5: ST=${m.stElevationJ60Mv.toFixed(2)} mV`,
+        };
+      },
+    ],
+    aVR: [
+      (m, ctx) => {
+        // aVR should show reciprocal depression / PR elevation
+        const passed = m.stElevationJ60Mv <= 0.0;
+        return {
+          passed,
+          tag: passed ? 'Reciprocal' : 'Check aVR',
+          detail: passed
+            ? `aVR: reciprocal ST depression ${m.stElevationJ60Mv.toFixed(2)} mV`
+            : `aVR unexpected ST elevation in pericarditis`,
+        };
+      },
+    ],
+  },
+
+  // ── Digoxin ───────────────────────────────────────────────────
+  digoxin: {
+    I: [
+      (m, ctx) => {
+        const sagSt = m.stElevationJ60Mv <= -0.08;
+        const passed = sagSt;
+        return {
+          passed,
+          tag: passed ? 'Sag ST' : 'Check I',
+          detail: passed
+            ? `I: sagging ST depression — digoxin effect`
+            : `I: ST=${m.stElevationJ60Mv.toFixed(2)} mV`,
+        };
+      },
+    ],
+    V5: [
+      (m, ctx) => {
+        const sagSt = m.stElevationJ60Mv <= -0.08;
+        const passed = sagSt;
+        return {
+          passed,
+          tag: passed ? 'Sag ST' : 'Check V5',
+          detail: passed
+            ? `V5: sagging ST depression ${m.stElevationJ60Mv.toFixed(2)} mV`
+            : `V5: ST=${m.stElevationJ60Mv.toFixed(2)} mV`,
+        };
+      },
+    ],
+  },
+
+  // ── Wellens ───────────────────────────────────────────────────
+  wellens: {
+    V2: [
+      (m, ctx) => {
+        const deepTInv = m.tAmplitudeMv <= -0.20;
+        const passed = deepTInv;
+        return {
+          passed,
+          tag: passed ? 'T inv' : 'Check V2',
+          detail: passed
+            ? `V2: deep T inversion ${m.tAmplitudeMv.toFixed(2)} mV — Wellens`
+            : `V2: T=${m.tAmplitudeMv.toFixed(2)} mV (expected inversion)`,
+        };
+      },
+    ],
+    V3: [
+      (m, ctx) => {
+        const deepTInv = m.tAmplitudeMv <= -0.15;
+        const passed = deepTInv;
+        return {
+          passed,
+          tag: passed ? 'T inv' : 'Check V3',
+          detail: passed
+            ? `V3: T inversion ${m.tAmplitudeMv.toFixed(2)} mV`
+            : `V3: T=${m.tAmplitudeMv.toFixed(2)} mV`,
+        };
+      },
+    ],
+  },
+
+  // ── De Winter ─────────────────────────────────────────────────
+  dewinter: {
+    V2: [
+      (m, ctx) => {
+        const stDep = m.stElevationJ60Mv <= -0.08;
+        const tallT = m.tAmplitudeMv >= 0.30;
+        const passed = stDep && tallT;
+        return {
+          passed,
+          tag: passed ? 'ST↓ T↑' : 'Check V2',
+          detail: passed
+            ? `V2 De Winter: ST↓ + tall T ${m.tAmplitudeMv.toFixed(2)} mV`
+            : `V2: ST=${m.stElevationJ60Mv.toFixed(2)}, T=${m.tAmplitudeMv.toFixed(2)}`,
+        };
+      },
+    ],
+    V4: [
+      (m, ctx) => {
+        const tallT = m.tAmplitudeMv >= 0.30;
+        const passed = tallT;
+        return {
+          passed,
+          tag: passed ? 'T↑' : 'Check V4',
+          detail: passed
+            ? `V4: tall T ${m.tAmplitudeMv.toFixed(2)} mV`
+            : `V4: T=${m.tAmplitudeMv.toFixed(2)} mV`,
+        };
+      },
+    ],
+  },
+
+  // ── PE ────────────────────────────────────────────────────────
+  pe: {
+    I: [
+      (m, ctx) => {
+        const deepS = m.sAmplitudeMv <= -0.30;
+        const passed = deepS;
+        return {
+          passed,
+          tag: passed ? 'S1' : 'Check I',
+          detail: passed
+            ? `I: S wave (S1) ${m.sAmplitudeMv.toFixed(2)} mV — PE`
+            : `I: S=${m.sAmplitudeMv.toFixed(2)} mV`,
+        };
+      },
+    ],
+    III: [
+      (m, ctx) => {
+        // Q3 + T3
+        const qWave = m.sAmplitudeMv <= -0.10 && m.rAmplitudeMv <= 0.25;
+        const tInv = m.tAmplitudeMv <= -0.05;
+        const passed = qWave && tInv;
+        return {
+          passed,
+          tag: passed ? 'Q3 T3' : 'Check III',
+          detail: passed
+            ? `III: Q3T3 pattern — PE`
+            : `III: R=${m.rAmplitudeMv.toFixed(2)}, T=${m.tAmplitudeMv.toFixed(2)}`,
+        };
+      },
+    ],
+    V1: [
+      (m, ctx) => {
+        const tInv = m.tAmplitudeMv <= -0.05;
+        const passed = tInv;
+        return {
+          passed,
+          tag: passed ? 'T inv' : 'Check V1',
+          detail: passed
+            ? `V1: T inversion (RV strain) ${m.tAmplitudeMv.toFixed(2)} mV`
+            : `V1: T=${m.tAmplitudeMv.toFixed(2)} mV`,
+        };
+      },
+    ],
+  },
+
+  // ── LAFB ──────────────────────────────────────────────────────
   lafb: {
-    I: (m, i) => {
-      if (i < 0.2) return null;
-      // qR pattern in I — positive QRS
-      const passed = m.maxVal > TALL_R_THRESHOLD * 0.4 && m.maxVal > Math.abs(m.minVal);
-      return {
-        passed,
-        tag: passed ? "qR" : "Check I",
-        detail: passed
-          ? `Lead I: qR pattern (R=${m.maxVal.toFixed(2)}) — LAFB left-axis`
-          : `LAFB qR in I not clear (R=${m.maxVal.toFixed(2)}, S=${m.minVal.toFixed(2)})`,
-      };
-    },
-    II: (m, i) => {
-      if (i < 0.2) return null;
-      // rS pattern in II — deep S, small r
-      const passed = m.minVal < DEEP_S_THRESHOLD * 0.4 && Math.abs(m.minVal) > m.maxVal;
-      return {
-        passed,
-        tag: passed ? "rS" : "Check II",
-        detail: passed
-          ? `Lead II: rS pattern (S=${m.minVal.toFixed(2)}) — LAFB inferior axis`
-          : `LAFB rS in II not confirmed (R=${m.maxVal.toFixed(2)}, S=${m.minVal.toFixed(2)})`,
-      };
-    },
+    I: [
+      (m, ctx) => {
+        const qR = m.rAmplitudeMv >= 0.50 && m.rAmplitudeMv > Math.abs(m.sAmplitudeMv);
+        const passed = qR;
+        return {
+          passed,
+          tag: passed ? 'qR' : 'Check I',
+          detail: passed
+            ? `I LAFB: qR pattern R=${m.rAmplitudeMv.toFixed(2)} — left axis`
+            : `I: R=${m.rAmplitudeMv.toFixed(2)}, S=${m.sAmplitudeMv.toFixed(2)}`,
+        };
+      },
+    ],
+    II: [
+      (m, ctx) => {
+        const rS = Math.abs(m.sAmplitudeMv) >= 0.30 && Math.abs(m.sAmplitudeMv) > m.rAmplitudeMv;
+        const passed = rS;
+        return {
+          passed,
+          tag: passed ? 'rS' : 'Check II',
+          detail: passed
+            ? `II LAFB: rS pattern S=${m.sAmplitudeMv.toFixed(2)} — left axis`
+            : `II: R=${m.rAmplitudeMv.toFixed(2)}, S=${m.sAmplitudeMv.toFixed(2)}`,
+        };
+      },
+    ],
   },
 
-  // ── LPFB ─────────────────────────────────────────────────────
+  // ── LPFB ──────────────────────────────────────────────────────
   lpfb: {
-    I: (m, i) => {
-      if (i < 0.2) return null;
-      // rS in I — right axis tendency
-      const passed = m.minVal < DEEP_S_THRESHOLD * 0.4 && Math.abs(m.minVal) > m.maxVal;
-      return {
-        passed,
-        tag: passed ? "rS" : "Check I",
-        detail: passed
-          ? `Lead I: rS (right axis) — LPFB pattern (S=${m.minVal.toFixed(2)})`
-          : `LPFB rS in I not expressed`,
-      };
-    },
-    II: (m, i) => {
-      if (i < 0.2) return null;
-      // qR in II — positive QRS
-      const passed = m.maxVal > TALL_R_THRESHOLD * 0.4 && m.maxVal > Math.abs(m.minVal);
-      return {
-        passed,
-        tag: passed ? "qR" : "Check II",
-        detail: passed
-          ? `Lead II: qR — LPFB inferior axis pattern (R=${m.maxVal.toFixed(2)})`
-          : `LPFB qR in II not confirmed`,
-      };
-    },
+    I: [
+      (m, ctx) => {
+        const rS = Math.abs(m.sAmplitudeMv) >= 0.30 && Math.abs(m.sAmplitudeMv) > m.rAmplitudeMv;
+        const passed = rS;
+        return {
+          passed,
+          tag: passed ? 'rS' : 'Check I',
+          detail: passed
+            ? `I LPFB: rS — right axis pattern`
+            : `I: R=${m.rAmplitudeMv.toFixed(2)}, S=${m.sAmplitudeMv.toFixed(2)}`,
+        };
+      },
+    ],
+    II: [
+      (m, ctx) => {
+        const qR = m.rAmplitudeMv >= 0.50 && m.rAmplitudeMv > Math.abs(m.sAmplitudeMv);
+        const passed = qR;
+        return {
+          passed,
+          tag: passed ? 'qR' : 'Check II',
+          detail: passed
+            ? `II LPFB: qR — right axis pattern`
+            : `II: R=${m.rAmplitudeMv.toFixed(2)}, S=${m.sAmplitudeMv.toFixed(2)}`,
+        };
+      },
+    ],
+  },
+
+  // ── LAH (P mitrale) ───────────────────────────────────────────
+  lah: {
+    II: [
+      (m, ctx) => {
+        const passed = m.pDurationMs >= 110;   // broad notched P ≥ 110 ms
+        return {
+          passed,
+          tag: passed ? 'Broad P' : 'Check P',
+          detail: passed
+            ? `II: broad notched P ${m.pDurationMs} ms (P mitrale)`
+            : `II: P duration ${m.pDurationMs} ms (expected ≥ 110 ms)`,
+        };
+      },
+    ],
+  },
+
+  // ── RAH (P pulmonale) ─────────────────────────────────────────
+  rah: {
+    II: [
+      (m, ctx) => {
+        const passed = m.pAmplitudeMv >= 0.25;  // tall peaked P ≥ 2.5 mm
+        return {
+          passed,
+          tag: passed ? 'Tall P' : 'Check P',
+          detail: passed
+            ? `II: tall peaked P ${(m.pAmplitudeMv * 10).toFixed(1)} mm (P pulmonale)`
+            : `II: P amplitude ${m.pAmplitudeMv.toFixed(2)} mV (expected ≥ 0.25)`,
+        };
+      },
+    ],
+  },
+
+  // ── AVB 1° ────────────────────────────────────────────────────
+  avb1: {
+    II: [
+      (m, ctx) => {
+        const passed = m.prIntervalMs >= 200;
+        return {
+          passed,
+          tag: passed ? 'PR↑' : 'Check PR',
+          detail: passed
+            ? `II: PR ${m.prIntervalMs} ms (≥ 200 ms — 1° AVB)`
+            : `II: PR ${m.prIntervalMs} ms (expected ≥ 200 ms)`,
+        };
+      },
+    ],
+  },
+
+  // ── NSR (sanity check) ────────────────────────────────────────
+  nsr: {
+    II: [
+      (m, ctx) => {
+        const normalPr = m.prIntervalMs >= 110 && m.prIntervalMs <= 200;
+        const normalQrs = m.qrsDurationMs <= 110;
+        const passed = normalPr && normalQrs && m.rAmplitudeMv > 0.3;
+        return {
+          passed,
+          tag: passed ? 'Normal' : 'Check II',
+          detail: passed
+            ? `II NSR: PR ${m.prIntervalMs} ms, QRS ${m.qrsDurationMs} ms — within normal limits`
+            : `II: PR=${m.prIntervalMs} ms, QRS=${m.qrsDurationMs} ms`,
+        };
+      },
+    ],
+  },
+
+  // ── Early repolarization ──────────────────────────────────────
+  earlyrepo: {
+    V5: [
+      (m, ctx) => {
+        const stElev = m.stElevationJ60Mv >= 0.05;
+        const passed = stElev;
+        return {
+          passed,
+          tag: passed ? 'J-point↑' : 'Check V5',
+          detail: passed
+            ? `V5: concave ST elevation — early repolarization`
+            : `V5: ST=${m.stElevationJ60Mv.toFixed(2)} mV`,
+        };
+      },
+    ],
+  },
+
+  // ── AVB 3° (complete) ─────────────────────────────────────────
+  avb3: {
+    V5: [
+      requireWideQrs,
+    ],
+  },
+
+  // ── VT ────────────────────────────────────────────────────────
+  vtach: {
+    V5: [
+      (m, ctx) => {
+        const passed = m.qrsDurationMs >= 140;
+        return {
+          passed,
+          tag: passed ? 'Wide QRS' : 'Check QRS',
+          detail: passed
+            ? `V5 VT: QRS ${m.qrsDurationMs} ms (≥ 140 ms — wide complex)`
+            : `V5: QRS ${m.qrsDurationMs} ms (expected ≥ 140 ms)`,
+        };
+      },
+    ],
+  },
+
+  // ── PVC ───────────────────────────────────────────────────────
+  pvc: {
+    V5: [
+      (m, ctx) => {
+        const passed = m.qrsDurationMs >= 120;
+        return {
+          passed,
+          tag: passed ? 'Wide ectopic' : 'Check QRS',
+          detail: passed
+            ? `V5 PVC: QRS ${m.qrsDurationMs} ms (wide ectopic)`
+            : `V5: QRS ${m.qrsDurationMs} ms`,
+        };
+      },
+    ],
+  },
+
+  // ── BVE ───────────────────────────────────────────────────────
+  bve: {
+    V5: [
+      (m, ctx) => {
+        const passed = m.rAmplitudeMv >= 1.50;
+        return {
+          passed,
+          tag: passed ? 'HV' : 'Check V5',
+          detail: passed
+            ? `V5 BVE: high voltage R=${m.rAmplitudeMv.toFixed(2)} mV`
+            : `V5: R=${m.rAmplitudeMv.toFixed(2)} mV`,
+        };
+      },
+    ],
+    V1: [
+      (m, ctx) => {
+        const passed = m.rAmplitudeMv >= 0.50;
+        return {
+          passed,
+          tag: passed ? 'Dom R' : 'Check V1',
+          detail: passed
+            ? `V1 BVE: dominant R=${m.rAmplitudeMv.toFixed(2)} mV`
+            : `V1: R=${m.rAmplitudeMv.toFixed(2)} mV`,
+        };
+      },
+    ],
   },
 };
 
-// ── Build STEMI rules dynamically ────────────────────────────────────────────
+// ─── STEMI rules (built dynamically) ────────────────────────────
 
 const STEMI_CULPRIT_MAP: Record<string, string[]> = {
-  stemi_ant:    ['V1','V2','V3','V4'],
-  stemi_inf:    ['II','III','aVF'],
-  stemi_lat:    ['I','aVL','V5','V6'],
-  stemi_antlat: ['V1','V2','V3','V4','V5','V6','I','aVL'],
-  stemi_inflat: ['II','III','aVF','V5','V6'],
-  stemi_rv:     ['V1'],
+  stemi_ant:    ['V1', 'V2', 'V3', 'V4'],
+  stemi_inf:    ['II', 'III', 'aVF'],
+  stemi_lat:    ['I', 'aVL', 'V5', 'V6'],
+  stemi_antlat: ['V1', 'V2', 'V3', 'V4', 'V5', 'V6', 'I', 'aVL'],
+  stemi_inflat: ['II', 'III', 'aVF', 'V5', 'V6'],
+  stemi_rv:     ['V1', 'V2'],
 };
-
 const STEMI_RECIPROCAL_MAP: Record<string, string[]> = {
-  stemi_ant:    ['II','III','aVF'],
-  stemi_inf:    ['I','aVL'],
-  stemi_lat:    ['V1','V2','V3'],
-  stemi_antlat: ['II','III','aVF'],
-  stemi_inflat: ['I','aVL'],
-  stemi_rv:     ['I','aVL','V5','V6'],
+  stemi_ant:    ['II', 'III', 'aVF'],
+  stemi_inf:    ['I', 'aVL'],
+  stemi_lat:    ['II', 'III', 'aVF'],
+  stemi_antlat: ['II', 'III', 'aVF'],
+  stemi_inflat: ['I', 'aVL'],
+  stemi_rv:     ['I', 'aVL', 'V5', 'V6'],
 };
 
-function buildStemiRules(rhythmId: string): RhythmLeadRules {
+function buildStemiRules(rhythmId: string): LeadRuleMap {
   const culprits = STEMI_CULPRIT_MAP[rhythmId] || [];
   const reciprocals = STEMI_RECIPROCAL_MAP[rhythmId] || [];
-  const rules: RhythmLeadRules = {};
-
+  const rules: LeadRuleMap = {};
   for (const lead of culprits) {
-    rules[lead] = (m, i) => {
-      if (i < 0.2) return null;
-      return stElevCheck(m);
-    };
+    rules[lead] = [
+      (m, ctx) => {
+        // Hyperacute stage: tall peaked T (≥ 0.45 mV), subtle ST.
+        // Use <= so intensity=0.30 falls in hyperacute (not acute).
+        if (ctx.intensity <= 0.30) {
+          const passed = m.tAmplitudeMv >= 0.45;
+          return {
+            passed,
+            tag: passed ? 'Hyperacute T' : 'Check T',
+            detail: passed
+              ? `${lead}: hyperacute T ${(m.tAmplitudeMv * 10).toFixed(1)} mm`
+              : `${lead}: T=${m.tAmplitudeMv.toFixed(2)} mV (expected hyperacute ≥ 0.45)`,
+          };
+        }
+        // Evolved stage: pathologic Q + T inversion.
+        if (ctx.intensity > 0.70) {
+          // Pathologic Q: net negative QRS (dominant S/QS over R) OR
+          // a deep S-wave consistent with Q in this lead.
+          const qPresent = m.sAmplitudeMv <= -0.20 && m.rAmplitudeMv <= 0.40;
+          const tInv = m.tAmplitudeMv <= -0.15;
+          const passed = qPresent && tInv;
+          return {
+            passed,
+            tag: passed ? 'Q + T inv' : 'Check evolved',
+            detail: passed
+              ? `${lead}: pathologic Q + T inversion — evolved MI`
+              : `${lead}: R=${m.rAmplitudeMv.toFixed(2)}, S=${m.sAmplitudeMv.toFixed(2)}, T=${m.tAmplitudeMv.toFixed(2)} (expect Q + T-)`,
+          };
+        }
+        // Acute / tombstone: ST elevation.
+        return requireStElev(m, ctx);
+      },
+    ];
   }
   for (const lead of reciprocals) {
-    rules[lead] = (m, i) => {
-      if (i < 0.35) return null;
-      return stDepCheck(m);
-    };
+    rules[lead] = [
+      (m, ctx) => {
+        // Hyperacute: reciprocal change subtle — skip.
+        if (ctx.intensity <= 0.30) return null;
+        // Evolved: reciprocal ST normalizes — skip.
+        if (ctx.intensity > 0.70) return null;
+        return requireStDep(m, ctx);
+      },
+    ];
   }
   return rules;
 }
 
-// Inject STEMI rules
 for (const rhythmId of Object.keys(STEMI_CULPRIT_MAP)) {
-  RHYTHM_LEAD_RULES[rhythmId] = buildStemiRules(rhythmId);
+  RHYTHM_RULES[rhythmId] = buildStemiRules(rhythmId);
 }
 
-// ── Main Validation Entry Point ───────────────────────────────────────────────
+// ─── Main entry point ───────────────────────────────────────────
 
 export function validateRhythmAllLeads(
   rhythmId: string,
   intensity: number
 ): LeadValidationSummary {
-  const rules = RHYTHM_LEAD_RULES[rhythmId];
+  const rules = RHYTHM_RULES[rhythmId];
   if (!rules) {
-    // Rhythm has no lead-specific rules — return a neutral summary
+    // No lead-specific rules — neutral pass.
     return {
       allPassed: true,
       checkedLeads: 0,
@@ -943,50 +1064,93 @@ export function validateRhythmAllLeads(
       results: LEADS.map((lead) => ({
         lead,
         passed: true,
-        tag: "—",
-        detail: "No lead-specific clinical rules defined for this rhythm.",
+        tag: '—',
+        detail: 'No lead-specific criteria defined for this rhythm.',
       })),
     };
   }
 
-  const config = INTENSITY_STAGES[rhythmId];
-  const bpm = config?.hrMod ? Math.max(20, Math.round(config.hrMod(intensity))) : (rhythmRates[rhythmId] || 72);
-  const clampedBpm = Math.max(20, Math.min(240, bpm));
+  // Measure all leads once for cross-lead criteria.
+  const allMeasurements: Record<string, CycleMeasurement> = {};
+  for (const lead of LEADS) {
+    allMeasurements[lead] = measureLead(rhythmId, lead, intensity);
+  }
+
+  const ctxAll = () => allMeasurements;
 
   const results: LeadValidationResult[] = LEADS.map((lead) => {
-    const rule = rules[lead];
-    if (!rule) {
-      return {
-        lead,
-        passed: true,
-        tag: "—",
-        detail: "No specific expectation defined for this lead.",
-      };
+    const leadRules = rules[lead];
+    if (!leadRules || leadRules.length === 0) {
+      return { lead, passed: true, tag: '—', detail: 'No specific criterion for this lead.' };
     }
+    const m = allMeasurements[lead];
+    const ctx: Ctx = { rhythmId, intensity, lead, all: ctxAll };
 
-    const metrics = sampleWaveformMetrics(rhythmId, lead, intensity, clampedBpm);
-    const result = rule(metrics, intensity);
-
-    if (result === null) {
-      // Rule returned null → intensity not high enough to check, skip
-      return {
-        lead,
-        passed: true,
-        tag: "—",
-        detail: "Check deferred — intensity below threshold for this criterion.",
-      };
+    // Run all rules for this lead; report the first failure (or first pass if all pass).
+    for (const rule of leadRules) {
+      const r = rule(m, ctx);
+      if (r === null) {
+        // Deferred — intensity too low; skip with neutral tag.
+        return { lead, passed: true, tag: '—', detail: 'Intensity below criterion threshold.' };
+      }
+      if (!r.passed) {
+        return { lead, passed: false, tag: r.tag, detail: r.detail };
+      }
+      // All rules pass — record the first tag.
+      return { lead, passed: true, tag: r.tag, detail: r.detail };
     }
-
-    return { lead, ...result };
+    return { lead, passed: true, tag: '—', detail: 'No criterion evaluated.' };
   });
 
-  const checkedResults = results.filter((r) => r.tag !== "—");
-  const passedResults  = checkedResults.filter((r) => r.passed);
+  const checkedResults = results.filter((r) => r.tag !== '—');
+  const passedResults = checkedResults.filter((r) => r.passed);
 
   return {
     allPassed: checkedResults.every((r) => r.passed),
     checkedLeads: checkedResults.length,
-    passedLeads:  passedResults.length,
+    passedLeads: passedResults.length,
     results,
   };
 }
+
+// ─── Aggregate harness: all rhythms × representative intensities ─
+
+export interface RhythmHarnessResult {
+  rhythmId: string;
+  intensities: { intensity: number; allPassed: boolean; failedLeads: string[]; details: string[] }[];
+  overallPassed: boolean;
+}
+
+/**
+ * Run the validator across every rhythm at multiple intensities.
+ * Used by scripts/validate-ecg.mjs as the completion gate.
+ */
+export function runFullValidationHarness(intensities: number[] = [0.3, 0.5, 0.75]): RhythmHarnessResult[] {
+  // Validate only rhythms that have rules (others auto-pass).
+  const rhythmIds = Object.keys(RHYTHM_RULES);
+  const results: RhythmHarnessResult[] = [];
+  for (const rhythmId of rhythmIds) {
+    const perIntensity = intensities.map((intensity) => {
+      const summary = validateRhythmAllLeads(rhythmId, intensity);
+      const failedLeads = summary.results
+        .filter((r) => !r.passed && r.tag !== '—')
+        .map((r) => r.lead);
+      return {
+        intensity,
+        allPassed: summary.allPassed,
+        failedLeads,
+        details: summary.results
+          .filter((r) => !r.passed && r.tag !== '—')
+          .map((r) => `${r.lead}: ${r.detail}`),
+      };
+    });
+    results.push({
+      rhythmId,
+      intensities: perIntensity,
+      overallPassed: perIntensity.every((p) => p.allPassed),
+    });
+  }
+  return results;
+}
+
+export { computeFrontalAxis, netQrsArea, resampleToMsPerSample };

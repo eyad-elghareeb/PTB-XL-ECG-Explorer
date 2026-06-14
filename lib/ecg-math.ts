@@ -1,555 +1,366 @@
+// ════════════════════════════════════════════════════════════════
+// ecg-math.ts — Beat sequencer + rendering fast-path
+//
+// Public API (preserved exactly for app/page.tsx):
+//   - getWaveformForBeatIndex(phase, lead, beatIndex, rhythm, intensity, bpm,
+//                            amplitude, noise, realistic, manualMode, waveParams): number
+//   - buildAllLeadLUTs(rhythm, lead, intensity, amplitude, bpm, manualMode, waveParams): void
+//   - sampleLeadLUT(lead, phase, rhythm, intensity, bpm, manualMode, waveParams): number
+//   - addTraceNoise(val, phase, timeSeed, noiseLevelPct, realistic, bpm): number
+//
+// Internally this is a thin layer over:
+//   - lib/ecg-model.ts      (segment primitives, baseline)
+//   - lib/ecg-pathologies.ts(per-lead templates per rhythm)
+// ════════════════════════════════════════════════════════════════
+
 import {
-  LEADS,
-  NK_GAMMA,
-  LEAD_TARGET_AMPLITUDE,
-  BASELINE_TI,
-  BASELINE_AI,
-  BASELINE_BI,
-  WAVEFORM_LUT_SIZE,
-  ODE_DAMPING,
-  DEPENDENT_LEADS
-} from "./ecg-rhythms";
+  WaveSegment, renderCycle, composeBeat, applyOverrides,
+  baselineSegments, INDEPENDENT_LEADS, DEPENDENT_LEAD_FORMULAS,
+  pWave, qWave, rWave, sWave, tWave, uWave, jWave, stShift, deltaWave,
+  WAVE_ANCHORS_MS as A, NORMAL_INTERVALS_MS as NI,
+} from './ecg-model';
+import { getTemplate } from './ecg-pathologies';
+import {
+  LEADS, BEAT_AWARE_RHYTHMS, LEAD_TARGET_AMPLITUDE,
+} from './ecg-rhythms';
 
-// Global cache for computed cycle waveforms
-const cycleCache: Record<string, Float32Array> = {};
-const leadLUTs: Record<string, Float32Array> = {};
-let leadLUTCacheKey: string = '';
+// ─── Cycle cache ────────────────────────────────────────────────
+// Rendered one-beat Float32Array per (rhythm, lead, intensity, bpm).
 
-// Laplace distribution sampler (exact inverse CDF method)
-export function randomLaplace(loc: number = 0, scale: number = 1): number {
-  const u = Math.random() - 0.5;
-  return loc - scale * Math.sign(u) * Math.log(1 - 2 * Math.abs(u));
+const cycleCache = new Map<string, Float32Array>();
+const CYCLE_SAMPLE_RATE = 500; // Hz
+
+function getCycle(rhythm: string, lead: string, intensity: number, bpm: number): Float32Array {
+  const key = `${rhythm}|${lead}|${intensity.toFixed(4)}|${bpm}`;
+  const cached = cycleCache.get(key);
+  if (cached) return cached;
+
+  const rrMs = 60000 / Math.max(1, bpm);
+  const overrides = getTemplate(rhythm)(intensity);
+  const segments = applyOverrides(lead, overrides);
+  const cycle = renderCycle(segments, rrMs, CYCLE_SAMPLE_RATE);
+  // Cap the cache to avoid unbounded growth in long sessions.
+  if (cycleCache.size > 4096) cycleCache.clear();
+  cycleCache.set(key, cycle);
+  return cycle;
 }
 
-// RK4 ODE Integration Solver for McSharry ECGSYN Model
-export function solveECGSYN(
-  ti: number[],
-  ai: number[],
-  bi: number[],
+/** Clear the cycle cache (used when settings change aggressively). */
+export function clearCycleCache(): void {
+  cycleCache.clear();
+}
+
+// ─── Sample an independent lead at fractional phase ─────────────
+
+function sampleIndependent(rhythm: string, lead: string, intensity: number, bpm: number, phase: number): number {
+  const cycle = getCycle(rhythm, lead, intensity, bpm);
+  const N = cycle.length;
+  const idxFloat = ((phase % 1) + 1) % 1 * N;
+  const i0 = Math.floor(idxFloat) % N;
+  const i1 = (i0 + 1) % N;
+  const frac = idxFloat - Math.floor(idxFloat);
+  return cycle[i0] * (1 - frac) + cycle[i1] * frac;
+}
+
+function sampleDependent(
+  rhythm: string,
+  depLead: string,
+  intensity: number,
   bpm: number,
-  targetAmplitude: number = 1.6,
-  samplingRate: number = 512
-): Float32Array {
-  const T = 60 / Math.max(1, bpm);
-  const N = Math.max(128, Math.round(T * samplingRate));
-  const dt = T / N;
-  const omega = (2 * Math.PI) / T;
-
-  const M = 2 * N; // Solve for two cycles to eliminate transients
-  const output = new Float32Array(N);
-  let z = 0.04; // safe initial condition
-
-  // Derivative evaluator
-  function getDzDt(theta: number, zVal: number) {
-    let sum = 0;
-    for (let i = 0; i < ti.length; i++) {
-      let dti = theta - ti[i];
-      dti = dti - Math.round(dti / (2 * Math.PI)) * (2 * Math.PI);
-      sum += (ai[i] / (bi[i] * bi[i])) * dti * Math.exp(-0.5 * Math.pow(dti / bi[i], 2));
-    }
-    return -sum - ODE_DAMPING * zVal;
-  }
-
-  // RK4 Integration Loop
-  const dtheta = dt * omega;
-  for (let j = 0; j < M; j++) {
-    const t = j * dt;
-    const theta = -Math.PI + omega * t;
-
-    const k1 = getDzDt(theta, z);
-    const k2 = getDzDt(theta + 0.5 * dtheta, z + 0.5 * dtheta * k1);
-    const k3 = getDzDt(theta + 0.5 * dtheta, z + 0.5 * dtheta * k2);
-    const k4 = getDzDt(theta + dtheta, z + dtheta * k3);
-    z = z + (dtheta / 6) * (k1 + 2 * k2 + 2 * k3 + k4);
-
-    if (j >= N) {
-      output[j - N] = z;
-    }
-  }
-
-  // Baseline-preserving normalization: TP segment maps to 0 mV
-  const isoStart = Math.floor(N * 0.05);
-  const isoEnd = Math.floor(N * 0.15);
-  let baseline = 0;
-  for (let i = isoStart; i < isoEnd; i++) {
-    baseline += output[i];
-  }
-  baseline /= (isoEnd - isoStart);
-
-  for (let i = 0; i < N; i++) {
-    output[i] -= baseline;
-  }
-
-  let zmin = output[0];
-  let zmax = output[0];
-  for (let i = 1; i < N; i++) {
-    if (output[i] < zmin) zmin = output[i];
-    if (output[i] > zmax) zmax = output[i];
-  }
-  const zrange = zmax - zmin;
-
-  if (zrange > 0.1) {
-    const scale = targetAmplitude / zrange;
-    for (let i = 0; i < N; i++) {
-      output[i] *= scale;
-    }
-  } else {
-    for (let i = 0; i < N; i++) {
-      output[i] = 0.0;
-    }
-  }
-
-  return output;
+  phase: number,
+  beatIndex: number
+): number {
+  const fn = DEPENDENT_LEAD_FORMULAS[depLead];
+  if (!fn) return 0;
+  const vI  = sampleBeatSequenced(rhythm, 'I',  intensity, bpm, phase, beatIndex);
+  const vII = sampleBeatSequenced(rhythm, 'II', intensity, bpm, phase, beatIndex);
+  return fn(vI, vII);
 }
 
-// Build precomputed Look Up Tables (LUT) for independent leads
-export function buildAllLeadLUTs(
+// ─── Beat sequencer ─────────────────────────────────────────────
+// Handles rhythms whose morphology depends on which beat in a group
+// we're on (afib fibrillation, flutter sawtooth, AV block cycles,
+// PVC trigeminy, VT, VFib, asystole, PEA).
+
+function sampleBeatSequenced(
   rhythm: string,
   lead: string,
   intensity: number,
+  bpm: number,
+  phase: number,
+  beatIndex: number
+): number {
+  // VFib / asystole / PEA: direct noise synthesis.
+  if (rhythm === 'vfib')     return vfibValue(intensity, phase, beatIndex, lead);
+  if (rhythm === 'asystole') return asystoleValue(intensity, phase, beatIndex, lead);
+  if (rhythm === 'pea')      return peaValue(intensity, phase, beatIndex, lead);
+
+  // Atrial fibrillation: NSR QRS + fibrillatory baseline, no P.
+  if (rhythm === 'afib') {
+    const qrs = sampleIndependent('afib', lead, intensity, bpm, phase);
+    const fib = afibBaseline(intensity, phase, beatIndex, lead);
+    return qrs + fib;
+  }
+
+  // Atrial flutter: NSR QRS + sawtooth at flutter rate.
+  if (rhythm === 'aflutter') {
+    const qrs = sampleIndependent('aflutter', lead, intensity, bpm, phase);
+    const saw = flutterSawtooth(intensity, phase, bpm);
+    const leadAmp = LEAD_TARGET_AMPLITUDE[lead] || 1.6;
+    return qrs + saw * (leadAmp / 1.6);
+  }
+
+  // AV Block 2° Mobitz I (Wenckebach): progressive PR lengthening,
+  // then a P-only beat (no QRS).
+  if (rhythm === 'avb2mob1') {
+    const cycleLen = intensity > 0.55 ? 3 : intensity > 0.25 ? 4 : 5;
+    const idxInCycle = beatIndex % cycleLen;
+    const isDropped = idxInCycle === cycleLen - 1;
+    if (isDropped) {
+      // P wave only — phase 0..0.2 maps to P region; rest flat.
+      return pOnlyValue(lead, bpm, phase, intensity, beatIndex, idxInCycle);
+    }
+    // Progressive PR prolongation: each beat in cycle has longer PR.
+    const prExtra = (60 + 40 * intensity) * idxInCycle;
+    const shiftedPhase = shiftPhaseForPR(phase, prExtra, bpm);
+    return sampleIndependent('avb1', lead, intensity, bpm, shiftedPhase);
+  }
+
+  // AV Block 2° Mobitz II: constant PR, sudden dropped QRS, wide QRS.
+  if (rhythm === 'avb2mob2') {
+    const cycleLen = intensity > 0.55 ? 2 : intensity > 0.25 ? 3 : 4;
+    const isDropped = beatIndex % cycleLen === cycleLen - 1;
+    if (isDropped) return pOnlyValue(lead, bpm, phase, intensity, beatIndex, 0);
+    return sampleIndependent('avb2mob2', lead, intensity, bpm, phase);
+  }
+
+  // AV Block 3° (complete): independent atrial P's + ventricular escape.
+  if (rhythm === 'avb3') {
+    const ventRate = Math.max(18, bpm);
+    const atrialRate = 70 + 20 * intensity;
+    const tAbs = (beatIndex + phase) * (60000 / ventRate);
+    const phaseAtrial = ((tAbs / 60000) * atrialRate) % 1;
+    const pVal = sampleIndependent('avb3', lead, intensity, atrialRate, phaseAtrial);
+    const pOnly = phaseAtrial < 0.18 ? pVal : 0;
+    const vVal = sampleIndependent('avb3', lead, intensity, ventRate, phase);
+    const qrst = phase < 0.18 ? 0 : vVal;
+    return pOnly + qrst;
+  }
+
+  // PVC trigeminy: every 3rd beat is a wide ectopic.
+  if (rhythm === 'pvc') {
+    if (beatIndex % 3 === 2) {
+      return sampleIndependent('pvc', lead, intensity, bpm, phase);
+    }
+    return sampleIndependent('nsr', lead, 0, bpm, phase);
+  }
+
+  // Default: render the rhythm's template directly.
+  return sampleIndependent(rhythm, lead, intensity, bpm, phase);
+}
+
+// ─── Beat-sequencer helpers ─────────────────────────────────────
+
+function afibBaseline(intensity: number, phase: number, beatIndex: number, lead: string): number {
+  const baseNoise = 0.04 + 0.14 * intensity;
+  const t = (beatIndex + phase) * (60 / 95);
+  const fib = baseNoise * (
+    Math.sin(t * 137.5) +
+    0.7 * Math.sin(t * 89.3) +
+    0.5 * Math.sin(t * 197.1 + 0.4) +
+    0.3 * Math.sin(t * 251.7 + 1.2)
+  );
+  const leadAmp = LEAD_TARGET_AMPLITUDE[lead] || 1.6;
+  return fib * (leadAmp / 1.6);
+}
+
+function flutterSawtooth(intensity: number, phase: number, bpm: number): number {
+  const flAmp = 0.10 + 0.15 * intensity;
+  const flutterRate = 300 + 30 * intensity;
+  const t = phase * (60 / bpm);
+  const flutterPhase = (t * flutterRate / 60) % 1;
+  const saw = 2 * flutterPhase - 1;
+  return -flAmp * (saw + 0.25 * Math.sin(2 * Math.PI * flutterPhase));
+}
+
+function pOnlyValue(lead: string, bpm: number, phase: number, intensity: number, beatIndex: number, cycleIdx: number): number {
+  // For dropped-beat phases in AV blocks, render an isolated P wave.
+  if (phase > 0.30) return 0;
+  const rrMs = 60000 / Math.max(1, bpm);
+  const cycle = getCycle('nsr', lead, 0, bpm);
+  // P region sits in the first ~18% of cycle; map phase 0..0.25 → 0..0.20.
+  const N = cycle.length;
+  const pFraction = Math.min(0.20, phase / 0.25 * 0.20);
+  const idxFloat = pFraction * N;
+  const i0 = Math.floor(idxFloat) % N;
+  const i1 = (i0 + 1) % N;
+  const frac = idxFloat - Math.floor(idxFloat);
+  return cycle[i0] * (1 - frac) + cycle[i1] * frac;
+}
+
+function shiftPhaseForPR(phase: number, extraPrMs: number, bpm: number): number {
+  // Each ms of extra PR shifts the beat later by that fraction of cycle.
+  const cycleMs = 60000 / Math.max(1, bpm);
+  const shift = extraPrMs / cycleMs;
+  return ((phase - shift) % 1 + 1) % 1;
+}
+
+function vfibValue(intensity: number, phase: number, beatIndex: number, _lead: string): number {
+  const t = (beatIndex + phase) * (60 / 72);
+  const amp = 0.5 - 0.35 * intensity;
+  const f1 = 45 + 30 * intensity;
+  const f2 = 73 + 25 * intensity;
+  const f3 = 127 - 20 * intensity;
+  return amp * (
+    Math.sin(t * f1) +
+    0.8 * Math.sin(t * f2) +
+    0.6 * Math.sin(t * f3) +
+    0.4 * Math.sin(t * 199.9 + 1.1)
+  );
+}
+
+function asystoleValue(intensity: number, phase: number, beatIndex: number, _lead: string): number {
+  const t = (beatIndex + phase) * (60 / 60);
+  return intensity * (0.005 * Math.sin(t * 23.0) + 0.003 * Math.sin(t * 67.0));
+}
+
+function peaValue(intensity: number, phase: number, beatIndex: number, _lead: string): number {
+  // Low-amplitude organized QRS complexes.
+  const base = sampleIndependent('pea', 'II', intensity, 35, phase);
+  const t = (beatIndex + phase) * (60 / 35);
+  return base * (1 - 0.3 * intensity) + 0.02 * Math.sin(t * 11);
+}
+
+// ─── Public: per-beat sample (drop-in for page.tsx) ─────────────
+
+export function getWaveformForBeatIndex(
+  phase: number,
+  lead: string,
+  beatIndex: number,
+  rhythm: string,
+  intensity: number,
+  bpm: number,
   amplitude: number,
+  noise: number,
+  realistic: boolean,
+  manualMode: boolean,
+  waveParams: any
+): number {
+  let val: number;
+
+  if (manualMode) {
+    val = ecgManualWaveform(phase, bpm, waveParams);
+  } else if (DEPENDENT_LEAD_FORMULAS[lead]) {
+    val = sampleDependent(rhythm, lead, intensity, bpm, phase, beatIndex);
+  } else {
+    val = sampleBeatSequenced(rhythm, lead, intensity, bpm, phase, beatIndex);
+  }
+
+  if (!manualMode) {
+    val *= amplitude;
+  }
+
+  return addTraceNoise(val, phase, beatIndex, noise, realistic, bpm);
+}
+
+// ─── LUT fast-path (used by page.tsx for non-beat-aware rhythms) ─
+
+const leadLUTs: Record<string, Float32Array> = {};
+let leadLUTCacheKey = '';
+const LUT_SIZE = 2048;
+
+export function buildAllLeadLUTs(
+  rhythm: string,
+  _lead: string,
+  intensity: number,
+  _amplitude: number,
   bpm: number,
   manualMode: boolean,
   waveParams: any
-) {
-  const cacheKey = [
-    rhythm,
-    lead,
-    intensity.toFixed(4),
-    amplitude.toFixed(4),
-    manualMode ? 'manual' : 'auto',
-    JSON.stringify(waveParams)
-  ].join('|');
-  
+): void {
+  const cacheKey = [rhythm, intensity.toFixed(4), bpm, manualMode ? 'm' : 'a', JSON.stringify(waveParams || {})].join('|');
   if (leadLUTCacheKey === cacheKey) return;
 
-  LEADS.forEach(l => {
-    if (!leadLUTs[l]) leadLUTs[l] = new Float32Array(WAVEFORM_LUT_SIZE);
+  for (const l of LEADS) {
+    if (!leadLUTs[l]) leadLUTs[l] = new Float32Array(LUT_SIZE);
     const lut = leadLUTs[l];
-    for (let i = 0; i < WAVEFORM_LUT_SIZE; i++) {
-      const phase = i / WAVEFORM_LUT_SIZE;
-      lut[i] = getWaveformValueRaw(phase, l, rhythm, intensity, bpm, manualMode, waveParams);
+    for (let i = 0; i < LUT_SIZE; i++) {
+      const phase = i / LUT_SIZE;
+      lut[i] = sampleBeatSequenced(rhythm, l, intensity, bpm, phase, 0);
     }
-  });
+  }
   leadLUTCacheKey = cacheKey;
 }
 
-export function sampleLeadLUT(lead: string, phase: number, rhythm: string, intensity: number, bpm: number, manualMode: boolean, waveParams: any): number {
+export function sampleLeadLUT(
+  lead: string,
+  phase: number,
+  rhythm: string,
+  intensity: number,
+  bpm: number,
+  manualMode: boolean,
+  waveParams: any
+): number {
+  // Beat-aware rhythms must NOT use the cached LUT (they depend on beatIndex).
+  if (BEAT_AWARE_RHYTHMS.has(rhythm)) {
+    return sampleBeatSequenced(rhythm, lead, intensity, bpm, phase, 0);
+  }
   const lut = leadLUTs[lead];
-  if (!lut) return getWaveformValueRaw(phase, lead, rhythm, intensity, bpm, manualMode, waveParams);
-  const idx = phase * WAVEFORM_LUT_SIZE;
-  const i0 = Math.floor(idx) & (WAVEFORM_LUT_SIZE - 1);
-  const i1 = (i0 + 1) & (WAVEFORM_LUT_SIZE - 1);
+  if (!lut) {
+    return sampleBeatSequenced(rhythm, lead, intensity, bpm, phase, 0);
+  }
+  const idx = ((phase % 1) + 1) % 1 * LUT_SIZE;
+  const i0 = Math.floor(idx) & (LUT_SIZE - 1);
+  const i1 = (i0 + 1) & (LUT_SIZE - 1);
   const frac = idx - Math.floor(idx);
   return lut[i0] + (lut[i1] - lut[i0]) * frac;
 }
 
-// Pathological Rhythms Parameter Mapping
-export function getRhythmParams(rhythm: string, lead: string, intensity: number, bpm: number) {
-  const ti = BASELINE_TI.map(deg => deg * Math.PI / 180);
-  const ai = [...BASELINE_AI];
-  const bi = [...BASELINE_BI];
-
-  const hrfact = Math.sqrt(bpm / 60);
-  const hrfact2 = Math.sqrt(hrfact);
-  for (let i = 0; i < bi.length; i++) {
-    bi[i] *= hrfact;
-  }
-  const tiScale = [hrfact2, hrfact, 1, hrfact, hrfact2];
-  for (let i = 0; i < ti.length; i++) {
-    ti[i] *= tiScale[i];
-  }
-
-  const gamma = NK_GAMMA[lead] || [1.0, 1.0, 1.0, 1.0, 1.0];
-  for (let i = 0; i < ai.length; i++) {
-    ai[i] *= gamma[i];
-  }
-
-  function addSTChange(deg: number, amp: number, width: number) {
-    ti.push(deg * Math.PI / 180);
-    ai.push(amp);
-    bi.push(width);
-  }
-
-  function addExtraWave(deg: number, amp: number, width: number) {
-    ti.push(deg * Math.PI / 180);
-    ai.push(amp);
-    bi.push(width);
-  }
-
-  if (lead === 'V1' && !['afib', 'aflutter', 'svt', 'vtach', 'vfib', 'asystole'].includes(rhythm)) {
-    ai[0] = Math.abs(ai[0]);
-    addExtraWave(-45, -Math.abs(ai[0]) * 1.1, bi[0] * 0.9);
-  }
-
-  switch (rhythm) {
-    case 'st':
-      ti[0] = -55 * Math.PI / 180 * hrfact2;
-      ai[0] *= 1.2 + 0.3 * intensity;
-      ai[4] *= 0.8 - 0.2 * intensity;
-      break;
-    case 'sb':
-      ti[0] = -85 * Math.PI / 180 * hrfact2;
-      ai[0] *= 1.0 + 0.2 * intensity;
-      ai[4] *= 1.2 + 0.3 * intensity;
-      break;
-    case 'avb1':
-      const shift = 40 + 60 * intensity;
-      ti[0] = (-70 - shift) * Math.PI / 180;
-      break;
-    case 'wpw':
-      ti[0] = -40 * Math.PI / 180;
-      addExtraWave(-8, 8.0 * intensity, 0.08);
-      bi[1] *= 1.3;
-      bi[2] *= 1.3;
-      bi[3] *= 1.3;
-      ai[4] = -Math.abs(ai[4]) * (0.5 + 1.2 * intensity);
-      break;
-    case 'lbbb':
-      bi[1] *= 1.8; bi[2] *= 1.8; bi[3] *= 1.8;
-      if (['I', 'V5', 'V6'].includes(lead)) {
-        ai[1] = 0; ai[2] *= 0.65;
-        addExtraWave(12, ai[2] * 0.9, 0.12);
-        addSTChange(35, -2.5 * intensity, 0.15);
-        ai[4] = -Math.abs(ai[4]) * (1.2 + 1.0 * intensity);
-      } else if (['V1', 'V2'].includes(lead)) {
-        ai[2] *= 0.1; ai[3] *= 1.8 + 0.8 * intensity;
-        addSTChange(35, 3.5 * intensity, 0.15);
-        ai[4] = Math.abs(ai[4]) * (1.8 + 1.5 * intensity);
-      } else {
-        ai[2] *= 0.7;
-        addExtraWave(10, ai[2] * 0.7, 0.15);
-      }
-      break;
-    case 'rbbb':
-      bi[1] *= 1.8; bi[2] *= 1.8; bi[3] *= 1.8;
-      if (['V1', 'V2'].includes(lead)) {
-        ai[2] *= 0.3; ai[3] *= 0.8;
-        addExtraWave(22, 18.0 * (0.8 + 0.4 * intensity), 0.15);
-        addSTChange(35, -2.0 * intensity, 0.15);
-        ai[4] = -Math.abs(ai[4]) * (1.5 + 1.2 * intensity);
-      } else if (['I', 'V5', 'V6'].includes(lead)) {
-        bi[3] *= 2.8; ai[3] *= 1.3 + 0.5 * intensity;
-      }
-      break;
-    case 'stemi_ant':
-    case 'stemi_inf':
-    case 'stemi_lat':
-    case 'stemi_antlat':
-    case 'stemi_inflat':
-    case 'stemi_rv': {
-      const culpritMap: Record<string, string[]> = {
-        'stemi_ant':    ['V1','V2','V3','V4'],
-        'stemi_inf':    ['II'],
-        'stemi_lat':    ['I','V5','V6'],
-        'stemi_antlat': ['V1','V2','V3','V4','I','V5','V6'],
-        'stemi_inflat': ['II','V5','V6'],
-        'stemi_rv':     ['V1']
-      };
-      const reciprocalMap: Record<string, string[]> = {
-        'stemi_ant':    ['II'],
-        'stemi_inf':    ['I'],
-        'stemi_lat':    ['V1','V2','V3'],
-        'stemi_antlat': ['II'],
-        'stemi_inflat': ['I'],
-        'stemi_rv':     ['I']
-      };
-      
-      const culpritLeads = culpritMap[rhythm] || [];
-      const reciprocalLeads = reciprocalMap[rhythm] || [];
-      const isCulprit = culpritLeads.includes(lead);
-      const isReciprocal = reciprocalLeads.includes(lead);
-
-      if (isCulprit) {
-        const stElev = (3.0 + 8.0 * intensity) * 2.5;
-        addSTChange(30, stElev, 0.22);
-        if (intensity < 0.45) {
-          ai[4] *= 3.5; bi[4] *= 1.4;
-        } else {
-          ai[4] = -Math.abs(ai[4]) * (1.2 + 1.5 * (intensity - 0.45));
-        }
-        ai[2] *= Math.max(0.3, 1.0 - 0.6 * intensity);
-      } else if (isReciprocal) {
-        const stDep = -(2.0 + 6.0 * intensity) * 2.5;
-        addSTChange(30, stDep, 0.22);
-        if (intensity > 0.45) {
-          ai[4] = -Math.abs(ai[4]) * (0.8 + 1.2 * intensity);
-        }
-      }
-      break;
-    }
-    case 'pwmi':
-      if (['V1', 'V2', 'V3'].includes(lead)) {
-        const stDep = -(1.5 + 3.5 * intensity);
-        addSTChange(30, stDep, 0.18);
-        ai[2] *= 1.5 + 0.8 * intensity;
-        ai[4] = Math.abs(ai[4]) * (1.8 + 1.5 * intensity);
-      }
-      break;
-    case 'hyperk':
-      ai[4] *= 3.5 + 8.0 * intensity;
-      bi[4] *= Math.max(0.55, 0.92 - 0.2 * intensity);
-      if (intensity > 0.3) {
-        ti[0] = (-70 - 40 * (intensity - 0.3)) * Math.PI / 180;
-        bi[1] *= 1.4; bi[2] *= 1.4; bi[3] *= 1.4;
-        ai[0] *= Math.max(0.0, 1.0 - 1.5 * (intensity - 0.3));
-      }
-      if (intensity > 0.7) {
-        ai[0] = 0; bi[1] *= 2.2; bi[2] *= 2.2; bi[3] *= 2.2;
-        addSTChange(45, 6.0 * intensity, 0.3);
-      }
-      break;
-    case 'hypokalemia': {
-      const tAmp = 0.22 * Math.max(0, 1 - intensity * 1.8);
-      const uAmp = 0.04 + 0.32 * intensity;
-      ai[4] = tAmp;
-      addSTChange(30, -1.5 * intensity, 0.15);
-      addExtraWave(130, uAmp * 10, 0.22);
-      break;
-    }
-    case 'hypothermia':
-      if (['II', 'V5', 'V6'].includes(lead)) {
-        addExtraWave(22, 5.0 * intensity, 0.08);
-      }
-      break;
-    case 'wellens':
-      if (['V2', 'V3'].includes(lead)) {
-        ai[4] = 0;
-        addExtraWave(90, 1.5 * intensity, 0.15);
-        addExtraWave(125, -2.5 * intensity, 0.15);
-      }
-      break;
-    case 'dewinter':
-      if (['V1','V2','V3','V4','V5','V6'].includes(lead)) {
-        addSTChange(25, -2.5 * intensity, 0.12);
-        ai[4] *= 3.0 + 5.0 * intensity;
-        bi[4] *= 0.8;
-      }
-      break;
-    case 'longqt':
-      ti[4] = (100 + 45 * intensity) * Math.PI / 180;
-      bi[4] *= 1.4 + 0.8 * intensity;
-      break;
-    case 'brugada':
-      if (['V1', 'V2'].includes(lead)) {
-        addSTChange(25, 4.5 * intensity, 0.15);
-        ai[4] = -Math.abs(ai[4]) * (1.5 + 2.0 * intensity);
-      }
-      break;
-    case 'pericarditis':
-      if (lead === 'aVR' || lead === 'V1') {
-        addSTChange(30, -1.5 * intensity, 0.15);
-        ti[0] = -55 * Math.PI / 180;
-        ai[0] *= 1.2;
-      } else {
-        addSTChange(30, 2.0 * intensity, 0.15);
-        ti[0] = -85 * Math.PI / 180;
-        ai[0] *= 0.8;
-      }
-      break;
-    case 'digoxin':
-      if (['I', 'II', 'V5', 'V6'].includes(lead)) {
-        addSTChange(30, -2.2 * intensity, 0.15);
-        ai[4] *= 0.5;
-      }
-      break;
-    case 'earlyrepo':
-      if (['I', 'II', 'V5', 'V6'].includes(lead)) {
-        addExtraWave(20, 1.2 * intensity, 0.05);
-        addSTChange(30, 1.5 * intensity, 0.15);
-        ai[4] *= 1.5 + 1.5 * intensity;
-      }
-      break;
-    case 'lvh':
-      if (['I', 'V5', 'V6'].includes(lead)) {
-        ai[2] *= 1.8 + 1.2 * intensity;
-        addSTChange(30, -1.8 * intensity, 0.15);
-        ai[4] = -Math.abs(ai[4]) * (1.2 + 1.0 * intensity);
-      } else if (['V1', 'V2'].includes(lead)) {
-        ai[3] *= 1.8 + 1.5 * intensity;
-      }
-      break;
-    case 'rvh':
-      if (lead === 'V1') {
-        ai[2] *= 2.5 + 2.0 * intensity;
-        addSTChange(30, -1.5 * intensity, 0.15);
-        ai[4] = -Math.abs(ai[4]) * (1.2 + 1.0 * intensity);
-      } else if (['I', 'V5', 'V6'].includes(lead)) {
-        ai[3] *= 1.8 + 1.2 * intensity;
-      }
-      break;
-    case 'bve':
-      if (lead === 'V1') {
-        ai[2] *= 1.5; ai[3] *= 1.8;
-      } else if (['V5', 'V6'].includes(lead)) {
-        ai[2] *= 2.0; ai[3] *= 1.5;
-      }
-      break;
-    case 'lah':
-      if (lead === 'II') {
-        ai[0] *= 0.7;
-        addExtraWave(-82 * Math.PI / 180 * hrfact2, ai[0] * 0.8, bi[0]);
-        bi[0] *= 1.4;
-      } else if (lead === 'V1') {
-        ai[0] *= 0.5;
-        addExtraWave(-55 * Math.PI / 180 * hrfact2, -ai[0] * 1.5, bi[0] * 1.2);
-      }
-      break;
-    case 'rah':
-      if (lead === 'II') {
-        ai[0] *= 1.8 + 1.2 * intensity;
-        bi[0] *= 0.8;
-      } else if (['V1', 'V2'].includes(lead)) {
-        ai[0] *= 1.5 + 1.0 * intensity;
-        bi[0] *= 0.85;
-      }
-      break;
-    case 'pe':
-      if (lead === 'I') {
-        ai[2] *= 0.4; ai[3] *= 2.5 * intensity;
-      } else if (lead === 'II') {
-        ai[1] *= 2.0 + 1.5 * intensity; ai[4] *= 0.4;
-      }
-      break;
-    case 'lafb':
-      if (lead === 'I') {
-        ai[2] *= 1.5 + 0.5 * intensity; ai[3] = 0;
-      } else if (lead === 'II') {
-        ai[2] *= 0.3; ai[3] *= 1.8 + 1.0 * intensity;
-      }
-      break;
-    case 'lpfb':
-      if (lead === 'I') {
-        ai[2] *= 0.3; ai[3] *= 1.8 + 1.0 * intensity;
-      } else if (lead === 'II') {
-        ai[2] *= 1.5 + 0.5 * intensity; ai[3] = 0;
-      }
-      break;
-  }
-
-  return { ti, ai, bi };
-}
-
-export function generateLeadWaveformUnscaled(
-  rhythm: string,
-  lead: string,
-  bpm: number,
-  intensity: number,
-  phase: number,
-  beatIndex: number,
-  waveParams: any,
-  manualMode: boolean
-): number {
-  if (DEPENDENT_LEADS[lead]) {
-    const valI = generateLeadWaveformUnscaled(rhythm, 'I', bpm, intensity, phase, beatIndex, waveParams, manualMode);
-    const valII = generateLeadWaveformUnscaled(rhythm, 'II', bpm, intensity, phase, beatIndex, waveParams, manualMode);
-    return DEPENDENT_LEADS[lead](valI, valII);
-  }
-
-  if (rhythm === 'asystole') {
-    const t = (beatIndex + phase) * (60 / Math.max(1, bpm));
-    return intensity * (0.005 * Math.sin(t * 23.0) + 0.003 * Math.sin(t * 67.0));
-  }
-  
-  if (rhythm === 'vfib') {
-    const t = (beatIndex + phase) * (60 / 72);
-    const amp = 0.5 - 0.35 * intensity;
-    const freq1 = 45 + 30 * intensity;
-    const freq2 = 73 + 25 * intensity;
-    const freq3 = 127 - 20 * intensity;
-    return amp * (Math.sin(t * freq1) + 0.8 * Math.sin(t * freq2) + 0.6 * Math.sin(t * freq3) + 0.4 * Math.sin(t * 199.9));
-  }
-
-  if (rhythm === 'vtach' && intensity > 0.8) {
-    const t = (beatIndex + phase) * (60 / bpm);
-    const twist = Math.sin(t * 1.5);
-    const ti = [0 * Math.PI / 180, 45 * Math.PI / 180];
-    const ai = [(1.5 + 2.5 * intensity) * 10, -(1.0 + 1.5 * intensity) * 8];
-    const bi = [(0.15 + 0.12 * intensity) * 1.5, (0.18 + 0.10 * intensity) * 1.5];
-    const cycleData = solveECGSYN(ti, ai, bi, 160);
-    const len = cycleData.length;
-    const idx = Math.floor(phase * len) % len;
-    return cycleData[idx] * twist;
-  }
-
-  const targetAmp = LEAD_TARGET_AMPLITUDE[lead] || 1.6;
-  const cacheKey = `${rhythm}_${lead}_${intensity.toFixed(2)}_${bpm}_${targetAmp.toFixed(2)}`;
-  let cycleData = cycleCache[cacheKey];
-
-  if (!cycleData) {
-    const { ti, ai, bi } = getRhythmParams(rhythm, lead, intensity, bpm);
-    cycleData = solveECGSYN(ti, ai, bi, bpm, targetAmp);
-    cycleCache[cacheKey] = cycleData;
-  }
-
-  const len = cycleData.length;
-  const idxFloat = phase * len;
-  const idx = Math.floor(idxFloat) % len;
-  const nextIdx = (idx + 1) % len;
-  const frac = idxFloat - Math.floor(idxFloat);
-
-  return cycleData[idx] * (1.0 - frac) + cycleData[nextIdx] * frac;
-}
+// ─── Manual mode waveform (Wave Builder customizer) ─────────────
+// Preserved: maps user waveParams → segments.
 
 export function ecgManualWaveform(phase: number, bpm: number, p: any): number {
-  const ti = BASELINE_TI.map(deg => deg * Math.PI / 180);
-  const ai = [...BASELINE_AI];
-  const bi = [...BASELINE_BI];
+  const rrMs = 60000 / Math.max(1, bpm);
+  const N = Math.max(64, Math.round((rrMs / 1000) * CYCLE_SAMPLE_RATE));
+  const rIdx = Math.floor(N * 0.25);
 
-  const hrfact = Math.sqrt(bpm / 60);
-  const hrfact2 = Math.sqrt(hrfact);
-  for (let i = 0; i < bi.length; i++) bi[i] *= hrfact;
-  const tiScale = [hrfact2, hrfact, 1, hrfact, hrfact2];
-  for (let i = 0; i < ti.length; i++) ti[i] *= tiScale[i];
+  // Build a synthetic segment list from p each call. p may be missing
+  // fields; fall back to baseline intervals.
+  const pr = (p?.prInt ?? 0.16) * 1000;          // s → ms
+  const qrsDur = (p?.qrsDur ?? 0.08) * 1000;
+  const tDur = (p?.tDur ?? 0.16) * 1000;
+  const pDur = (p?.pDur ?? 0.10) * 1000;
+  const uDur = (p?.uDur ?? 0.10) * 1000;
 
-  ai[0] = p.pAmp * 10;
-  bi[0] = p.pDur * hrfact;
-
-  const prExt = (p.prInt - 0.12) * 360 * Math.PI / 180;
-  ti[0] -= prExt;
-
-  ai[1] = -0.15 * p.qrsAmp * 30;
-  ai[2] = p.qrsAmp * 30;
-  ai[3] = -0.22 * p.qrsAmp * 30;
-  bi[1] = p.qrsDur * 0.5 * hrfact;
-  bi[2] = p.qrsDur * hrfact;
-  bi[3] = p.qrsDur * 0.8 * hrfact;
-
-  if (Math.abs(p.stElev) > 0.01) {
-    const stSlopeVal = p.stSlope === 2 ? 0.22 : (p.stSlope === -1 ? -0.22 : 0.0);
-    ti.push(30 * Math.PI / 180);
-    ai.push(p.stElev * 15 + stSlopeVal);
-    bi.push(p.stDur * hrfact);
+  const segs: WaveSegment[] = [];
+  if ((p?.pAmp ?? 0) !== 0) {
+    segs.push(pWave(A.rCenter - pr - pDur * 0.5, p.pAmp, pDur));
+  }
+  if ((p?.qrsAmp ?? 1) > 0) {
+    segs.push(rWave(A.rCenter, p.qrsAmp, qrsDur));
+  }
+  if (p?.stElev && Math.abs(p.stElev) > 0.01) {
+    segs.push(stShift(A.jPoint + 20, p.stElev, 100));
+  }
+  if ((p?.tAmp ?? 0) !== 0) {
+    segs.push(tWave(A.rCenter + 60 + tDur * 0.5 + 100, p.tAmp, tDur));
+  }
+  if ((p?.uAmp ?? 0) > 0) {
+    segs.push(uWave(A.tCenter + 150, p.uAmp, uDur));
+  }
+  if ((p?.jNotch ?? 0) > 0) {
+    segs.push(jWave(A.jPoint + 5, p.jNotch, 30));
   }
 
-  ai[4] = p.tAmp * 12;
-  bi[4] = p.tDur * hrfact;
-
-  if (p.uAmp > 0) {
-    ti.push(140 * Math.PI / 180);
-    ai.push(p.uAmp * 10);
-    bi.push(p.uDur * hrfact);
-  }
-
-  const cacheKey = `manual_${bpm}_${p.pAmp}_${p.pDur}_${p.prInt}_${p.qrsAmp}_${p.qrsDur}_${p.stElev}_${p.stDur}_${p.stSlope}_${p.tAmp}_${p.tDur}_${p.uAmp}_${p.uDur}`;
-  let cycleData = cycleCache[cacheKey];
-
-  if (!cycleData) {
-    // manual designs target 1.6 mV
-    cycleData = solveECGSYN(ti, ai, bi, bpm);
-    cycleCache[cacheKey] = cycleData;
-  }
-
-  const len = cycleData.length;
-  const idxFloat = phase * len;
-  const idx = Math.floor(idxFloat) % len;
-  const nextIdx = (idx + 1) % len;
-  const frac = idxFloat - Math.floor(idxFloat);
-
-  return cycleData[idx] * (1.0 - frac) + cycleData[nextIdx] * frac;
+  const msPerSample = rrMs / N;
+  const tMs = (Math.floor(((phase % 1) + 1) % 1 * N) - rIdx) * msPerSample;
+  return composeBeat(segs, tMs);
 }
 
+// ─── Noise (preserved signature) ────────────────────────────────
+
 const noiseCache: Record<string, Float32Array> = {};
+
 export function getLaplaceNoiseSample(index: number, length: number, samplingRate: number, amplitude: number, frequency: number): number {
   const cacheKey = `${length}_${samplingRate}_${amplitude.toFixed(4)}_${frequency}`;
   let noiseBuf = noiseCache[cacheKey];
@@ -558,7 +369,7 @@ export function getLaplaceNoiseSample(index: number, length: number, samplingRat
     const duration = length / samplingRate;
     const noiseDuration = Math.max(1, Math.floor(duration * frequency));
     const rawNoise = new Float32Array(noiseDuration);
-    
+
     const scale = amplitude / Math.sqrt(2);
     for (let i = 0; i < noiseDuration; i++) {
       const seed = Math.sin((i + frequency) * 12.9898 + 78.233) * 43758.5453;
@@ -589,7 +400,7 @@ export function addTraceNoise(val: number, phase: number, timeSeed: number, nois
   let noise = 0;
   const samplingRate = 512;
   const length = 5120;
-  
+
   const baseWander = 0.005 * Math.sin((timeSeed + phase) * 0.5);
   const baseJitter = 0.002 * (Math.random() * 2 - 1);
   noise += baseWander + baseJitter;
@@ -599,7 +410,6 @@ export function addTraceNoise(val: number, phase: number, timeSeed: number, nois
     const freqs = [5, 10, 100];
     const index = Math.floor((timeSeed + phase) * length);
     const signalSd = 0.35;
-    
     for (let i = 0; i < freqs.length; i++) {
       const amp = noiseLevel * 0.08 * signalSd;
       noise += getLaplaceNoiseSample(index + i * 100, length, samplingRate, amp, freqs[i]);
@@ -610,7 +420,6 @@ export function addTraceNoise(val: number, phase: number, timeSeed: number, nois
     const t = (timeSeed + phase) * (60 / Math.max(1, bpm));
     const wander = 0.12 * Math.sin(t * 0.8) + 0.04 * Math.sin(t * 2.1);
     noise += wander;
-
     const index = Math.floor((timeSeed + phase) * length);
     noise += getLaplaceNoiseSample(index, length, samplingRate, 0.015, 150);
   }
@@ -618,111 +427,39 @@ export function addTraceNoise(val: number, phase: number, timeSeed: number, nois
   return val + noise;
 }
 
-export function getWaveformForBeatIndex(
-  phase: number,
-  lead: string,
-  beatIndex: number,
-  rhythm: string,
-  intensity: number,
-  bpm: number,
-  amplitude: number,
-  noise: number,
-  realistic: boolean,
-  manualMode: boolean,
-  waveParams: any
-): number {
-  let val = 0;
+// ─── Diagnostic exports (used by ecg-validate.ts) ───────────────
 
-  if (manualMode) {
-    val = ecgManualWaveform(phase, bpm, waveParams);
-  } else if (rhythm === 'afib') {
-    const baseNoise = 0.05 + 0.15 * intensity;
-    const t = (beatIndex + phase) * (60 / 95);
-    const fib = baseNoise * (Math.sin(t * 137.5) + 0.7 * Math.sin(t * 89.3) + 0.5 * Math.sin(t * 197.1) + 0.3 * Math.sin(t * 251.7 + 1.2));
-    const rawClean = generateLeadWaveformUnscaled('nsr', lead, 95, 0.0, phase, beatIndex, waveParams, manualMode);
-    const cleanVal = phase < 0.15 ? 0.0 : rawClean;
-    const leadAmp = LEAD_TARGET_AMPLITUDE[lead] || 1.6;
-    const leadScale = leadAmp / 1.6;
-    val = cleanVal + fib * leadScale;
-  } else if (rhythm === 'aflutter') {
-    const flAmp = 0.08 + 0.12 * intensity;
-    const flutterRate = 300 + 30 * intensity;
-    const t = (beatIndex + phase) * (60 / bpm);
-    const flutterPhase = (t * flutterRate / 60) % 1;
-    const saw = 2 * flutterPhase - 1;
-    const fl = -flAmp * (saw + 0.25 * Math.sin(2 * Math.PI * flutterPhase));
-    const rawClean = generateLeadWaveformUnscaled('nsr', lead, bpm, 0.0, phase, beatIndex, waveParams, manualMode);
-    const cleanVal = phase < 0.15 ? 0.0 : rawClean;
-    const leadAmp = LEAD_TARGET_AMPLITUDE[lead] || 1.6;
-    const leadScale = leadAmp / 1.6;
-    val = cleanVal + fl * leadScale;
-  } else if (rhythm === 'avb1') {
-    val = generateLeadWaveformUnscaled(rhythm, lead, bpm, intensity, phase, beatIndex, waveParams, manualMode);
-  } else if (rhythm === 'avb2mob1' || rhythm === 'avb2mob2') {
-    const dropEvery = rhythm === 'avb2mob1'
-      ? (intensity > 0.55 ? 3 : intensity > 0.25 ? 4 : 5)
-      : (intensity > 0.55 ? 2 : intensity > 0.25 ? 3 : 4);
-    const droppedBeat = beatIndex % dropEvery === dropEvery - 1;
-    if (droppedBeat) {
-      const atrialOnly = generateLeadWaveformUnscaled('nsr', lead, bpm, 0.0, phase, beatIndex, waveParams, manualMode);
-      val = phase < 0.22 ? atrialOnly * (0.85 + 0.2 * intensity) : 0;
-    } else {
-      val = generateLeadWaveformUnscaled(rhythm, lead, bpm, intensity, phase, beatIndex, waveParams, manualMode);
-    }
-  } else if (rhythm === 'avb3') {
-    const ventRate = Math.max(18, bpm);
-    const atrialRate = 82 + 10 * intensity;
-    const t_abs = (beatIndex + phase) * (60 / ventRate);
-    const phase_atrial = (t_abs * (atrialRate / 60)) % 1;
-    const valAtrial = generateLeadWaveformUnscaled('nsr', lead, atrialRate, 0.0, phase_atrial, 0, waveParams, manualMode);
-    const pOnly = phase_atrial < 0.15 ? valAtrial : 0.0;
-    const valVent = generateLeadWaveformUnscaled('avb3', lead, ventRate, intensity, phase, beatIndex, waveParams, manualMode);
-    const qrstOnly = phase < 0.15 ? 0.0 : valVent;
-    val = pOnly + qrstOnly;
-  } else if (rhythm === 'pvc') {
-    if (beatIndex % 3 === 2) {
-      const qrsW = 0.12 + 0.08 * intensity;
-      const ti = [0 * Math.PI / 180, 40 * Math.PI / 180];
-      const ai = [(1.5 + 2.0 * intensity) * 12, -(1.2 + 1.8 * intensity) * 10];
-      const bi = [qrsW * 0.8, (0.2 + 0.06 * intensity) * 1.5];
-      
-      const isLateral = ['I', 'V5', 'V6'].includes(lead);
-      if (isLateral) {
-        ai[0] = -Math.abs(ai[0]);
-        ai[1] = Math.abs(ai[1]);
-      }
-      
-      const cacheKey = `pvc_${lead}_${intensity.toFixed(2)}_${bpm}`;
-      let cycleData = cycleCache[cacheKey];
-      if (!cycleData) {
-        cycleData = solveECGSYN(ti, ai, bi, bpm);
-        cycleCache[cacheKey] = cycleData;
-      }
-      const len = cycleData.length;
-      const idx = Math.floor(phase * len) % len;
-      val = cycleData[idx];
-    } else {
-      val = generateLeadWaveformUnscaled('nsr', lead, bpm, 0.0, phase, beatIndex, waveParams, manualMode);
-    }
-  } else {
-    val = generateLeadWaveformUnscaled(rhythm, lead, bpm, intensity, phase, beatIndex, waveParams, manualMode);
-  }
-
-  if (!manualMode) {
-    val *= amplitude;
-  }
-
-  return addTraceNoise(val, phase, beatIndex, noise, realistic, bpm);
+export function renderLeadCycle(rhythm: string, lead: string, intensity: number, bpm: number): Float32Array {
+  return getCycle(rhythm, lead, intensity, bpm);
 }
 
-export function getWaveformValueRaw(
-  phase: number,
-  lead: string,
+export function renderLeadCycleForBeat(
   rhythm: string,
+  lead: string,
   intensity: number,
   bpm: number,
-  manualMode: boolean,
-  waveParams: any
-): number {
-  return generateLeadWaveformUnscaled(rhythm, lead, bpm, intensity, phase, 0, waveParams, manualMode);
+  beatIndex: number
+): Float32Array {
+  // For beat-aware rhythms, render the representative beat (beatIndex 0
+  // for non-ectopic; for PVC trigeminy use the ectopic beat at index 2).
+  const sampleBeat = (rhythm === 'pvc') ? 2 : 0;
+  const N = Math.max(64, Math.round((60000 / Math.max(1, bpm) / 1000) * CYCLE_SAMPLE_RATE));
+  const out = new Float32Array(N);
+
+  // Dependent leads (III, aVR, aVL, aVF) derive from I and II at each sample.
+  if (DEPENDENT_LEAD_FORMULAS[lead]) {
+    const cycleI  = renderLeadCycleForBeat(rhythm, 'I',  intensity, bpm, beatIndex);
+    const cycleII = renderLeadCycleForBeat(rhythm, 'II', intensity, bpm, beatIndex);
+    const fn = DEPENDENT_LEAD_FORMULAS[lead];
+    for (let i = 0; i < N; i++) out[i] = fn(cycleI[i], cycleII[i]);
+    return out;
+  }
+
+  for (let i = 0; i < N; i++) {
+    const phase = i / N;
+    out[i] = sampleBeatSequenced(rhythm, lead, intensity, bpm, phase, sampleBeat);
+  }
+  return out;
 }
+
+export { INDEPENDENT_LEADS, baselineSegments, getTemplate, composeBeat };

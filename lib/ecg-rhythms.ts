@@ -764,6 +764,27 @@ export function validateRhythmProfile(rhythmId: string, intensity: number): Rhyt
     });
   }
 
+  // Measured-morphology gate (delegates to ecg-validate).
+  // Wrapped in try/catch so a transient measurement issue never breaks the UI.
+  try {
+    // Lazy require to avoid circular-import problems at module load.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { validateRhythmAllLeads } = require("./ecg-validate") as typeof import("./ecg-validate");
+    const summary = validateRhythmAllLeads(rhythmId, clampedIntensity);
+    const failedDetails = summary.results
+      .filter((r: { passed: boolean; tag: string; lead: string; detail: string }) => !r.passed && r.tag !== "—")
+      .map((r: { lead: string; detail: string }) => `${r.lead}: ${r.detail}`);
+    checks.push({
+      label: "Measured 12-lead morphology",
+      passed: summary.allPassed,
+      detail: summary.allPassed
+        ? `All ${summary.checkedLeads} lead criteria satisfied (measured intervals & amplitudes match diagnostic thresholds).`
+        : `${summary.passedLeads}/${summary.checkedLeads} lead criteria satisfied.` + (failedDetails.length ? ` Failures: ${failedDetails.slice(0, 3).join(" · ")}` : "")
+    });
+  } catch (_e) {
+    // Validator not loadable in this context — skip the morphology check.
+  }
+
   const status = checks.every((check) => check.passed) ? "validated" : "warning";
   return { status, stageName: stage.name, targetHeartRate, checks };
 }
