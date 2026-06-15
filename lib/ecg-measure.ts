@@ -93,23 +93,45 @@ export function resampleToMsPerSample(
   return { mv: out, rrMs, bpm, sampleRateHz: 1000 };
 }
 
-// ─── QRS energy envelope ────────────────────────────────────────
-// |slope| (rectified first derivative) summed in a sliding window.
-// The QRS produces a burst of high-frequency energy; P and T are
-// smoother. This localizes the QRS center even when the QRS net
-// deflection is negative (e.g., LBBB V1, QS pattern).
+  // ─── QRS energy envelope ────────────────────────────────────────
+// |slope| (rectified first derivative) summed in a sliding window,
+// GATED by direction-change frequency. The QRS produces a burst of
+// high-frequency content with many directional reversals; ST-shift
+// ramps are monotonic (one direction). Multiplying the slope-sum by
+// the count of derivative sign changes within the window produces an
+// envelope that peaks inside the QRS and stays low across ST ramps.
+//
+// This is the key discriminator that lets the delineator distinguish
+// a true QRS (R-S-R' with multiple reversals) from a wide ST-elevation
+// or ST-depression ramp (single direction).
 
 function absSlopeEnvelope(mv: Float32Array, winMs: number = 16): Float32Array {
   const N = mv.length;
   const env = new Float32Array(N);
   const halfWin = Math.max(1, Math.floor(winMs / 2));
-  // Rectified first difference, accumulated over a sliding window.
+  // Pre-compute first differences.
+  const diff = new Float32Array(N);
+  for (let i = 1; i < N; i++) diff[i] = mv[i] - mv[i - 1];
   for (let i = 1; i < N; i++) {
-    const lo = Math.max(0, i - halfWin);
+    const lo = Math.max(1, i - halfWin);
     const hi = Math.min(N - 1, i + halfWin);
-    let s = 0;
-    for (let k = lo; k < hi; k++) s += Math.abs(mv[k + 1] - mv[k]);
-    env[i] = s;
+    let slopeSum = 0;
+    let reversals = 0;
+    let prevSign = 0;
+    for (let k = lo; k <= hi; k++) {
+      const d = diff[k];
+      slopeSum += Math.abs(d);
+      const sign = d > 0.001 ? 1 : (d < -0.001 ? -1 : 0);
+      if (sign !== 0 && prevSign !== 0 && sign !== prevSign) reversals++;
+      if (sign !== 0) prevSign = sign;
+    }
+    // Slope provides the base energy; reversals amplify it for true
+    // QRS morphology. A monotonic ramp gets reversals ≤ 1 and is
+    // effectively suppressed relative to a multi-deflection QRS
+    // (3+ reversals). Light gating (0.2 weight) — enough to suppress
+    // pure ST ramps while still detecting delta waves (which have
+    // 1-2 reversals at the QRS-delta junction).
+    env[i] = slopeSum * (1 + reversals * 0.2);
   }
   return env;
 }
@@ -178,55 +200,68 @@ export function delineateCycle(s: CycleSample): WaveDelineation {
   // QRS energy peak threshold — half the peak (used as onset search end).
   const qrsPeak = qrsCenterEnv;
   const onsetThreshold = qrsPeak * 0.08; // 8% of peak energy = onset level
+  // Deflection threshold: 35% of QRS peak — used to identify QRS
+  // deflection edges (R/R'/S falling/rising) within the bounded window.
+  const deflectionThreshold = qrsPeak * 0.35;
 
-  // ── QRS onset: walk LEFT from center until envelope drops to a
-  // sustained low run AND signal approaches baseline. The sustained
-  // run (mirror of the J-point logic) prevents a brief notch inside
-  // the rising QRS (e.g., PVC / LBBB notch) from being mistaken for
-  // the onset.
-  let qrsOnset = qrsCenter - 30;
+  // ── QRS onset: bound the search to qrsCenter - 100 ms (QRS onset
+  // is at most ~100 ms before R-peak in severe BBB). Find the earliest
+  // env peak ≥ 35% of QRS peak within the bounded window, then walk
+  // left to where env settles.
+  const qrsOnsetHardCap = Math.max(1, qrsCenter - 100);
+  let firstDeflectionIdx = qrsCenter;
+  for (let i = qrsCenter - 5; i >= qrsOnsetHardCap; i--) {
+    if (envSmooth[i] > deflectionThreshold) {
+      firstDeflectionIdx = i;   // keep updating to earliest
+    }
+  }
+  // Walk LEFT from firstDeflectionIdx to where env settles.
+  let qrsOnset = firstDeflectionIdx - 15;
   let onsetLowRunMs = 0;
-  let onsetLastLowIdx = qrsOnset;
-  for (let i = qrsCenter - 8; i > Math.max(1, qrsCenter - 180); i--) {
-    const envLow = envSmooth[i] < onsetThreshold;
-    if (envLow) {
-      onsetLastLowIdx = i;
+  for (let i = firstDeflectionIdx - 3; i > Math.max(1, firstDeflectionIdx - 50); i--) {
+    if (envSmooth[i] < onsetThreshold) {
       onsetLowRunMs++;
-      if (onsetLowRunMs >= 15 && Math.abs(mv[i]) < 0.15) {
-        qrsOnset = i + 15;
+      if (onsetLowRunMs >= 8) {
+        qrsOnset = i + 8;
         break;
       }
     } else {
       onsetLowRunMs = 0;
     }
   }
-  if (qrsOnset >= qrsCenter - 15) qrsOnset = Math.max(1, onsetLastLowIdx);
+  if (qrsOnset >= firstDeflectionIdx - 3) qrsOnset = Math.max(1, firstDeflectionIdx - 15);
 
-  // ── J point (QRS offset): walk RIGHT from center. The QRS offset
-  // is the point where the QRS complex ends and the signal either
-  // returns to baseline OR transitions into an ST shift. We detect
-  // it by requiring BOTH:
-  //   - sustained low-energy env (≥ 15 ms) — skips RBBB/LBBB/PVC notches
-  //   - signal NOT accelerating away from baseline — skips ST ramps
-  // The acceleration check distinguishes a real J point (signal
-  // settling) from an ST depression/elevation ramp (signal moving
-  // AWAY from baseline at increasing speed).
-  const qrsOffsetMaxSearch = Math.min(N - 1, qrsCenter + 150);
-  let qrsOffset = qrsCenter + 30;
-  let lastLowEnvIdx = qrsOffset;
+  // ── J point (QRS offset): the J point is bounded by physiology.
+  // QRS duration is at most ~160 ms (severe BBB/VT); typical is
+  // 80-120 ms. The R-peak sits at qrsCenter; the J point is at most
+  // qrsCenter + 100 ms. We find the latest deflection within this
+  // bounded window, then walk a short distance past it to the J point.
+  //
+  // Key insight: deflection peaks PAST qrsCenter + 100 ms are NOT
+  // QRS — they are ST-shift ramps or T waves. Hard-capping the
+  // search window prevents these from extending the QRS.
+  const qrsOffsetHardCap = Math.min(N - 1, qrsCenter + 130);
+  // Find the latest env peak (≥ 35% of QRS peak) within the bounded
+  // window. This is the last R/R'/S-falling-edge of the QRS.
+  let lastDeflectionIdx = qrsCenter;
+  for (let i = qrsCenter + 5; i <= qrsOffsetHardCap; i++) {
+    if (envSmooth[i] > deflectionThreshold) {
+      // Update to the latest sample above threshold — this captures
+      // the trailing edge of the last QRS deflection.
+      lastDeflectionIdx = i;
+    }
+  }
+
+  // J point: walk right from lastDeflectionIdx looking for a sustained
+  // low-env run (signal settling after the QRS).
+  const qrsOffsetMaxSearch = Math.min(N - 1, lastDeflectionIdx + 50);
+  let qrsOffset = lastDeflectionIdx + 15;
   let lowEnvRunMs = 0;
-  const requiredRun = 15;
-  for (let i = qrsCenter + 8; i <= qrsOffsetMaxSearch; i++) {
-    const envLow = envSmooth[i] < onsetThreshold;
-    if (envLow) {
-      lastLowEnvIdx = i;
+  const requiredRun = 8;
+  for (let i = lastDeflectionIdx + 3; i <= qrsOffsetMaxSearch; i++) {
+    if (envSmooth[i] < onsetThreshold) {
       lowEnvRunMs++;
-      // |mv| trend over the last 10 ms: is the signal moving toward
-      // baseline (decelerating) or away (accelerating into ST ramp)?
-      const recent = Math.abs(mv[i]);
-      const prior = Math.abs(mv[Math.max(0, i - 10)]);
-      const approachingBaseline = recent <= prior + 0.05;
-      if (lowEnvRunMs >= requiredRun && Math.abs(mv[i]) < 0.30 && approachingBaseline) {
+      if (lowEnvRunMs >= requiredRun) {
         qrsOffset = i - requiredRun;
         break;
       }
@@ -234,19 +269,7 @@ export function delineateCycle(s: CycleSample): WaveDelineation {
       lowEnvRunMs = 0;
     }
   }
-  // Fallback 1: if no settling point found, use the last low-env point.
-  if (qrsOffset <= qrsCenter + 15) qrsOffset = Math.min(qrsOffsetMaxSearch, lastLowEnvIdx);
-  // Fallback 2: if still nothing, look for the first sustained approach
-  // to baseline regardless of env (handles wide BBB where env stays
-  // elevated but the signal does return to baseline briefly).
-  if (qrsOffset - qrsOnset > 160) {
-    for (let i = qrsCenter + 60; i <= qrsOffsetMaxSearch; i++) {
-      if (Math.abs(mv[i]) < 0.10 && Math.abs(mv[i + 5]) < 0.10) {
-        qrsOffset = i;
-        break;
-      }
-    }
-  }
+  if (qrsOffset <= lastDeflectionIdx + 3) qrsOffset = Math.min(qrsOffsetMaxSearch, lastDeflectionIdx + 15);
 
   // Clamp QRS duration to a physiologic window: 40–180 ms.
   if (qrsOffset - qrsOnset < 40) qrsOffset = qrsOnset + 40;
