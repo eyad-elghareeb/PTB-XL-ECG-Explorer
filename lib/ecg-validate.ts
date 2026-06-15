@@ -387,6 +387,13 @@ const RHYTHM_RULES: Record<string, LeadRuleMap> = {
         };
       },
     ],
+    V2: [
+      (m, ctx) => {
+        const ratio = m.rAmplitudeMv / Math.max(0.05, -m.sAmplitudeMv);
+        const passed = m.rAmplitudeMv >= 0.40 && ratio >= 0.5;
+        return { passed, tag: passed ? 'R/S↑' : 'Check V2', detail: passed ? `V2 RVH: R/S=${ratio.toFixed(2)}` : `V2: R/S=${ratio.toFixed(2)}` };
+      },
+    ],
   },
 
   // ── WPW ───────────────────────────────────────────────────────
@@ -796,7 +803,7 @@ const RHYTHM_RULES: Record<string, LeadRuleMap> = {
     III: [
       (m, ctx) => {
         // Q3 + T3
-        const qWave = m.sAmplitudeMv <= -0.10 && m.rAmplitudeMv <= 0.25;
+        const qWave = m.sAmplitudeMv <= -0.15 && m.rAmplitudeMv <= 0.25;
         const tInv = m.tAmplitudeMv <= -0.05;
         const passed = qWave && tInv;
         return {
@@ -1749,7 +1756,7 @@ for (const rhythmId of Object.keys(LEAD_SPECIFICITY)) {
 
 // Wide-QRS rhythms: aVR and III also widen via linear combination.
 const WIDE_QRS_RHYTHMS = [
-  'lbbb', 'rbbb', 'wpw', 'avb3', 'vtach', 'pvc',
+  'lbbb', 'rbbb', 'wpw', 'avb3', 'vtach', 'pvc', 'hypothermia'
 ];
 
 // Fascicular blocks: QRS slightly widened (100–120 ms in independent
@@ -1760,7 +1767,7 @@ const FASCICULAR_RHYTHMS = [
 
 // Rhythms where aVR shows ST depression (reciprocal of diffuse elevation).
 const AVR_ST_DEP_RHYTHMS = [
-  'pericarditis',
+  'pericarditis', 'earlyrepo'
 ];
 
 // Rhythms where aVR shows ST elevation (discordant / reciprocal).

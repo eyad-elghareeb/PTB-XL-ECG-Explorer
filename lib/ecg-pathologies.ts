@@ -429,8 +429,20 @@ export const brugada: PathologyTemplate = (i) => {
       },
     };
   }
-  // V3 can show subtle ST elevation (extension); other leads normal.
-  ov.V3 = { add: [stElevPlateau(0.05 + 0.05 * i, 10, 80)] };
+  // V3 can show subtle ST elevation (extension) — intensity-dependent.
+  // At i >= 0.6, V3 shows Brugada extension with coved morphology.
+  if (i >= 0.6) {
+    ov.V3 = {
+      add: [stElevPlateau(0.15 + 0.15 * Math.min(1, (i - 0.6) * 3), 10, 100)],
+      replace: {
+        r: [rWave(A.rCenter - 10, 0.35, 50)],
+        s: [],
+        t: [tWave(A.tCenter + 30, -0.10 - 0.10 * Math.min(1, (i - 0.6) * 3), NI.tDuration * 1.2)],
+      },
+    };
+  } else if (i >= 0.3) {
+    ov.V3 = { add: [stElevPlateau(0.05 + 0.05 * i, 10, 80)] };
+  }
   return ov;
 };
 
@@ -620,8 +632,13 @@ export const pericarditis: PathologyTemplate = (i) => {
       ],
     };
   }
-  // V1 typically shows ST depression or isoelectric (reciprocal to lateral).
-  ov.V1 = { add: [stElevPlateau(-stElev * 0.5)] };
+  // V1 typically shows ST depression (reciprocal to lateral) + PR elevation.
+  ov.V1 = {
+    add: [
+      stElevPlateau(-0.08 - 0.08 * i),  // slight ST depression
+      stShift(A.pCenter + 30, 0.03 + 0.05 * i, 80),  // PR elevation (reciprocal)
+    ],
+  };
   return ov;
 };
 
@@ -669,6 +686,7 @@ export const wellens: PathologyTemplate = (i) => {
   // V1 and V4 may show milder T inversion (extension).
   ov.V1 = { replace: { t: [tWave(A.tCenter, -0.10 - 0.10 * i, NI.tDuration)] } };
   ov.V4 = { replace: { t: [tWave(A.tCenter, -0.10 - 0.10 * i, NI.tDuration)] } };
+  ov.V5 = { replace: { t: [tWave(A.tCenter, -0.05 - 0.05 * i, NI.tDuration)] } };
   return ov;
 };
 
@@ -685,6 +703,9 @@ export const dewinter: PathologyTemplate = (i) => {
       add: [stElevPlateau(stDep)],
     };
   }
+  // Limb leads for derived lead consistency (III, aVR, aVL, aVF).
+  ov.I = { replace: { t: [tWave(A.tCenter, 0.30 + 0.20 * i, NI.tDuration * 0.9)] }, add: [stElevPlateau(-0.10 - 0.10 * i)] };
+  ov.II = { replace: { t: [tWave(A.tCenter, 0.30 + 0.20 * i, NI.tDuration * 0.9)] }, add: [stElevPlateau(-0.10 - 0.10 * i)] };
   return ov;
 };
 
@@ -695,24 +716,28 @@ export const dewinter: PathologyTemplate = (i) => {
 // II itself is NOT inverted — only III (and sometimes aVF).
 export const pe: PathologyTemplate = (i) => {
   const ov: LeadOverrides = {};
-  // S1: deep S in lead I.
-  ov.I = { replace: { s: [sWave(A.sCenter + 10, 0.40 + 0.30 * i, 70)] } };
-  // II: small-mild R + small S so III = II - I produces a net
-  // negative QRS (Q3, R<0.25). To get III's T inverted (T3) we
-  // need II's T smaller than I's T (III_T = II_T - I_T). Slightly
-  // reduce II's T so III_T goes negative.
+  // S1: rS in I — small r, deep S.
+  ov.I = {
+    replace: {
+      r: [rWave(A.rCenter, 0.20 + 0.10 * i, 60)],
+      s: [sWave(A.sCenter + 10, 0.45 + 0.30 * i, 70)],
+    }
+  };
+  // II: qR pattern, small T — so III = II - I creates Q3 + T3.
   ov.II = {
     replace: {
-      r: [rWave(A.rCenter, 0.70, 80)],
-      s: [sWave(A.sCenter, 0.50 + 0.20 * i, 70)],
-      t: [tWave(A.tCenter, 0.05, NI.tDuration)],
+      q: [qWave(A.qCenter, 0.08 + 0.04 * i, 30)],
+      r: [rWave(A.rCenter, 0.65 + 0.15 * i, 70)],
+      s: [sWave(A.sCenter, 0.15 + 0.10 * i, 50)],
+      t: [tWave(A.tCenter, 0.04, NI.tDuration)],
     },
   };
-  // Anterior T inversion (V1-V3) — RV strain. This is the most
-  // consistent PE ECG finding.
+  // Anterior T inversion (RV strain) — V1-V3.
   for (const lead of ['V1', 'V2', 'V3']) {
-    ov[lead] = { replace: { t: [tWave(A.tCenter, -0.10 - 0.20 * i, NI.tDuration)] } };
+    ov[lead] = { replace: { t: [tWave(A.tCenter, -0.10 - 0.25 * i, NI.tDuration)] } };
   }
+  // V4 may show subtle T flattening at high intensity.
+  ov.V4 = { replace: { t: [tWave(A.tCenter, 0.05 - 0.10 * i, NI.tDuration)] } };
   return ov;
 };
 
@@ -766,6 +791,12 @@ export const rvh: PathologyTemplate = (i) => {
     replace: {
       r: [rWave(A.rCenter, 0.60 + 0.20 * i, 70)],
       s: [sWave(A.sCenter, 0.60, 70)],
+    },
+  };
+  ov.V4 = {
+    replace: {
+      r: [rWave(A.rCenter, 0.80 + 0.20 * i, 70)],
+      s: [sWave(A.sCenter, 0.50, 70)],
     },
   };
   for (const lead of ['I', 'V5', 'V6']) {
