@@ -21,6 +21,7 @@ import {
   addTraceNoise
 } from "../lib/ecg-math";
 import { validateRhythmAllLeads } from "../lib/ecg-validate";
+import { getRepresentativeId, RepresentativeRecord } from "../lib/representative-ids";
 
 function getImpureTimestamp(): string {
   if (typeof window !== "undefined") {
@@ -2868,7 +2869,8 @@ export default function ECGSimulatorPage() {
   };
 
   // ── Selector handler ──
-  const selectRhythm = (id: string) => {
+  const selectRhythm = async (id: string) => {
+    const freq = selectedFreq;
     if (manualMode) {
       setManualMode(false);
     }
@@ -2893,7 +2895,58 @@ export default function ECGSimulatorPage() {
     stateRef.current.beatIndex = 0;
 
     const matched = RHYTHMS.find((r) => r.id === id);
-    showToastMsg("Rhythm Configured: " + (matched ? matched.name : id.toUpperCase()));
+
+    // Try loading a representative clinical record from PTB-XL
+    const rep = getRepresentativeId(id);
+    if (rep) {
+      try {
+        setSignalsLoading(true);
+        setMode("database");
+        stateRef.current.mode = "database";
+        const url = `/api/ecg/${rep.ecg_id}?frequency=${freq}`;
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (data.signals) {
+          const record = {
+            ecg_id: data.ecg_id,
+            patient_id: data.patient_id,
+            superclass: data.superclass,
+            scp_codes: typeof data.scp_codes === "string" ? data.scp_codes : JSON.stringify(data.scp_codes),
+            report: data.report || "",
+          };
+          setSelectedRecord(record);
+          setRecordSignals(data.signals);
+          stateRef.current.scrollOffset = 0.0;
+          if (stateRef.current.sweepBuf) stateRef.current.sweepBuf.fill(lastDimensions.current.H / 2);
+          if (stateRef.current.sweepWritten) stateRef.current.sweepWritten.fill(0);
+          const loopWindow = buildDbLoopWindow(data.signals, freq);
+          setDbLoopWindow(loopWindow);
+          stateRef.current.dbLoopWindow = loopWindow;
+          if (data.signals["II"]) {
+            const bpmEst = estimateHeartRate(data.signals["II"], freq);
+            setHeartRate(bpmEst);
+          }
+          showToastMsg("Loaded: " + (matched ? matched.name : id.toUpperCase()) + " (Record #" + rep.ecg_id + ")");
+        } else {
+          throw new Error("No signals in response");
+        }
+      } catch (err) {
+        console.error("Failed to load representative record:", rep.ecg_id, err);
+        setMode("simulation");
+        stateRef.current.mode = "simulation";
+        showToastMsg("Could not load clinical record — using simulation for " + (matched ? matched.name : id.toUpperCase()));
+      } finally {
+        setSignalsLoading(false);
+      }
+    } else {
+      // No record — use pure simulation
+      setMode("simulation");
+      stateRef.current.mode = "simulation";
+      setSelectedRecord(null);
+      setRecordSignals(null);
+      showToastMsg("Rhythm Configured: " + (matched ? matched.name : id.toUpperCase()));
+    }
   };
 
   const selectLead = (lead: string) => {
