@@ -1986,6 +1986,16 @@ export default function ECGSimulatorPage() {
             wrapped = true;
           }
 
+          // Clear stale sweep buffer data where the scan head wraps around,
+          // preventing horizontal artifacts from old traces connecting to new.
+          if (wrapped && state.sweepWritten) {
+            const staleStart = Math.floor(state.scanX) + 1;
+            const staleEnd = Math.min(Math.floor(oldScanX) - 1, state.sweepWritten.length - 1);
+            for (let si = staleStart; si <= staleEnd; si++) {
+              if (si >= 0) state.sweepWritten[si] = 0;
+            }
+          }
+
           const totalAdvance = wrapped ? (W - oldScanX) + state.scanX : state.scanX - oldScanX;
           const drawSteps = Math.max(1, Math.ceil(totalAdvance));
           const maxX = state.sweepBuf ? state.sweepBuf.length : Math.ceil(W);

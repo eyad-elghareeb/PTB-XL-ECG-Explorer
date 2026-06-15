@@ -1,34 +1,39 @@
-// ════════════════════════════════════════════════════════════════
 // ecg-math.ts — Beat sequencer + rendering fast-path
 //
 // Public API (preserved exactly for app/page.tsx):
-//   - getWaveformForBeatIndex(phase, lead, beatIndex, rhythm, intensity, bpm,
-//                            amplitude, noise, realistic, manualMode, waveParams): number
-//   - buildAllLeadLUTs(rhythm, lead, intensity, amplitude, bpm, manualMode, waveParams): void
-//   - sampleLeadLUT(lead, phase, rhythm, intensity, bpm, manualMode, waveParams): number
+//   - getWaveformForBeatIndex(...): number
+//   - buildAllLeadLUTs(...): void
+//   - sampleLeadLUT(...): number
 //   - addTraceNoise(val, phase, timeSeed, noiseLevelPct, realistic, bpm): number
+//   - clearCycleCache(): void
+//   - renderLeadCycle(rhythm, lead, intensity, bpm): Float32Array
+//   - renderLeadCycleForBeat(rhythm, lead, intensity, bpm, beatIndex): Float32Array
 //
-// Internally this is a thin layer over:
-//   - lib/ecg-model.ts      (segment primitives, baseline)
-//   - lib/ecg-pathologies.ts(per-lead templates per rhythm)
-// ════════════════════════════════════════════════════════════════
+// Internally uses:
+//   - lib/ecg-model.ts       (piecewise sinusoidal waveform synthesis)
+//   - lib/ecg-rhythms.ts     (rhythm definitions, LEAD_TARGET_AMPLITUDE)
+//   - lib/ecg-model.ts       (nsrWaveformAtMs, generateLeadCycle, nsrWaveformAtMsLeadAware)
 
 import {
-  WaveSegment, renderCycle, composeBeat, applyOverrides,
-  baselineSegments, INDEPENDENT_LEADS, DEPENDENT_LEAD_FORMULAS,
-  pWave, qWave, rWave, sWave, tWave, uWave, jWave, stShift, deltaWave,
-  WAVE_ANCHORS_MS as A, NORMAL_INTERVALS_MS as NI,
+  WaveParams,
+  INDEPENDENT_LEADS,
+  DEPENDENT_LEAD_FORMULAS,
+  generateLeadCycle,
+  nsrWaveformAtMs,
+  nsrWaveformAtMsLeadAware,
 } from './ecg-model';
-import { getTemplate } from './ecg-pathologies';
-import {
-  LEADS, BEAT_AWARE_RHYTHMS, LEAD_TARGET_AMPLITUDE,
-} from './ecg-rhythms';
+import { LEADS, BEAT_AWARE_RHYTHMS, LEAD_TARGET_AMPLITUDE } from './ecg-rhythms';
+import { INTENSITY_STAGES } from './ecg-rhythms';
 
 // ─── Cycle cache ────────────────────────────────────────────────
-// Rendered one-beat Float32Array per (rhythm, lead, intensity, bpm).
 
 const cycleCache = new Map<string, Float32Array>();
-const CYCLE_SAMPLE_RATE = 500; // Hz
+const CYCLE_SAMPLE_RATE = 500;
+
+function getParams(rhythm: string, intensity: number): WaveParams {
+  const config = INTENSITY_STAGES[rhythm] || INTENSITY_STAGES._default;
+  return config.params(Math.max(0, Math.min(1, intensity)));
+}
 
 function getCycle(rhythm: string, lead: string, intensity: number, bpm: number): Float32Array {
   const key = `${rhythm}|${lead}|${intensity.toFixed(4)}|${bpm}`;
@@ -36,24 +41,35 @@ function getCycle(rhythm: string, lead: string, intensity: number, bpm: number):
   if (cached) return cached;
 
   const rrMs = 60000 / Math.max(1, bpm);
-  const overrides = getTemplate(rhythm)(intensity);
-  const segments = applyOverrides(lead, overrides);
-  const cycle = renderCycle(segments, rrMs, CYCLE_SAMPLE_RATE);
-  // Cap the cache to avoid unbounded growth in long sessions.
+  const params = getParams(rhythm, intensity);
+
+  // For lead-aware rhythms, use the lead-aware waveform generator
+  if (isLeadAwareRhythm(rhythm)) {
+    const N = Math.max(64, Math.round((rrMs / 1000) * CYCLE_SAMPLE_RATE));
+    const out = new Float32Array(N);
+    const msPerSample = rrMs / N;
+    for (let i = 0; i < N; i++) {
+      const tMs = i * msPerSample;
+      out[i] = nsrWaveformAtMsLeadAware(tMs, rrMs, params, lead, rhythm);
+    }
+    if (cycleCache.size > 4096) cycleCache.clear();
+    cycleCache.set(key, out);
+    return out;
+  }
+
+  const cycle = generateLeadCycle(lead, rrMs, params, CYCLE_SAMPLE_RATE);
   if (cycleCache.size > 4096) cycleCache.clear();
   cycleCache.set(key, cycle);
   return cycle;
 }
 
-/** Clear the cycle cache (used when settings change aggressively). */
 export function clearCycleCache(): void {
   cycleCache.clear();
 }
 
-// ─── Sample an independent lead at fractional phase ─────────────
+// ─── Sample at fractional phase ─────────────────────────────────
 
-function sampleIndependent(rhythm: string, lead: string, intensity: number, bpm: number, phase: number): number {
-  const cycle = getCycle(rhythm, lead, intensity, bpm);
+function sampleCycle(cycle: Float32Array, phase: number): number {
   const N = cycle.length;
   const idxFloat = ((phase % 1) + 1) % 1 * N;
   const i0 = Math.floor(idxFloat) % N;
@@ -62,13 +78,13 @@ function sampleIndependent(rhythm: string, lead: string, intensity: number, bpm:
   return cycle[i0] * (1 - frac) + cycle[i1] * frac;
 }
 
+function sampleIndependent(rhythm: string, lead: string, intensity: number, bpm: number, phase: number): number {
+  const cycle = getCycle(rhythm, lead, intensity, bpm);
+  return sampleCycle(cycle, phase);
+}
+
 function sampleDependent(
-  rhythm: string,
-  depLead: string,
-  intensity: number,
-  bpm: number,
-  phase: number,
-  beatIndex: number
+  rhythm: string, depLead: string, intensity: number, bpm: number, phase: number, beatIndex: number
 ): number {
   const fn = DEPENDENT_LEAD_FORMULAS[depLead];
   if (!fn) return 0;
@@ -78,31 +94,20 @@ function sampleDependent(
 }
 
 // ─── Beat sequencer ─────────────────────────────────────────────
-// Handles rhythms whose morphology depends on which beat in a group
-// we're on (afib fibrillation, flutter sawtooth, AV block cycles,
-// PVC trigeminy, VT, VFib, asystole, PEA).
 
 function sampleBeatSequenced(
-  rhythm: string,
-  lead: string,
-  intensity: number,
-  bpm: number,
-  phase: number,
-  beatIndex: number
+  rhythm: string, lead: string, intensity: number, bpm: number, phase: number, beatIndex: number
 ): number {
-  // VFib / asystole / PEA: direct noise synthesis.
   if (rhythm === 'vfib')     return vfibValue(intensity, phase, beatIndex, lead);
   if (rhythm === 'asystole') return asystoleValue(intensity, phase, beatIndex, lead);
   if (rhythm === 'pea')      return peaValue(intensity, phase, beatIndex, lead);
 
-  // Atrial fibrillation: NSR QRS + fibrillatory baseline, no P.
   if (rhythm === 'afib') {
     const qrs = sampleIndependent('afib', lead, intensity, bpm, phase);
     const fib = afibBaseline(intensity, phase, beatIndex, lead);
     return qrs + fib;
   }
 
-  // Atrial flutter: NSR QRS + sawtooth at flutter rate.
   if (rhythm === 'aflutter') {
     const qrs = sampleIndependent('aflutter', lead, intensity, bpm, phase);
     const saw = flutterSawtooth(intensity, phase, bpm);
@@ -110,23 +115,18 @@ function sampleBeatSequenced(
     return qrs + saw * (leadAmp / 1.6);
   }
 
-  // AV Block 2° Mobitz I (Wenckebach): progressive PR lengthening,
-  // then a P-only beat (no QRS).
   if (rhythm === 'avb2mob1') {
     const cycleLen = intensity > 0.55 ? 3 : intensity > 0.25 ? 4 : 5;
     const idxInCycle = beatIndex % cycleLen;
     const isDropped = idxInCycle === cycleLen - 1;
     if (isDropped) {
-      // P wave only — phase 0..0.2 maps to P region; rest flat.
       return pOnlyValue(lead, bpm, phase, intensity, beatIndex, idxInCycle);
     }
-    // Progressive PR prolongation: each beat in cycle has longer PR.
     const prExtra = (60 + 40 * intensity) * idxInCycle;
     const shiftedPhase = shiftPhaseForPR(phase, prExtra, bpm);
     return sampleIndependent('avb1', lead, intensity, bpm, shiftedPhase);
   }
 
-  // AV Block 2° Mobitz II: constant PR, sudden dropped QRS, wide QRS.
   if (rhythm === 'avb2mob2') {
     const cycleLen = intensity > 0.55 ? 2 : intensity > 0.25 ? 3 : 4;
     const isDropped = beatIndex % cycleLen === cycleLen - 1;
@@ -134,7 +134,6 @@ function sampleBeatSequenced(
     return sampleIndependent('avb2mob2', lead, intensity, bpm, phase);
   }
 
-  // AV Block 3° (complete): independent atrial P's + ventricular escape.
   if (rhythm === 'avb3') {
     const ventRate = Math.max(18, bpm);
     const atrialRate = 70 + 20 * intensity;
@@ -147,19 +146,32 @@ function sampleBeatSequenced(
     return pOnly + qrst;
   }
 
-  // PVC trigeminy: every 3rd beat is a wide ectopic.
   if (rhythm === 'pvc') {
     if (beatIndex % 3 === 2) {
-      return sampleIndependent('pvc', lead, intensity, bpm, phase);
+      return pvcWaveform(phase, intensity, lead, bpm);
     }
     return sampleIndependent('nsr', lead, 0, bpm, phase);
   }
 
-  // Default: render the rhythm's template directly.
+  if (rhythm === 'vtach') {
+    return vtachWaveform(phase, intensity, lead, bpm);
+  }
+
   return sampleIndependent(rhythm, lead, intensity, bpm, phase);
 }
 
-// ─── Beat-sequencer helpers ─────────────────────────────────────
+// ─── Rhythm-specific waveform helpers ───────────────────────────
+
+function isLeadAwareRhythm(rhythm: string): boolean {
+  if (!rhythm) return false;
+  return LEADAWARE_RHYTHMS.has(rhythm);
+}
+
+const LEADAWARE_RHYTHMS = new Set([
+  'lbbb', 'rbbb', 'brugada',
+  'stemi_ant', 'stemi_inf', 'stemi_lat', 'stemi_antlat', 'stemi_inflat', 'stemi_rv',
+  'pwmi', 'pericarditis', 'wellens', 'dewinter',
+]);
 
 function afibBaseline(intensity: number, phase: number, beatIndex: number, lead: string): number {
   const baseNoise = 0.04 + 0.14 * intensity;
@@ -183,23 +195,14 @@ function flutterSawtooth(intensity: number, phase: number, bpm: number): number 
   return -flAmp * (saw + 0.25 * Math.sin(2 * Math.PI * flutterPhase));
 }
 
-function pOnlyValue(lead: string, bpm: number, phase: number, intensity: number, beatIndex: number, cycleIdx: number): number {
-  // For dropped-beat phases in AV blocks, render an isolated P wave.
+function pOnlyValue(lead: string, bpm: number, phase: number, _intensity: number, _beatIndex: number, _cycleIdx: number): number {
   if (phase > 0.30) return 0;
-  const rrMs = 60000 / Math.max(1, bpm);
   const cycle = getCycle('nsr', lead, 0, bpm);
-  // P region sits in the first ~18% of cycle; map phase 0..0.25 → 0..0.20.
-  const N = cycle.length;
   const pFraction = Math.min(0.20, phase / 0.25 * 0.20);
-  const idxFloat = pFraction * N;
-  const i0 = Math.floor(idxFloat) % N;
-  const i1 = (i0 + 1) % N;
-  const frac = idxFloat - Math.floor(idxFloat);
-  return cycle[i0] * (1 - frac) + cycle[i1] * frac;
+  return sampleCycle(cycle, pFraction);
 }
 
 function shiftPhaseForPR(phase: number, extraPrMs: number, bpm: number): number {
-  // Each ms of extra PR shifts the beat later by that fraction of cycle.
   const cycleMs = 60000 / Math.max(1, bpm);
   const shift = extraPrMs / cycleMs;
   return ((phase - shift) % 1 + 1) % 1;
@@ -225,26 +228,95 @@ function asystoleValue(intensity: number, phase: number, beatIndex: number, _lea
 }
 
 function peaValue(intensity: number, phase: number, beatIndex: number, _lead: string): number {
-  // Low-amplitude organized QRS complexes.
   const base = sampleIndependent('pea', 'II', intensity, 35, phase);
   const t = (beatIndex + phase) * (60 / 35);
   return base * (1 - 0.3 * intensity) + 0.02 * Math.sin(t * 11);
 }
 
+// ─── PVC waveform (piecewise sinusoidal) ────────────────────────
+
+function pvcWaveform(phase: number, intensity: number, lead: string, bpm: number): number {
+  const rrMs = 60000 / Math.max(1, bpm);
+  const tMs = phase * rrMs;
+  const pMs = 80;
+  const amp = 0.8 + 0.6 * intensity;
+  const qrsW = 0.12 + 0.08 * intensity;
+
+  const msPerQRS = qrsW * rrMs;
+  let val = 0;
+
+  // No P wave before PVC
+
+  // Wide bizarre QRS
+  const qrsEnd = pMs + msPerQRS;
+  if (tMs >= pMs && tMs < pMs + msPerQRS * 0.55) {
+    const prog = (tMs - pMs) / (msPerQRS * 0.55);
+    val += amp * Math.sin(Math.PI * prog);
+  }
+  if (tMs >= pMs + msPerQRS * 0.55 && tMs < qrsEnd) {
+    const prog = (tMs - pMs - msPerQRS * 0.55) / (msPerQRS * 0.45);
+    const sDepth = 0.6 + 0.4 * intensity;
+    val += -sDepth * Math.sin(Math.PI * prog) * (1 + 0.15 * Math.sin(Math.PI * prog * 3));
+  }
+
+  // Discordant ST-T
+  const stEnd = qrsEnd + 0.08 * rrMs;
+  if (tMs >= qrsEnd && tMs < stEnd) {
+    val += -(0.08 + 0.12 * intensity);
+  }
+
+  const tEnd = stEnd + (0.20 + 0.06 * intensity) * rrMs;
+  if (tMs >= stEnd && tMs < tEnd) {
+    const tDiscordant = -(0.25 + 0.25 * intensity);
+    val += tDiscordant * Math.sin(Math.PI * (tMs - stEnd) / (tEnd - stEnd));
+  }
+
+  return val;
+}
+
+// ─── VTach waveform ─────────────────────────────────────────────
+
+function vtachWaveform(phase: number, intensity: number, _lead: string, _bpm: number): number {
+  const widening = 0.08 + 0.12 * intensity;
+  const polymorph = 0.15 * intensity * Math.sin(phase * 0.8);
+  const amp = 0.5 + 0.7 * intensity;
+  if (phase < 0.5) {
+    return amp * (Math.sin(Math.PI * phase / 0.5) + 0.25 * Math.sin(Math.PI * phase / 0.25) + polymorph * 0.3);
+  }
+  return -amp * (Math.sin(Math.PI * (phase - 0.5) / 0.5) * 0.6 + polymorph * 0.2);
+}
+
+// ─── Manual mode waveform ───────────────────────────────────────
+
+export function ecgManualWaveform(phase: number, bpm: number, p: any): number {
+  const rrMs = 60000 / Math.max(1, bpm);
+  const tMs = phase * rrMs;
+  const params: WaveParams = {
+    pAmp: p?.pAmp ?? 0.12,
+    pDur: p?.pDur ?? 0.10,
+    prInt: p?.prInt ?? 0.19,
+    qrsAmp: p?.qrsAmp ?? 1.0,
+    qrsDur: p?.qrsDur ?? 0.06,
+    stElev: p?.stElev ?? 0,
+    stDur: p?.stDur ?? 0.12,
+    stSlope: p?.stSlope ?? 0,
+    tAmp: p?.tAmp ?? 0.22,
+    tDur: p?.tDur ?? 0.19,
+    tShape: p?.tShape ?? 1,
+    jNotch: p?.jNotch ?? 0,
+    uAmp: p?.uAmp ?? 0,
+    uDur: p?.uDur ?? 0.10,
+  };
+  return nsrWaveformAtMs(tMs, rrMs, params, 'II');
+}
+
 // ─── Public: per-beat sample (drop-in for page.tsx) ─────────────
 
 export function getWaveformForBeatIndex(
-  phase: number,
-  lead: string,
-  beatIndex: number,
-  rhythm: string,
-  intensity: number,
-  bpm: number,
-  amplitude: number,
-  noise: number,
-  realistic: boolean,
-  manualMode: boolean,
-  waveParams: any
+  phase: number, lead: string, beatIndex: number,
+  rhythm: string, intensity: number, bpm: number,
+  amplitude: number, noise: number, realistic: boolean,
+  manualMode: boolean, waveParams: any
 ): number {
   let val: number;
 
@@ -263,26 +335,20 @@ export function getWaveformForBeatIndex(
   return addTraceNoise(val, phase, beatIndex, noise, realistic, bpm);
 }
 
-// ─── LUT fast-path (used by page.tsx for non-beat-aware rhythms) ─
+// ─── LUT fast-path ──────────────────────────────────────────────
 
 const leadLUTs: Record<string, Float32Array> = {};
 let leadLUTCacheKey = '';
 const LUT_SIZE = 2048;
 
 export function buildAllLeadLUTs(
-  rhythm: string,
-  _lead: string,
-  intensity: number,
-  _amplitude: number,
-  bpm: number,
-  manualMode: boolean,
-  waveParams: any
+  rhythm: string, _lead: string, intensity: number, _amplitude: number,
+  bpm: number, manualMode: boolean, waveParams: any
 ): void {
   const cacheKey = [rhythm, intensity.toFixed(4), bpm, manualMode ? 'm' : 'a', JSON.stringify(waveParams || {})].join('|');
   if (leadLUTCacheKey === cacheKey) return;
 
   for (const l of LEADS) {
-    // Skip dependent leads — derived on-the-fly from I and II in sampleLeadLUT.
     if (DEPENDENT_LEAD_FORMULAS[l]) continue;
     if (!leadLUTs[l]) leadLUTs[l] = new Float32Array(LUT_SIZE);
     const lut = leadLUTs[l];
@@ -295,26 +361,19 @@ export function buildAllLeadLUTs(
 }
 
 export function sampleLeadLUT(
-  lead: string,
-  phase: number,
-  rhythm: string,
-  intensity: number,
-  bpm: number,
-  manualMode: boolean,
-  waveParams: any
+  lead: string, phase: number, rhythm: string, intensity: number,
+  bpm: number, manualMode: boolean, waveParams: any
 ): number {
-  // Dependent leads: derive from I and II (LUT or on-the-fly).
-  // This ensures pathology applied to I/II propagates correctly.
   if (DEPENDENT_LEAD_FORMULAS[lead]) {
     const vI  = sampleLeadLUT('I',  phase, rhythm, intensity, bpm, manualMode, waveParams);
     const vII = sampleLeadLUT('II', phase, rhythm, intensity, bpm, manualMode, waveParams);
     return DEPENDENT_LEAD_FORMULAS[lead](vI, vII);
   }
 
-  // Beat-aware rhythms must NOT use the cached LUT (they depend on beatIndex).
   if (BEAT_AWARE_RHYTHMS.has(rhythm)) {
     return sampleBeatSequenced(rhythm, lead, intensity, bpm, phase, 0);
   }
+
   const lut = leadLUTs[lead];
   if (!lut) {
     return sampleBeatSequenced(rhythm, lead, intensity, bpm, phase, 0);
@@ -326,67 +385,23 @@ export function sampleLeadLUT(
   return lut[i0] + (lut[i1] - lut[i0]) * frac;
 }
 
-// ─── Manual mode waveform (Wave Builder customizer) ─────────────
-// Preserved: maps user waveParams → segments.
-
-export function ecgManualWaveform(phase: number, bpm: number, p: any): number {
-  const rrMs = 60000 / Math.max(1, bpm);
-  const N = Math.max(64, Math.round((rrMs / 1000) * CYCLE_SAMPLE_RATE));
-  const rIdx = Math.floor(N * 0.25);
-
-  // Build a synthetic segment list from p each call. p may be missing
-  // fields; fall back to baseline intervals.
-  const pr = (p?.prInt ?? 0.16) * 1000;          // s → ms
-  const qrsDur = (p?.qrsDur ?? 0.08) * 1000;
-  const tDur = (p?.tDur ?? 0.16) * 1000;
-  const pDur = (p?.pDur ?? 0.10) * 1000;
-  const uDur = (p?.uDur ?? 0.10) * 1000;
-
-  const segs: WaveSegment[] = [];
-  if ((p?.pAmp ?? 0) !== 0) {
-    segs.push(pWave(A.rCenter - pr - pDur * 0.5, p.pAmp, pDur));
-  }
-  if ((p?.qrsAmp ?? 1) > 0) {
-    segs.push(rWave(A.rCenter, p.qrsAmp, qrsDur));
-  }
-  if (p?.stElev && Math.abs(p.stElev) > 0.01) {
-    segs.push(stShift(A.jPoint + 20, p.stElev, 100));
-  }
-  if ((p?.tAmp ?? 0) !== 0) {
-    segs.push(tWave(A.rCenter + 60 + tDur * 0.5 + 100, p.tAmp, tDur));
-  }
-  if ((p?.uAmp ?? 0) > 0) {
-    segs.push(uWave(A.tCenter + 150, p.uAmp, uDur));
-  }
-  if ((p?.jNotch ?? 0) > 0) {
-    segs.push(jWave(A.jPoint + 5, p.jNotch, 30));
-  }
-
-  const msPerSample = rrMs / N;
-  const tMs = (Math.floor(((phase % 1) + 1) % 1 * N) - rIdx) * msPerSample;
-  return composeBeat(segs, tMs);
-}
-
-// ─── Noise (preserved signature) ────────────────────────────────
+// ─── Noise ──────────────────────────────────────────────────────
 
 const noiseCache: Record<string, Float32Array> = {};
 
 export function getLaplaceNoiseSample(index: number, length: number, samplingRate: number, amplitude: number, frequency: number): number {
   const cacheKey = `${length}_${samplingRate}_${amplitude.toFixed(4)}_${frequency}`;
   let noiseBuf = noiseCache[cacheKey];
-
   if (!noiseBuf) {
     const duration = length / samplingRate;
     const noiseDuration = Math.max(1, Math.floor(duration * frequency));
     const rawNoise = new Float32Array(noiseDuration);
-
     const scale = amplitude / Math.sqrt(2);
     for (let i = 0; i < noiseDuration; i++) {
       const seed = Math.sin((i + frequency) * 12.9898 + 78.233) * 43758.5453;
       const u = (seed - Math.floor(seed)) - 0.5;
       rawNoise[i] = -scale * Math.sign(u) * Math.log(1.0 - 2.0 * Math.abs(u));
     }
-
     noiseBuf = new Float32Array(length);
     if (noiseDuration === 1) {
       noiseBuf.fill(rawNoise[0]);
@@ -402,7 +417,6 @@ export function getLaplaceNoiseSample(index: number, length: number, samplingRat
     }
     noiseCache[cacheKey] = noiseBuf;
   }
-
   return noiseBuf[index % length];
 }
 
@@ -437,34 +451,29 @@ export function addTraceNoise(val: number, phase: number, timeSeed: number, nois
   return val + noise;
 }
 
-// ─── Diagnostic exports (used by ecg-validate.ts) ───────────────
+// ─── Diagnostic exports ─────────────────────────────────────────
 
 export function renderLeadCycle(rhythm: string, lead: string, intensity: number, bpm: number): Float32Array {
   return getCycle(rhythm, lead, intensity, bpm);
 }
 
 export function renderLeadCycleForBeat(
-  rhythm: string,
-  lead: string,
-  intensity: number,
-  bpm: number,
-  beatIndex: number
+  rhythm: string, lead: string, intensity: number, bpm: number, _beatIndex: number
 ): Float32Array {
-  // For beat-aware rhythms, render the representative beat (beatIndex 0
-  // for non-ectopic; for PVC trigeminy use the ectopic beat at index 2).
   const sampleBeat = (rhythm === 'pvc') ? 2 : 0;
-  const N = Math.max(64, Math.round((60000 / Math.max(1, bpm) / 1000) * CYCLE_SAMPLE_RATE));
-  const out = new Float32Array(N);
+  const rrMs = 60000 / Math.max(1, bpm);
+  const N = Math.max(64, Math.round((rrMs / 1000) * CYCLE_SAMPLE_RATE));
 
-  // Dependent leads (III, aVR, aVL, aVF) derive from I and II at each sample.
   if (DEPENDENT_LEAD_FORMULAS[lead]) {
-    const cycleI  = renderLeadCycleForBeat(rhythm, 'I',  intensity, bpm, beatIndex);
-    const cycleII = renderLeadCycleForBeat(rhythm, 'II', intensity, bpm, beatIndex);
+    const cycleI  = renderLeadCycleForBeat(rhythm, 'I',  intensity, bpm, _beatIndex);
+    const cycleII = renderLeadCycleForBeat(rhythm, 'II', intensity, bpm, _beatIndex);
     const fn = DEPENDENT_LEAD_FORMULAS[lead];
+    const out = new Float32Array(N);
     for (let i = 0; i < N; i++) out[i] = fn(cycleI[i], cycleII[i]);
     return out;
   }
 
+  const out = new Float32Array(N);
   for (let i = 0; i < N; i++) {
     const phase = i / N;
     out[i] = sampleBeatSequenced(rhythm, lead, intensity, bpm, phase, sampleBeat);
@@ -472,4 +481,6 @@ export function renderLeadCycleForBeat(
   return out;
 }
 
-export { INDEPENDENT_LEADS, baselineSegments, getTemplate, composeBeat };
+export { INDEPENDENT_LEADS, baselineSegments } from './ecg-model';
+export { LEAD_SCALE } from './ecg-model';
+export { getTemplate } from './ecg-pathologies';
