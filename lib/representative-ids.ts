@@ -4,7 +4,8 @@ export interface RepresentativeRecord {
   label: string;
 }
 
-const REPRESENTATIVE_IDS: Record<string, RepresentativeRecord> = {
+export const REPRESENTATIVE_IDS: Record<string, RepresentativeRecord> = {
+  // ─ Exact SCP code matches (weight=100 primary diagnosis) ─
   nsr:         { ecg_id: 1,     superclass: "NORM", label: "Normal Sinus Rhythm" },
   st:          { ecg_id: 12767, superclass: "STTC", label: "Sinus Tachycardia" },
   afib:        { ecg_id: 351,   superclass: "CD",   label: "Atrial Fibrillation" },
@@ -34,6 +35,19 @@ const REPRESENTATIVE_IDS: Record<string, RepresentativeRecord> = {
   stemi_antlat:{ ecg_id: 2448,  superclass: "MI",   label: "Anterolateral STEMI" },
   stemi_inflat:{ ecg_id: 514,   superclass: "MI",   label: "Inferolateral STEMI" },
   pwmi:        { ecg_id: 7244,  superclass: "MI",   label: "Posterior Wall MI" },
+
+  // ─ Best-available mappings (SBRAD only at weight=0, report-confirmed) ─
+  sb:          { ecg_id: 2,     superclass: "NORM", label: "Sinus Bradycardia (young athlete ECG)" },
+
+  // ─ Approximate / surrogate records for rare pathologies ─
+  earlyrepo:   { ecg_id: 2143,  superclass: "NORM", label: "Benign Early Repolarization (report-confirmed)" },
+  stemi_rv:    { ecg_id: 139,   superclass: "MI",   label: "Inferior STEMI (IMI — surrogate for RV involvement)" },
+  brugada:     { ecg_id: 1725,  superclass: "STTC", label: "IRBBB + STE (surrogate: mimics Brugada V1–V3)" },
+  wellens:     { ecg_id: 266,   superclass: "MI",   label: "ALMI with deep T inversion (surrogate for Wellens)" },
+  pericarditis:{ ecg_id: 1600,  superclass: "NORM", label: "Isolated STE in normal (surrogate for Pericarditis)" },
+  pe:          { ecg_id: 4602,  superclass: "STTC", label: "RVH + STACH (surrogate: RV strain pattern for PE)" },
+  vtach:       { ecg_id: 4637,  superclass: "STTC", label: "PVC + BIGU (surrogate: bigeminal ventricular ectopy)" },
+  bve:         { ecg_id: 943,   superclass: "MI",   label: "Bi-atrial enlargement (ASMI + LAO/LAE + RAO/RAE)" },
 };
 
 export function getRepresentativeId(rhythmId: string): RepresentativeRecord | null {
