@@ -282,6 +282,8 @@ export function buildAllLeadLUTs(
   if (leadLUTCacheKey === cacheKey) return;
 
   for (const l of LEADS) {
+    // Skip dependent leads — derived on-the-fly from I and II in sampleLeadLUT.
+    if (DEPENDENT_LEAD_FORMULAS[l]) continue;
     if (!leadLUTs[l]) leadLUTs[l] = new Float32Array(LUT_SIZE);
     const lut = leadLUTs[l];
     for (let i = 0; i < LUT_SIZE; i++) {
@@ -301,6 +303,14 @@ export function sampleLeadLUT(
   manualMode: boolean,
   waveParams: any
 ): number {
+  // Dependent leads: derive from I and II (LUT or on-the-fly).
+  // This ensures pathology applied to I/II propagates correctly.
+  if (DEPENDENT_LEAD_FORMULAS[lead]) {
+    const vI  = sampleLeadLUT('I',  phase, rhythm, intensity, bpm, manualMode, waveParams);
+    const vII = sampleLeadLUT('II', phase, rhythm, intensity, bpm, manualMode, waveParams);
+    return DEPENDENT_LEAD_FORMULAS[lead](vI, vII);
+  }
+
   // Beat-aware rhythms must NOT use the cached LUT (they depend on beatIndex).
   if (BEAT_AWARE_RHYTHMS.has(rhythm)) {
     return sampleBeatSequenced(rhythm, lead, intensity, bpm, phase, 0);

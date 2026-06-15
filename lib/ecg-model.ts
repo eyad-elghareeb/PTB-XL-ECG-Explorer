@@ -275,12 +275,19 @@ export function baselineSegments(lead: string): WaveSegment[] {
   if (!b) return [];
   const A = WAVE_ANCHORS_MS;
   const I = NORMAL_INTERVALS_MS;
-  const segs: WaveSegment[] = [
-    pWave(A.pCenter, I.pAmplitude, I.pDuration),
-    rWave(A.rCenter, b.rMv, I.qrsDuration),
-    sWave(A.sCenter, b.sMv, I.qrsDuration * 0.6),
-    tWave(A.tCenter, b.tMv, I.tDuration),
-  ];
+  const segs: WaveSegment[] = [];
+  // V1 P wave is normally biphasic: initial positive (right atrium) then
+  // terminal negative (left atrium). The terminal component (P-terminal
+  // force) has depth ≤ 0.1 mV in normal subjects; > 0.1 mV suggests LAE.
+  if (lead === 'V1') {
+    segs.push(pWave(A.pCenter - 10, 0.06, 50));
+    segs.push(pWave(A.pCenter + 25, -0.06, 50));
+  } else {
+    segs.push(pWave(A.pCenter, I.pAmplitude, I.pDuration));
+  }
+  segs.push(rWave(A.rCenter, b.rMv, I.qrsDuration));
+  segs.push(sWave(A.sCenter, b.sMv, I.qrsDuration * 0.6));
+  segs.push(tWave(A.tCenter, b.tMv, I.tDuration));
   if (b.hasSeptalQ) segs.push(qWave(A.qCenter, b.qMv, I.qDuration));
   return segs;
 }
