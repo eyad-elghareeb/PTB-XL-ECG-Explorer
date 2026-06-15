@@ -201,7 +201,7 @@ export const INTENSITY_STAGES: Record<string, IntensityConfig> = {
       { name: 'Severe Tachy', range: [55, 100], desc: 'HR >160 bpm. Short diastole, P-T fusion, decreased filling time, risk of ischemia.' }
     ],
     defaultIntensity: 0.4,
-    hrMod: (i) => 100 + 120 * i,
+    hrMod: (i) => 110 + 110 * i,
     params: (i) => ({ pAmp: 0.12 + 0.06*i, pDur: 0.09, prInt: 0.19 - 0.04*i, qrsAmp: 1.0, qrsDur: 0.06, stElev: 0, stDur: 0.12, stSlope: 0, tAmp: 0.22 - 0.08*i, tDur: 0.17 - 0.05*i, tShape: 1, jNotch: 0, uAmp: 0, uDur: 0.10 })
   },
   sb: {
@@ -221,7 +221,7 @@ export const INTENSITY_STAGES: Record<string, IntensityConfig> = {
       { name: 'Uncontrolled AFib', range: [55, 100], desc: 'Large chaotic baseline, highly irregular R-R, risk of thromboembolism and hemodynamic compromise.' }
     ],
     defaultIntensity: 0.4,
-    hrMod: (i) => 80 + 40 * i,
+    hrMod: (i) => 90 + 60 * i,
     params: (i) => ({ pAmp: 0, pDur: 0, prInt: 0, qrsAmp: 0.9, qrsDur: 0.06, stElev: 0, stDur: 0.12, stSlope: 0, tAmp: 0.22 - 0.08*i, tDur: 0.19, tShape: 1, jNotch: 0, uAmp: 0, uDur: 0.10 })
   },
   aflutter: {
@@ -417,7 +417,7 @@ export const INTENSITY_STAGES: Record<string, IntensityConfig> = {
       { name: 'Evolved Anterior MI', range: [75, 100], desc: 'Q waves established in V1-V4, ST resolving, T wave inversion (evolving MI).' }
     ],
     defaultIntensity: 0.5,
-    hrMod: (i) => 88 + 15 * i,
+    hrMod: (i) => 90 + 20 * i,
     culpritLeads: ['V1','V2','V3','V4'],
     reciprocalLeads: ['II','III','aVF'],
     params: (i) => {
@@ -764,6 +764,27 @@ export function validateRhythmProfile(rhythmId: string, intensity: number): Rhyt
     });
   }
 
+  // Measured-morphology gate (delegates to ecg-validate).
+  // Wrapped in try/catch so a transient measurement issue never breaks the UI.
+  try {
+    // Lazy require to avoid circular-import problems at module load.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { validateRhythmAllLeads } = require("./ecg-validate") as typeof import("./ecg-validate");
+    const summary = validateRhythmAllLeads(rhythmId, clampedIntensity);
+    const failedDetails = summary.results
+      .filter((r: { passed: boolean; tag: string; lead: string; detail: string }) => !r.passed && r.tag !== "—")
+      .map((r: { lead: string; detail: string }) => `${r.lead}: ${r.detail}`);
+    checks.push({
+      label: "Measured 12-lead morphology",
+      passed: summary.allPassed,
+      detail: summary.allPassed
+        ? `All ${summary.checkedLeads} lead criteria satisfied (measured intervals & amplitudes match diagnostic thresholds).`
+        : `${summary.passedLeads}/${summary.checkedLeads} lead criteria satisfied.` + (failedDetails.length ? ` Failures: ${failedDetails.slice(0, 3).join(" · ")}` : "")
+    });
+  } catch (_e) {
+    // Validator not loadable in this context — skip the morphology check.
+  }
+
   const status = checks.every((check) => check.passed) ? "validated" : "warning";
   return { status, stageName: stage.name, targetHeartRate, checks };
 }
@@ -787,7 +808,7 @@ export const LAYOUT_12 = [
 export const RHYTHM_LEAD = 'II';
 export const LEADS = ['I','II','III','aVR','aVL','aVF','V1','V2','V3','V4','V5','V6'];
 export const BEAT_AWARE_RHYTHMS = new Set(['afib', 'pvc', 'avb2mob1', 'avb2mob2', 'avb3']);
-export const LEAD_AWARE_RHYTHMS = new Set(['lbbb', 'rbbb', 'brugada', 'pwmi', 'pericarditis', 'lvh', 'rvh', 'bve', 'lah', 'rah']);
+export const LEAD_AWARE_RHYTHMS = new Set(['lbbb', 'rbbb', 'brugada', 'pwmi', 'pericarditis', 'lvh', 'rvh', 'bve', 'lah', 'rah', 'pe', 'wellens', 'dewinter', 'hyperk', 'hypokalemia', 'hypothermia']);
 
 export const DEPENDENT_LEADS: Record<string, (I: number, II: number) => number> = {
   'III': (I, II) => II - I,

@@ -21,6 +21,7 @@ import {
   addTraceNoise
 } from "../lib/ecg-math";
 import { validateRhythmAllLeads } from "../lib/ecg-validate";
+import { getRepresentativeId, RepresentativeRecord } from "../lib/representative-ids";
 
 function getImpureTimestamp(): string {
   if (typeof window !== "undefined") {
@@ -999,6 +1000,35 @@ function analyzeECGPeaks(signals: any, leadName: string, freq: number = 500) {
   };
 }
 
+function computeDbIntensityDelta(
+  sampleIdx: number,
+  peaksAnalysis: any,
+  rhythm: string,
+  lead: string,
+  intensity: number,
+  bpm: number,
+  freq: number
+): number {
+  if (!peaksAnalysis?.peaksInfo?.length || intensity <= 0) return 0;
+  const rrSamples = Math.round((peaksAnalysis.meanRR || 60000 / bpm) / 1000 * freq);
+  if (rrSamples <= 0) return 0;
+
+  let lastR = 0;
+  for (const p of peaksAnalysis.peaksInfo) {
+    if (p.index <= sampleIdx) { lastR = p.index; continue; }
+    break;
+  }
+
+  const samplesSinceR = sampleIdx - lastR;
+  let phase = samplesSinceR / rrSamples;
+  if (phase < 0 || phase > 1.3) return 0;
+  if (phase > 1) phase = 0.999;
+
+  const pathVal = getWaveformForBeatIndex(phase, lead, 0, rhythm, intensity, bpm, 1, 0, false, false, null);
+  const normVal = getWaveformForBeatIndex(phase, lead, 0, "nsr", 0, bpm, 1, 0, false, false, null);
+  return (pathVal - normVal) * intensity;
+}
+
 function getScpCategory(code: string): string {
   const mi = [
     "AMI", "ASMI", "ALMI", "IMI", "ILMI", "IPLMI", "IPMI", "LMI", "PMI",
@@ -1072,6 +1102,35 @@ function parseScpCodes(val: any): Record<string, number> {
   if (!val) return {};
   if (typeof val === "object") return val;
   try { return JSON.parse(val); } catch { return {}; }
+}
+
+function DbBadge({ rhythmId }: { rhythmId: string }) {
+  const rep = getRepresentativeId(rhythmId);
+  if (!rep) return null;
+  const isExact = rep.ecg_id <= 10000 && !rep.label.includes("surrogate");
+  const isSurrogate = rep.label.includes("surrogate");
+  return (
+    <span
+      className="rc-db-badge"
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: "2px",
+        marginLeft: "5px",
+        fontSize: "9px",
+        padding: "1px 4px",
+        borderRadius: "3px",
+        fontWeight: 600,
+        background: isSurrogate ? "var(--rhythm-metabolic)" : isExact ? "var(--correct)" : "var(--accent)",
+        color: isSurrogate || !isExact ? "#fff" : "#000",
+        verticalAlign: "middle",
+        lineHeight: "1.4",
+      }}
+      title={rep.label}
+    >
+      {isSurrogate ? "~" : "DB"}
+    </span>
+  );
 }
 
 export default function ECGSimulatorPage() {
@@ -1986,6 +2045,16 @@ export default function ECGSimulatorPage() {
             wrapped = true;
           }
 
+          // Clear stale sweep buffer data where the scan head wraps around,
+          // preventing horizontal artifacts from old traces connecting to new.
+          if (wrapped && state.sweepWritten) {
+            const staleStart = Math.floor(state.scanX) + 1;
+            const staleEnd = Math.min(Math.floor(oldScanX) - 1, state.sweepWritten.length - 1);
+            for (let si = staleStart; si <= staleEnd; si++) {
+              if (si >= 0) state.sweepWritten[si] = 0;
+            }
+          }
+
           const totalAdvance = wrapped ? (W - oldScanX) + state.scanX : state.scanX - oldScanX;
           const drawSteps = Math.max(1, Math.ceil(totalAdvance));
           const maxX = state.sweepBuf ? state.sweepBuf.length : Math.ceil(W);
@@ -2107,6 +2176,13 @@ export default function ECGSimulatorPage() {
               );
               const idx0 = sample.sampleIndex;
               let val = sample.value * state.amplitude;
+
+              if (state.mode === "database" && state.effectIntensity > 0 && state.currentRhythm !== "nsr" && state.peaksAnalysis) {
+                val += computeDbIntensityDelta(
+                  idx0, state.peaksAnalysis, state.currentRhythm, state.currentLead,
+                  state.effectIntensity, state.heartRate, signalFreq
+                ) * state.amplitude;
+              }
 
               if (state.noise > 0) {
                 val = addTraceNoise(val, px * 0.05, 0, state.noise, state.realistic, state.heartRate);
@@ -2341,6 +2417,13 @@ export default function ECGSimulatorPage() {
                   const idx0 = sample.sampleIndex;
                   let val = sample.value * state.amplitude;
 
+                  if (state.mode === "database" && state.effectIntensity > 0 && state.currentRhythm !== "nsr" && state.peaksAnalysis) {
+                    val += computeDbIntensityDelta(
+                      idx0, state.peaksAnalysis, state.currentRhythm, lead,
+                      state.effectIntensity, state.heartRate, signalFreq
+                    ) * state.amplitude;
+                  }
+
                   if (state.noise > 0) {
                     val = addTraceNoise(val, idx0 * 0.05, 0, state.noise, state.realistic, state.heartRate);
                   }
@@ -2433,6 +2516,13 @@ export default function ECGSimulatorPage() {
               );
               const idx0 = sample.sampleIndex;
               let val = sample.value * state.amplitude;
+
+              if (state.mode === "database" && state.effectIntensity > 0 && state.currentRhythm !== "nsr" && state.peaksAnalysis) {
+                val += computeDbIntensityDelta(
+                  idx0, state.peaksAnalysis, state.currentRhythm, "II",
+                  state.effectIntensity, state.heartRate, signalFreq
+                ) * state.amplitude;
+              }
 
               if (state.noise > 0) {
                 val = addTraceNoise(val, px * 0.05, 0, state.noise, state.realistic, state.heartRate);
@@ -2858,7 +2948,8 @@ export default function ECGSimulatorPage() {
   };
 
   // ── Selector handler ──
-  const selectRhythm = (id: string) => {
+  const selectRhythm = async (id: string) => {
+    const freq = selectedFreq;
     if (manualMode) {
       setManualMode(false);
     }
@@ -2883,7 +2974,58 @@ export default function ECGSimulatorPage() {
     stateRef.current.beatIndex = 0;
 
     const matched = RHYTHMS.find((r) => r.id === id);
-    showToastMsg("Rhythm Configured: " + (matched ? matched.name : id.toUpperCase()));
+
+    // Try loading a representative clinical record from PTB-XL
+    const rep = getRepresentativeId(id);
+    if (rep) {
+      try {
+        setSignalsLoading(true);
+        setMode("database");
+        stateRef.current.mode = "database";
+        const url = `/api/ecg/${rep.ecg_id}?frequency=${freq}`;
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (data.signals) {
+          const record = {
+            ecg_id: data.ecg_id,
+            patient_id: data.patient_id,
+            superclass: data.superclass,
+            scp_codes: typeof data.scp_codes === "string" ? data.scp_codes : JSON.stringify(data.scp_codes),
+            report: data.report || "",
+          };
+          setSelectedRecord(record);
+          setRecordSignals(data.signals);
+          stateRef.current.scrollOffset = 0.0;
+          if (stateRef.current.sweepBuf) stateRef.current.sweepBuf.fill(lastDimensions.current.H / 2);
+          if (stateRef.current.sweepWritten) stateRef.current.sweepWritten.fill(0);
+          const loopWindow = buildDbLoopWindow(data.signals, freq);
+          setDbLoopWindow(loopWindow);
+          stateRef.current.dbLoopWindow = loopWindow;
+          if (data.signals["II"]) {
+            const bpmEst = estimateHeartRate(data.signals["II"], freq);
+            setHeartRate(bpmEst);
+          }
+          showToastMsg("Loaded: " + (matched ? matched.name : id.toUpperCase()) + " (Record #" + rep.ecg_id + ")");
+        } else {
+          throw new Error("No signals in response");
+        }
+      } catch (err) {
+        console.error("Failed to load representative record:", rep.ecg_id, err);
+        setMode("simulation");
+        stateRef.current.mode = "simulation";
+        showToastMsg("Could not load clinical record — using simulation for " + (matched ? matched.name : id.toUpperCase()));
+      } finally {
+        setSignalsLoading(false);
+      }
+    } else {
+      // No record — use pure simulation
+      setMode("simulation");
+      stateRef.current.mode = "simulation";
+      setSelectedRecord(null);
+      setRecordSignals(null);
+      showToastMsg("Rhythm Configured: " + (matched ? matched.name : id.toUpperCase()));
+    }
   };
 
   const selectLead = (lead: string) => {
@@ -3733,22 +3875,22 @@ export default function ECGSimulatorPage() {
               onClick={() => {
                 setMode("database");
                 setActiveTab("db-explorer");
-                showToastMsg("Clinical database Explorer activated");
+                showToastMsg("Full PTB-XL Database Explorer");
               }}
-              title="Explore raw sqlite clinical dataset signals"
+              title="Explore the full PTB-XL clinical dataset"
             >
-              Clinical DB
+              Full DB
             </button>
             <button
               className={`view-toggle-btn ${mode === "simulation" ? "active" : ""}`}
               onClick={() => {
                 setMode("simulation");
                 setActiveTab("rhythms");
-                showToastMsg("Continuous Math Simulator activated");
+                showToastMsg("Featured Pathology Rhythms");
               }}
-              title="Generate synthetic cardiac waveforms"
+              title="Curated pathology rhythms backed by clinical records"
             >
-              Simulator
+              Featured
             </button>
           </div>
 
@@ -3848,7 +3990,9 @@ export default function ECGSimulatorPage() {
             }`}
           >
             {mode === "database"
-              ? (selectedRecord ? `Patient ID #${selectedRecord.patient_id} · ${selectedRecord.superclass} (${SCP_DESCRIPTIONS[selectedRecord.superclass] || 'Diagnostic Abnormality'})` : "No Record Loaded")
+              ? (selectedRecord
+                ? `${RHYTHMS.find((r) => r.id === currentRhythm)?.name || "Record"} #${selectedRecord.ecg_id} · ${selectedRecord.superclass} (${SCP_DESCRIPTIONS[selectedRecord.superclass] || 'Diagnostic Abnormality'})`
+                : "No Record Loaded")
               : (manualMode ? "Custom Wave Synthesizer" : RHYTHMS.find((r) => r.id === currentRhythm)?.name || currentRhythm.toUpperCase())
             }
           </div>
@@ -3866,7 +4010,7 @@ export default function ECGSimulatorPage() {
                   className={`tab-btn ${activeTab === "db-explorer" ? "active" : ""}`}
                   onClick={() => setActiveTab("db-explorer")}
                 >
-                  Records DB
+                  Full DB
                 </button>
                 {viewMode === "single" && (
                 <button
@@ -4648,7 +4792,10 @@ export default function ECGSimulatorPage() {
                               <div className="rc-icon">
                                 <i className={iconClass}></i>
                               </div>
-                              <div className="rc-name">{r.name}</div>
+                              <div className="rc-name">
+                                {r.name}
+                                <DbBadge rhythmId={r.id} />
+                              </div>
                               <span className={`rc-tag ${r.tagClass}`}>{r.tag}</span>
                             </div>
                           );
@@ -5305,7 +5452,7 @@ export default function ECGSimulatorPage() {
                   <div className="meta-label">Rhythm</div>
                   <div className="meta-value">
                     {mode === "database"
-                      ? (selectedRecord ? `Patient ID #${selectedRecord.patient_id} · ${selectedRecord.superclass} (${selectedRecord.class_explanation || 'ECG Clinical Recording'})` : "No Record Loaded")
+                      ? (selectedRecord ? `${RHYTHMS.find((r) => r.id === currentRhythm)?.name || "Record"} #${selectedRecord.ecg_id} · ${selectedRecord.superclass} (${selectedRecord.class_explanation || 'ECG Clinical Recording'})` : "No Record Loaded")
                       : (manualMode
                         ? "Custom Manual Wave"
                         : RHYTHMS.find((r) => r.id === currentRhythm)?.name || currentRhythm)
